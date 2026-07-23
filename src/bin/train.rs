@@ -7,6 +7,9 @@
 //!   --temperature 0.35    température d'exploration du self-play
 //!   --lr 0.001            taux d'apprentissage Adam
 //!   --eval-games 120      parties d'évaluation par adversaire de référence
+//!   --replay 1200000      positions gardées dans le tampon de rejeu (0 = désactivé)
+//!   --elo-every 15        estimation Elo tous les N cycles (0 = désactivée)
+//!   --elo-games 24        parties par ancre de l'échelle Elo
 //!   --seed 0
 //!
 //! Boucle par cycle :
@@ -15,7 +18,11 @@
 //!   2. self-play : `games_per_cycle` parties en parallèle (rayon,
 //!      selfplay::play_training_game, graine dérivée seed+games déjà joués) ;
 //!   3. apprentissage : mélange toutes les positions du cycle, minibatchs de 256,
-//!      1 époque, nn::train_batch, loss moyenne ;
+//!      1 époque, nn::train_batch, loss moyenne ; puis, si le tampon de rejeu est
+//!      actif, autant de minibatchs supplémentaires échantillonnés uniformément
+//!      dans le tampon (chaque position est ainsi revue plusieurs fois au fil des
+//!      cycles — meilleure efficacité d'échantillon, courbe plus stable ; le
+//!      tampon repart vide à chaque reprise du process, c'est accepté) ;
 //!   4. évaluation : NetBot (temperature 0, depth 1) contre RandomBot et contre
 //!      MaterialBot(depth 2) via arena::score, `eval_games` parties chacun ;
 //!   5. état : trained_secs += durée du cycle (mesurée), games, positions, cycles ;
@@ -44,6 +51,7 @@ use shakmaty::{Chess, Move};
 use echec::arena;
 use echec::bots::{Bot, MaterialBot, NetBot, RandomBot};
 use echec::checkpoints::{self, TrainState};
+use echec::elo;
 use echec::features::N_FEATURES;
 use echec::nn::Mlp;
 use echec::selfplay::{self, GameRecord};
@@ -56,6 +64,9 @@ const MINIBATCH: usize = 256;
 const PROFONDEUR_MATERIEL: u32 = 2;
 /// Profondeur du NetBot en évaluation (température 0).
 const PROFONDEUR_EVAL: u32 = 1;
+/// Profondeur du NetBot pour l'estimation Elo : 2, comme l'IA servie sur le
+/// plateau — l'Elo estimé décrit ce que l'utilisateur affronte réellement.
+const PROFONDEUR_ELO: u32 = 2;
 
 /// Options de la ligne de commande (défauts du contrat).
 struct Options {
@@ -65,7 +76,59 @@ struct Options {
     temperature: f32,
     lr: f32,
     eval_games: usize,
+    replay: usize,
+    elo_every: u64,
+    elo_games: usize,
     seed: u64,
+}
+
+/// Tampon de rejeu : anneau de positions encodées à capacité fixe.
+/// L'écriture écrase les plus anciennes ; l'échantillonnage est uniforme.
+struct Rejeu {
+    xs: Vec<f32>,
+    zs: Vec<f32>,
+    capacite: usize,
+    tete: usize,
+    len: usize,
+}
+
+impl Rejeu {
+    fn new(capacite: usize) -> Self {
+        Rejeu {
+            // Croissance paresseuse : on n'alloue les ~773 f32/position qu'au fil
+            // des écritures, pas les ~3,7 Go d'un coup au démarrage.
+            xs: Vec::new(),
+            zs: Vec::new(),
+            capacite,
+            tete: 0,
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, x: &[f32], z: f32) {
+        if self.len < self.capacite {
+            self.xs.extend_from_slice(x);
+            self.zs.push(z);
+            self.len += 1;
+        } else {
+            let d = self.tete * N_FEATURES;
+            self.xs[d..d + N_FEATURES].copy_from_slice(x);
+            self.zs[self.tete] = z;
+        }
+        self.tete = (self.tete + 1) % self.capacite;
+    }
+
+    /// Remplit un minibatch échantillonné uniformément dans le tampon.
+    fn echantillonne(&self, rng: &mut StdRng, n: usize,
+                     lot_xs: &mut Vec<f32>, lot_zs: &mut Vec<f32>) {
+        lot_xs.clear();
+        lot_zs.clear();
+        for _ in 0..n {
+            let i = rng.gen_range(0..self.len);
+            lot_xs.extend_from_slice(&self.xs[i * N_FEATURES..(i + 1) * N_FEATURES]);
+            lot_zs.push(self.zs[i]);
+        }
+    }
 }
 
 /// Valeur suivant l'option `nom`, ou sortie propre si elle manque.
@@ -92,6 +155,9 @@ fn parse_options() -> Options {
         temperature: 0.35,
         lr: 0.001,
         eval_games: 120,
+        replay: 1_200_000,
+        elo_every: 15,
+        elo_games: 24,
         seed: 0,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -107,12 +173,15 @@ fn parse_options() -> Options {
             "--temperature" => opt.temperature = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--lr" => opt.lr = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--eval-games" => opt.eval_games = parse_valeur(&valeur(&args, i, &nom), &nom),
+            "--replay" => opt.replay = parse_valeur(&valeur(&args, i, &nom), &nom),
+            "--elo-every" => opt.elo_every = parse_valeur(&valeur(&args, i, &nom), &nom),
+            "--elo-games" => opt.elo_games = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--seed" => opt.seed = parse_valeur(&valeur(&args, i, &nom), &nom),
             _ => {
                 eprintln!("option inconnue : {nom}");
                 eprintln!(
                     "options : --out --threads --games-per-cycle --temperature --lr \
-                     --eval-games --seed"
+                     --eval-games --replay --elo-every --elo-games --seed"
                 );
                 std::process::exit(2);
             }
@@ -188,7 +257,21 @@ fn main() {
     } else {
         println!("réseau neuf (graine {})", opt.seed);
     }
+    let mut rejeu = (opt.replay > 0).then(|| Rejeu::new(opt.replay));
+    if let Some(r) = &rejeu {
+        println!(
+            "tampon de rejeu : {} positions max (~{:.1} Go)",
+            r.capacite,
+            (r.capacite * N_FEATURES * 4) as f64 / 1e9
+        );
+    }
     std::io::stdout().flush().ok();
+
+    // Cycles effectués par CE process (l'estimation Elo tourne au premier cycle
+    // local — retour immédiat après un lancement — puis tous les elo_every cycles
+    // globaux). Son temps n'entre PAS dans trained_secs : les heures des paliers
+    // restent du pur temps d'entraînement.
+    let mut cycles_locaux: u64 = 0;
 
     loop {
         let debut_cycle = Instant::now();
@@ -235,6 +318,28 @@ fn main() {
             let loss_lot = net_mut.train_batch(&lot_xs, &lot_zs, opt.lr);
             somme_loss += loss_lot as f64 * lot.len() as f64;
             n_vus += lot.len();
+        }
+
+        // 3 bis. Rejeu : les positions fraîches entrent dans le tampon, puis on
+        // rejoue autant de minibatchs, tirés uniformément dans TOUT le tampon
+        // (frais + anciens). Chaque position finit donc revue plusieurs fois au
+        // fil des cycles avant d'être écrasée.
+        if let Some(r) = rejeu.as_mut() {
+            for i in 0..n_positions {
+                r.push(&xs[i * N_FEATURES..(i + 1) * N_FEATURES], zs[i]);
+            }
+            if r.len >= MINIBATCH {
+                let mut rng_rejeu = StdRng::seed_from_u64(derive_graine(
+                    opt.seed.wrapping_add(etat.cycles),
+                    0x8E3E0,
+                ));
+                for _ in 0..n_positions.div_ceil(MINIBATCH) {
+                    r.echantillonne(&mut rng_rejeu, MINIBATCH, &mut lot_xs, &mut lot_zs);
+                    let loss_lot = net_mut.train_batch(&lot_xs, &lot_zs, opt.lr);
+                    somme_loss += loss_lot as f64 * MINIBATCH as f64;
+                    n_vus += MINIBATCH;
+                }
+            }
         }
         let loss = if n_vus > 0 {
             (somme_loss / n_vus as f64) as f32
@@ -314,5 +419,40 @@ fn main() {
             etat.cycles, apres_h, etat.games, etat.positions, loss, pct_alea, pct_materiel
         );
         std::io::stdout().flush().ok();
+
+        // 8. Estimation Elo : échelle d'ancres + ajustement par maximum de
+        //    vraisemblance (voir src/elo.rs). Hors chronométrage des paliers.
+        cycles_locaux += 1;
+        if opt.elo_every > 0 && (cycles_locaux == 1 || etat.cycles % opt.elo_every == 0) {
+            let mesures = elo::mesure(
+                &net,
+                PROFONDEUR_ELO,
+                opt.elo_games,
+                derive_graine(opt.seed.wrapping_add(etat.cycles), 0xE10),
+            );
+            let estimation = elo::ajuste_elo(&mesures);
+            let chemin_elo = format!("{}/elo.csv", opt.out);
+            let neuf_elo = !Path::new(&chemin_elo).exists();
+            let mut fichier_elo = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&chemin_elo)
+                .expect("ouverture de elo.csv");
+            if neuf_elo {
+                writeln!(fichier_elo, "elapsed_hours,elo").expect("entête de elo.csv");
+            }
+            writeln!(fichier_elo, "{:.3},{:.0}", apres_h, estimation)
+                .expect("append dans elo.csv");
+            let detail: Vec<String> = mesures
+                .iter()
+                .map(|m| format!("{} {:.0} %", m.nom, m.score * 100.0))
+                .collect();
+            println!(
+                "  Elo estime ~{:.0} (echelle maison ; {})",
+                estimation,
+                detail.join(", ")
+            );
+            std::io::stdout().flush().ok();
+        }
     }
 }

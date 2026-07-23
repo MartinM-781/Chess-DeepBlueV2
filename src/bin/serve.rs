@@ -331,6 +331,23 @@ fn progress_json() -> serde_json::Value {
         }
     }
 
+    // Estimations Elo (fichier écrit par l'entraîneur, absent au tout début).
+    let mut elo_hours: Vec<f64> = Vec::new();
+    let mut elo_vals: Vec<f64> = Vec::new();
+    if let Ok(contenu) = std::fs::read_to_string(format!("{MODELS_DIR}/elo.csv")) {
+        // Entête : elapsed_hours,elo
+        for ligne in contenu.lines().skip(1) {
+            let cols: Vec<&str> = ligne.split(',').collect();
+            if cols.len() < 2 {
+                continue;
+            }
+            if let (Ok(h), Ok(e)) = (cols[0].trim().parse::<f64>(), cols[1].trim().parse::<f64>()) {
+                elo_hours.push(h);
+                elo_vals.push(e);
+            }
+        }
+    }
+
     let state_val: serde_json::Value =
         std::fs::read_to_string(format!("{MODELS_DIR}/state.json"))
             .ok()
@@ -350,6 +367,10 @@ fn progress_json() -> serde_json::Value {
             "pct_vs_random": pct_vs_random,
             "pct_vs_material": pct_vs_material,
             "games": games,
+        },
+        "elo": {
+            "elapsed_hours": elo_hours,
+            "elo": elo_vals,
         },
         "state": {
             "trained_secs": champ("trained_secs"),

@@ -162,6 +162,17 @@ function render(data) {
     { color: css("--series-2"), pts: ptsMaterial, dots: true },
   ], { yMin: 0, yMax: 100, baseline: 50, yFmt: (v) => `${Math.round(v)} %` });
 
+  // Courbe Elo : échantillonnée moins souvent que les métriques (1er cycle après
+  // un lancement puis 1 cycle sur 15) ; sa source est data.elo (models/elo.csv).
+  const e = data.elo || {};
+  const ptsElo = pairs(e.elapsed_hours, e.elo);
+  const lastE = ptsElo.length ? ptsElo[ptsElo.length - 1][1] : null;
+  $("elo-last").textContent = lastE === null ? "" :
+    `Dernière estimation : ~${fr(Math.round(lastE))} Elo`;
+  drawChart("chart-elo", "empty-elo", [
+    { color: css("--series-4"), pts: ptsElo, dots: true },
+  ], { yFmt: (v) => fr(Math.round(v)) });
+
   drawChart("chart-loss", "empty-loss", [
     { color: css("--series-3"), pts: ptsLoss },
   ], {

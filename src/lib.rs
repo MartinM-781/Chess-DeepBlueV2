@@ -6,6 +6,7 @@
 pub mod arena;
 pub mod bots;
 pub mod checkpoints;
+pub mod elo;
 pub mod features;
 pub mod nn;
 pub mod selfplay;

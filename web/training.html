@@ -72,6 +72,25 @@
     </div>
   </div>
 
+  <!-- Niveau estimé (Elo) -->
+  <div class="tr-chart-card">
+    <div class="tr-chart-head">
+      <div class="tr-chart-title">Niveau estimé — Elo (échelle maison)</div>
+      <div class="tr-legend"><span><i style="background:var(--series-4)"></i>Elo estimé</span></div>
+    </div>
+    <div class="tr-lastvals" id="elo-last"></div>
+    <div class="tr-chart-wrap"><canvas id="chart-elo"></canvas>
+      <div class="tr-empty" id="empty-elo" hidden>Pas encore d'estimation — elle tombe au premier cycle après un lancement, puis tous les 15 cycles.</div>
+    </div>
+    <div class="tr-note">
+      Mesuré en faisant jouer l'IA (profondeur&nbsp;2, comme sur le plateau) contre une échelle
+      d'adversaires de force croissante — aléatoire (~400), matériel prof.&nbsp;1 à 4 (~800 à ~1550) —
+      puis ajustement logistique sur l'ensemble des scores. Les Elo des ancres sont des estimations :
+      la <em>tendance</em> de la courbe est fiable, le niveau absolu sera recalé plus tard contre
+      un moteur de référence (Stockfish à force limitée).
+    </div>
+  </div>
+
   <!-- Perte du réseau -->
   <div class="tr-chart-card">
     <div class="tr-chart-head">
