@@ -426,6 +426,43 @@ fn progress_json() -> serde_json::Value {
         }
     }
 
+    // Journal de gating (duels candidat vs champion) et événements de régime
+    // (fichiers écrits par l'entraîneur v2, absents avant lui).
+    let mut gat_hours: Vec<f64> = Vec::new();
+    let mut gat_score: Vec<f64> = Vec::new();
+    let mut gat_promu: Vec<f64> = Vec::new();
+    if let Ok(contenu) = std::fs::read_to_string(format!("{MODELS_DIR}/gating.csv")) {
+        // Entête : elapsed_hours,score_pct,promu
+        for ligne in contenu.lines().skip(1) {
+            let cols: Vec<&str> = ligne.split(',').collect();
+            if cols.len() < 3 {
+                continue;
+            }
+            if let (Ok(h), Ok(s), Ok(p)) = (
+                cols[0].trim().parse::<f64>(),
+                cols[1].trim().parse::<f64>(),
+                cols[2].trim().parse::<f64>(),
+            ) {
+                gat_hours.push(h);
+                gat_score.push(s);
+                gat_promu.push(p);
+            }
+        }
+    }
+    let mut events: Vec<serde_json::Value> = Vec::new();
+    if let Ok(contenu) = std::fs::read_to_string(format!("{MODELS_DIR}/events.csv")) {
+        // Entête : elapsed_hours,label
+        for ligne in contenu.lines().skip(1) {
+            let cols: Vec<&str> = ligne.split(',').collect();
+            if cols.len() < 2 {
+                continue;
+            }
+            if let Ok(h) = cols[0].trim().parse::<f64>() {
+                events.push(serde_json::json!({"h": h, "label": cols[1].trim()}));
+            }
+        }
+    }
+
     let state_val: serde_json::Value =
         std::fs::read_to_string(format!("{MODELS_DIR}/state.json"))
             .ok()
@@ -450,6 +487,12 @@ fn progress_json() -> serde_json::Value {
             "elapsed_hours": elo_hours,
             "elo": elo_vals,
         },
+        "gating": {
+            "elapsed_hours": gat_hours,
+            "score_pct": gat_score,
+            "promu": gat_promu,
+        },
+        "events": events,
         "state": {
             "trained_secs": champ("trained_secs"),
             "games": champ("games"),

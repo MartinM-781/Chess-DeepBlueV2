@@ -44,10 +44,5 @@ Puis ouvrir **http://localhost:8778** :
 - **/** — le plateau : choisissez votre adversaire (« IA — 1 h d'entraînement »,
   « IA — 3 h », … les paliers non atteints sont grisés), votre couleur, et jouez.
 - **/training** — la courbe d'apprentissage en direct : loss, % de points contre le
-  bot aléatoire et contre le bot matériel, en fonction des heures d'entraînement.
-
-## Un agent Claude comme chef de chantier
-
-Ce projet est construit et piloté par un agent Claude (architecture, implémentation
-par escouade d'agents parallèles, audits adversariaux croisés — signes/perspective,
-règles de nulle, cohérence API — puis entraînement et évaluation en continu).
+  bot aléatoire et contre le bot matériel, Elo estimé et duels de gating, en
+  fonction des heures d'entraînement.

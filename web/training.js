@@ -117,6 +117,20 @@ function drawChart(canvasId, emptyId, series, opts) {
     ctx.fillText(`${m} h`, X(m), P.t - 6);
   }
 
+  // Marqueurs d'événements de régime (ex. « recherche ») : trait plein grisé,
+  // libellé en bas — visuellement distincts des paliers jaunes.
+  for (const ev of (opts.events || [])) {
+    if (ev.h > xMax) continue;
+    ctx.strokeStyle = css("--ink-2");
+    ctx.globalAlpha = 0.7;
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(X(ev.h), P.t); ctx.lineTo(X(ev.h), H - P.b); ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = css("--ink-2");
+    ctx.textAlign = "center";
+    ctx.fillText(ev.label, X(ev.h), H - P.b + 24);
+  }
+
   // Séries
   for (const s of series) {
     if (!s.pts.length) continue;
@@ -150,6 +164,7 @@ function render(data) {
   const ptsRandom = pairs(m.elapsed_hours, m.pct_vs_random);
   const ptsMaterial = pairs(m.elapsed_hours, m.pct_vs_material);
   const ptsLoss = pairs(m.elapsed_hours, m.loss);
+  const events = data.events || [];
 
   const lastR = ptsRandom.length ? ptsRandom[ptsRandom.length - 1][1] : null;
   const lastM = ptsMaterial.length ? ptsMaterial[ptsMaterial.length - 1][1] : null;
@@ -160,7 +175,7 @@ function render(data) {
   drawChart("chart-pct", "empty-pct", [
     { color: css("--series-1"), pts: ptsRandom, dots: true },
     { color: css("--series-2"), pts: ptsMaterial, dots: true },
-  ], { yMin: 0, yMax: 100, baseline: 50, yFmt: (v) => `${Math.round(v)} %` });
+  ], { yMin: 0, yMax: 100, baseline: 50, yFmt: (v) => `${Math.round(v)} %`, events });
 
   // Courbe Elo : échantillonnée moins souvent que les métriques (1er cycle après
   // un lancement puis 1 cycle sur 15) ; sa source est data.elo (models/elo.csv).
@@ -171,7 +186,22 @@ function render(data) {
     `Dernière estimation : ~${fr(Math.round(lastE))} Elo`;
   drawChart("chart-elo", "empty-elo", [
     { color: css("--series-4"), pts: ptsElo, dots: true },
-  ], { yFmt: (v) => fr(Math.round(v)) });
+  ], { yFmt: (v) => fr(Math.round(v)), events });
+
+  // Gating : synthèse des duels candidat vs champion (régime recherche).
+  const g = data.gating || {};
+  const nDuels = (g.score_pct || []).length;
+  if (nDuels === 0) {
+    $("gating-last").textContent =
+      "Gating : aucun duel encore — le premier tombe tous les 10 cycles du régime recherche.";
+  } else {
+    const nPromus = g.promu.filter((p) => p > 0).length;
+    const dernier = g.score_pct[nDuels - 1];
+    const dernierPromu = g.promu[nDuels - 1] > 0;
+    $("gating-last").textContent =
+      `Gating : ${nDuels} duel${nDuels > 1 ? "s" : ""}, ${nPromus} promotion${nPromus > 1 ? "s" : ""}` +
+      ` — dernier : ${fr(dernier, 1)} % (${dernierPromu ? "✔ promu champion" : "✘ refusé, le champion reste"})`;
+  }
 
   drawChart("chart-loss", "empty-loss", [
     { color: css("--series-3"), pts: ptsLoss },

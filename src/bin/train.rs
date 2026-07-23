@@ -260,6 +260,18 @@ fn copie_atomique(src: &str, dst: &str) -> std::io::Result<()> {
     fs::rename(&tmp, dst)
 }
 
+/// Append une ligne dans un CSV du dossier modèles (entête à la création).
+/// Sert aux journaux lus par le dashboard : gating.csv, events.csv.
+fn append_csv(chemin: &str, entete: &str, ligne: &str) {
+    let neuf = !Path::new(chemin).exists();
+    if let Ok(mut fichier) = fs::OpenOptions::new().create(true).append(true).open(chemin) {
+        if neuf {
+            let _ = writeln!(fichier, "{entete}");
+        }
+        let _ = writeln!(fichier, "{ligne}");
+    }
+}
+
 /// Mélangeur déterministe (style SplitMix64) pour dériver des graines
 /// indépendantes d'une même graine de base.
 fn derive_graine(base: u64, sel: u64) -> u64 {
@@ -474,6 +486,22 @@ fn main() {
     } else {
         println!("réseau neuf (graine {})", opt.seed);
     }
+    // Marqueur de changement de régime pour les courbes du dashboard : posé une
+    // seule fois, à la première activation du régime recherche.
+    if opt.search_nodes > 0 {
+        let chemin_events = format!("{}/events.csv", opt.out);
+        let deja = fs::read_to_string(&chemin_events)
+            .map(|s| s.contains("recherche"))
+            .unwrap_or(false);
+        if !deja {
+            append_csv(
+                &chemin_events,
+                "elapsed_hours,label",
+                &format!("{:.3},recherche", etat.trained_secs / 3600.0),
+            );
+        }
+    }
+
     let mut rejeu = (opt.replay > 0).then(|| Rejeu::new(opt.replay));
     if let Some(r) = &rejeu {
         println!(
@@ -735,13 +763,21 @@ fn main() {
                             opt.gate_games,
                             derive_graine(opt.seed.wrapping_add(etat.cycles), 0x6A7E),
                         );
-                        if score >= SEUIL_PROMOTION {
+                        let promu = score >= SEUIL_PROMOTION;
+                        if promu {
                             copie_atomique(&chemin_latest, &chemin_best)
                                 .expect("copie latest -> best");
                             println!("gating : promu ({:.0} %)", score * 100.0);
                         } else {
                             println!("gating : refuse ({:.0} %)", score * 100.0);
                         }
+                        // Journal lu par la page /training.
+                        append_csv(
+                            &format!("{}/gating.csv", opt.out),
+                            "elapsed_hours,score_pct,promu",
+                            &format!("{:.3},{:.1},{}", apres_h, score * 100.0,
+                                     if promu { 1 } else { 0 }),
+                        );
                     }
                 }
             }
