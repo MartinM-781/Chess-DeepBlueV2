@@ -10,3 +10,4 @@ pub mod elo;
 pub mod features;
 pub mod nn;
 pub mod selfplay;
+pub mod uci;

@@ -3,3 +3,4 @@
 *.log
 Cargo.lock
 .claude/
+/engines
