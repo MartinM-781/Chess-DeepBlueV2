@@ -67,8 +67,13 @@ where
     if games == 0 {
         return 0.5;
     }
+    // with_max_len(1) : UNE partie par tâche rayon. Sans ça, rayon regroupe les
+    // parties en paquets séquentiels et les ouvriers qui ont fini n'ont plus
+    // rien à voler — mesuré : 7 cœurs occupés sur 18 pendant les phases
+    // parallèles, la durée d'une phase étant celle du paquet le plus lent.
     let total: f32 = (0..games)
         .into_par_iter()
+        .with_max_len(1)
         .map(|i| {
             // Graines distinctes et déterministes pour chaque bot de chaque partie.
             let graine_a = base_seed.wrapping_add(2 * i as u64);

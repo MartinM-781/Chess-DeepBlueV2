@@ -439,8 +439,11 @@ fn duel_gating(candidat: Arc<Mlp>, champion: Arc<Mlp>, parties: usize, graine: u
     }
     // Progression en direct du duel (une ligne toutes les 4 paires jouées).
     let faites = std::sync::atomic::AtomicUsize::new(0);
+    // Une paire par tâche rayon (voir arena::score : sans with_max_len(1),
+    // les paquets séquentiels laissent la moitié des ouvriers au chômage).
     let points: f32 = (0..paires)
         .into_par_iter()
+        .with_max_len(1)
         .map(|p| {
             // Ouverture aléatoire de la paire. Jamais à court de coups en
             // 4 plis (le mat le plus court en demande 4) ; on s'arrête
@@ -470,6 +473,7 @@ fn duel_gating(candidat: Arc<Mlp>, champion: Arc<Mlp>, parties: usize, graine: u
 }
 
 fn main() {
+    echec::pleine_puissance(); // jamais bridé par l'EcoQoS Windows
     let opt = parse_options();
 
     fs::create_dir_all(&opt.out).expect("création du dossier --out");
@@ -562,6 +566,7 @@ fn main() {
             let total = graines.len();
             graines
                 .par_iter()
+                .with_max_len(1)
                 .map(|&g| {
                     let mut recherche =
                         search::Recherche::new(net.clone(), TAILLE_TT_LOG2_SELFPLAY);
@@ -580,6 +585,7 @@ fn main() {
             let net_ref: &Mlp = &net;
             graines
                 .par_iter()
+                .with_max_len(1)
                 .map(|&g| selfplay::play_training_game(net_ref, g, opt.temperature, MAX_PLIES))
                 .collect()
         };

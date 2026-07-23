@@ -680,6 +680,7 @@ fn boucle(serveur: Server, etat: Arc<Etat>) {
 }
 
 fn main() {
+    echec::pleine_puissance(); // la réflexion de l'IA jamais bridée par l'EcoQoS
     let etat = Arc::new(Etat {
         // Session par défaut : humain (blancs) contre le bot aléatoire.
         session: Mutex::new(Session::nouvelle("random", Color::White)),

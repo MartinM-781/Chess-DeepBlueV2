@@ -7,6 +7,8 @@ use std::io::{ErrorKind, Read, Write};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+use rayon::prelude::*;
+
 use crate::features::N_FEATURES;
 
 /// Hyperparamètres Adam (fixes, seul le taux d'apprentissage est passé en argument).
@@ -153,19 +155,22 @@ impl Mlp {
             let prec: &[f32] = if l == 0 { xs } else { &acts[l - 1] };
             let w = &self.weights[l];
             let b = &self.biases[l];
+            // Parallèle par échantillon (rayon) : chaque ligne de sortie est
+            // indépendante. Depuis le NNUE, cette étape était devenue LE goulot
+            // séquentiel des cycles (~30 s mono-thread par cycle).
             let mut a = vec![0.0f32; n * no];
-            for i in 0..n {
-                let x = &prec[i * ni..(i + 1) * ni];
-                let sortie = &mut a[i * no..(i + 1) * no];
-                for j in 0..no {
-                    let ligne = &w[j * ni..(j + 1) * ni];
-                    let mut s = b[j];
-                    for k in 0..ni {
-                        s += ligne[k] * x[k];
+            a.par_chunks_mut(no)
+                .zip(prec.par_chunks(ni))
+                .for_each(|(sortie, x)| {
+                    for j in 0..no {
+                        let ligne = &w[j * ni..(j + 1) * ni];
+                        let mut s = b[j];
+                        for k in 0..ni {
+                            s += ligne[k] * x[k];
+                        }
+                        sortie[j] = if derniere { s.tanh() } else { s.max(0.0) };
                     }
-                    sortie[j] = if derniere { s.tanh() } else { s.max(0.0) };
-                }
-            }
+                });
             acts.push(a);
         }
 
@@ -192,50 +197,72 @@ impl Mlp {
             let (ni, no) = (self.sizes[l], self.sizes[l + 1]);
             let prec: &[f32] = if l == 0 { xs } else { &acts[l - 1] };
 
-            // Gradients des poids et biais de la couche l.
-            let mut grad_w = vec![0.0f32; no * ni];
-            let mut grad_b = vec![0.0f32; no];
-            for i in 0..n {
-                let d = &delta[i * no..(i + 1) * no];
-                let x = &prec[i * ni..(i + 1) * ni];
-                for j in 0..no {
-                    let dj = d[j];
-                    if dj == 0.0 {
-                        continue; // neurone ReLU éteint : rien à propager
-                    }
-                    grad_b[j] += dj;
-                    let gw = &mut grad_w[j * ni..(j + 1) * ni];
-                    for k in 0..ni {
-                        gw[k] += dj * x[k];
-                    }
-                }
-            }
+            // Gradients des poids et biais de la couche l : accumulation
+            // parallèle par échantillon avec réduction (un tampon de gradients
+            // par thread, sommés à la fin — l'ordre de sommation flottante
+            // change, sans conséquence : l'apprentissage est stochastique).
+            let (grad_w, grad_b) = (0..n)
+                .into_par_iter()
+                .fold(
+                    || (vec![0.0f32; no * ni], vec![0.0f32; no]),
+                    |(mut gw_acc, mut gb_acc), i| {
+                        let d = &delta[i * no..(i + 1) * no];
+                        let x = &prec[i * ni..(i + 1) * ni];
+                        for j in 0..no {
+                            let dj = d[j];
+                            if dj == 0.0 {
+                                continue; // neurone ReLU éteint : rien à propager
+                            }
+                            gb_acc[j] += dj;
+                            let gw = &mut gw_acc[j * ni..(j + 1) * ni];
+                            for k in 0..ni {
+                                gw[k] += dj * x[k];
+                            }
+                        }
+                        (gw_acc, gb_acc)
+                    },
+                )
+                .reduce(
+                    || (vec![0.0f32; no * ni], vec![0.0f32; no]),
+                    |(mut aw, mut ab), (bw, bb)| {
+                        for (u, v) in aw.iter_mut().zip(&bw) {
+                            *u += *v;
+                        }
+                        for (u, v) in ab.iter_mut().zip(&bb) {
+                            *u += *v;
+                        }
+                        (aw, ab)
+                    },
+                );
 
             // Delta de la couche précédente (avec les poids AVANT mise à jour),
             // en traversant la ReLU : dérivée = 1 si activation > 0, sinon 0.
             if l > 0 {
                 let w = &self.weights[l];
                 let mut delta_prec = vec![0.0f32; n * ni];
-                for i in 0..n {
-                    let d = &delta[i * no..(i + 1) * no];
-                    let dp = &mut delta_prec[i * ni..(i + 1) * ni];
-                    for j in 0..no {
-                        let dj = d[j];
-                        if dj == 0.0 {
-                            continue;
+                let delta_ref = &delta;
+                delta_prec
+                    .par_chunks_mut(ni)
+                    .enumerate()
+                    .for_each(|(i, dp)| {
+                        let d = &delta_ref[i * no..(i + 1) * no];
+                        for j in 0..no {
+                            let dj = d[j];
+                            if dj == 0.0 {
+                                continue;
+                            }
+                            let ligne = &w[j * ni..(j + 1) * ni];
+                            for k in 0..ni {
+                                dp[k] += dj * ligne[k];
+                            }
                         }
-                        let ligne = &w[j * ni..(j + 1) * ni];
+                        let a = &prec[i * ni..(i + 1) * ni];
                         for k in 0..ni {
-                            dp[k] += dj * ligne[k];
+                            if a[k] <= 0.0 {
+                                dp[k] = 0.0;
+                            }
                         }
-                    }
-                    let a = &prec[i * ni..(i + 1) * ni];
-                    for k in 0..ni {
-                        if a[k] <= 0.0 {
-                            dp[k] = 0.0;
-                        }
-                    }
-                }
+                    });
                 // Mise à jour Adam de la couche l (après le calcul de delta_prec).
                 adam_maj(&mut self.weights[l], &mut self.adam_mw[l], &mut self.adam_vw[l],
                          &grad_w, lr, c1, c2);
