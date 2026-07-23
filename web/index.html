@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Échecs IA — Plateau</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">♞ <strong>Échecs IA</strong> — Plateau</div>
+  <div class="sub">Toi contre un réseau de neurones entraîné par self-play ·
+    <a class="head-link" href="/training">📈 Suivi de l'entraînement en direct →</a></div>
+</header>
+
+<main class="layout">
+  <!-- ============================ PLATEAU ============================ -->
+  <section class="game">
+    <div class="board-wrap">
+      <div class="board-frame">
+        <div class="board" id="board"></div>
+        <div class="banner" id="banner" hidden>
+          <div class="banner-title" id="banner-title"></div>
+          <div class="banner-sub" id="banner-sub"></div>
+        </div>
+      </div>
+    </div>
+    <div class="status" id="status">Connexion au serveur…</div>
+    <div class="hint">Clique sur une de tes pièces puis sur une case cible ·
+      promotion : dame automatique · <kbd>N</kbd> nouvelle partie</div>
+  </section>
+
+  <!-- ============================ PANNEAU ============================ -->
+  <aside class="panel">
+    <div class="card-box">
+      <div class="card-box-head"><h2>Nouvelle partie</h2></div>
+      <div class="field">
+        <label for="sel-opponent">Adversaire</label>
+        <select id="sel-opponent"></select>
+      </div>
+      <div class="field">
+        <span>Ta couleur</span>
+        <div class="color-choice">
+          <label><input type="radio" name="color" value="white" checked> Blancs</label>
+          <label><input type="radio" name="color" value="black"> Noirs</label>
+          <label><input type="radio" name="color" value="random"> Aléatoire</label>
+        </div>
+      </div>
+      <button class="btn btn-new" id="btn-new">Nouvelle partie</button>
+    </div>
+
+    <div class="tiles">
+      <div class="tile"><div class="tile-value small" id="tile-opponent">—</div><div class="tile-label">Adversaire</div></div>
+      <div class="tile"><div class="tile-value" id="tile-think">—</div><div class="tile-label">Réflexion de l'IA</div></div>
+    </div>
+
+    <div class="card-box">
+      <div class="card-box-head"><h2>Historique de la partie (SAN)</h2></div>
+      <div class="moves" id="moves">
+        <div class="moves-empty">La partie n'a pas encore commencé.</div>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>

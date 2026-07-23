@@ -1,0 +1,5 @@
+/target
+/models
+*.log
+Cargo.lock
+.claude/
