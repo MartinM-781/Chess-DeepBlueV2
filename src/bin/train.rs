@@ -344,6 +344,10 @@ fn mesure_elo_recherche(net: &Arc<Mlp>, parties_par_ancre: usize,
                 parties_par_ancre,
                 graine.wrapping_add(k as u64).wrapping_mul(0x9E37_79B9),
             ) as f64;
+            // Progression en direct de la mesure (une ligne par ancre jouée).
+            println!("  echelle Elo : {} -> {:.0} % ({} parties)",
+                     a.nom, score * 100.0, parties_par_ancre);
+            std::io::stdout().flush().ok();
             elo::MesureAncre {
                 nom: a.nom,
                 elo_ancre: a.elo,
@@ -433,6 +437,8 @@ fn duel_gating(candidat: Arc<Mlp>, champion: Arc<Mlp>, parties: usize, graine: u
     if paires == 0 {
         return 0.5;
     }
+    // Progression en direct du duel (une ligne toutes les 4 paires jouées).
+    let faites = std::sync::atomic::AtomicUsize::new(0);
     let points: f32 = (0..paires)
         .into_par_iter()
         .map(|p| {
@@ -450,8 +456,14 @@ fn duel_gating(candidat: Arc<Mlp>, champion: Arc<Mlp>, parties: usize, graine: u
                 ouverture.push(m);
             }
             let g = derive_graine(graine, 2 * p as u64 + 1);
-            partie_gating(&candidat, &champion, true, &ouverture, g)
-                + partie_gating(&candidat, &champion, false, &ouverture, g.wrapping_add(2))
+            let pts = partie_gating(&candidat, &champion, true, &ouverture, g)
+                + partie_gating(&candidat, &champion, false, &ouverture, g.wrapping_add(2));
+            let n = faites.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n % 4 == 0 || n == paires {
+                println!("  gating : {}/{} paires jouees", n, paires);
+                std::io::stdout().flush().ok();
+            }
+            pts
         })
         .sum();
     points / (2 * paires) as f32
@@ -543,12 +555,24 @@ fn main() {
                 max_plies: MAX_PLIES,
                 ..Default::default()
             };
+            // Progression en direct : une ligne toutes les 8 parties terminées,
+            // pour que `Get-Content train.log -Wait` montre le calcul en cours
+            // et pas seulement les fins de cycle.
+            let fait = std::sync::atomic::AtomicUsize::new(0);
+            let total = graines.len();
             graines
                 .par_iter()
                 .map(|&g| {
                     let mut recherche =
                         search::Recherche::new(net.clone(), TAILLE_TT_LOG2_SELFPLAY);
-                    selfplay::play_training_game_recherche(&mut recherche, g, &opts_recherche)
+                    let partie =
+                        selfplay::play_training_game_recherche(&mut recherche, g, &opts_recherche);
+                    let n = fait.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if n % 8 == 0 || n == total {
+                        println!("  self-play : {n}/{total} parties");
+                        std::io::stdout().flush().ok();
+                    }
+                    partie
                 })
                 .collect()
         } else {

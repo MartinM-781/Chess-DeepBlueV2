@@ -3,6 +3,14 @@
 //! killers, historique), élagage null-move. Les feuilles calmes sont évaluées
 //! par le réseau (perspective du trait, [-1,1]) ; les mats sont exacts.
 //!
+//! ÉVALUATION INCRÉMENTALE (src/nnue.rs) : les feuilles ne repassent plus par
+//! encode + forward complet — une pile d'accumulateurs de la couche 1 est
+//! maintenue par deltas le long de la ligne explorée (pousse avant chaque
+//! récursion, depousse au retour, pousse_null pour le null-move), et seule la
+//! tête 512→64→1 est recalculée. Mêmes scores (à l'ordre des sommations f32
+//! près), mêmes coups : la recherche est inchangée, seulement plus rapide.
+//! Chemin de secours : USE_NNUE (ci-dessous).
+//!
 //! C'est l'étage 1 de la fusée « battre Deep Blue » : il sert à la fois à
 //! JOUER (serveur, arène) et à FABRIQUER les étiquettes TD-leaf du self-play
 //! (le score racine devient la cible d'apprentissage).
@@ -19,8 +27,16 @@ use shakmaty::{Chess, Color, EnPassantMode, Move, Position};
 
 use crate::features::{encode, N_FEATURES};
 use crate::nn::Mlp;
+use crate::nnue::{EvalIncrementale, PileAccus};
 
 pub const SCORE_MAT: f32 = 1000.0;
+
+/// Interrupteur de secours de l'évaluation incrémentale. Si une divergence est
+/// suspectée (le debug_assert de parité échantillonnée d'`evaluer` se déclenche
+/// en mode debug), basculer cette constante à `false` : la recherche revient au
+/// forward complet (encode + forward_one) — comportement identique, seulement
+/// plus lent — le temps de corriger src/nnue.rs.
+pub const USE_NNUE: bool = true;
 
 /// Au-delà de ce seuil (en valeur absolue) un score est un score de MAT :
 /// les valeurs réseau vivent dans [-1, 1] et les mats dans
@@ -196,8 +212,23 @@ pub struct Resultat {
 /// État persistant d'un chercheur : table de transposition, killers,
 /// historique. UN chercheur par thread (rien de partagé). Possède son réseau
 /// via Arc (partagé en lecture entre threads).
+///
+/// ATTENTION (rechargement du réseau) : `eval` COPIE les poids du réseau à la
+/// construction. Si le réseau change (nouveau checkpoint chargé, Arc remplacé),
+/// il FAUT reconstruire la `Recherche` — c'est déjà le cas partout dans le
+/// projet : les bots (BotRecherche, self-play, duels de gating) sont recréés à
+/// chaque partie ou à chaque cycle avec l'Arc du réseau courant.
 pub struct Recherche {
     pub net: Arc<Mlp>,
+    /// Poids réorganisés pour l'évaluation incrémentale. `None` = chemin de
+    /// secours forward complet : USE_NNUE à false, ou réseau sans couche
+    /// cachée (les réseaux linéaires [773,1] de certains tests, où il n'y a
+    /// de toute façon rien à accélérer).
+    eval: Option<EvalIncrementale>,
+    /// Pile d'accumulateurs de la ligne en cours d'exploration, recréée à
+    /// chaque appel de cherche() (racine posée sur la position de départ).
+    /// Poussée/dépoussée par negamax et quiesce, en miroir de leur récursion.
+    pile: Option<PileAccus>,
     /// Table de transposition : 2^taille_tt_log2 entrées, index = cle & masque.
     tt: Vec<EntreeTT>,
     masque: u64,
@@ -229,8 +260,14 @@ impl Recherche {
     pub fn new(net: Arc<Mlp>, taille_tt_log2: u32) -> Self {
         assert!(taille_tt_log2 <= 30, "taille_tt_log2 déraisonnable (> 2^30 entrées)");
         let n = 1usize << taille_tt_log2;
+        // Évaluation incrémentale construite UNE FOIS depuis le réseau (copie
+        // des poids en colonnes) : voir le commentaire de la struct pour le
+        // rechargement du réseau. Réseau sans couche cachée → forward complet.
+        let eval = (USE_NNUE && net.sizes.len() >= 3).then(|| EvalIncrementale::new(&net));
         Recherche {
             net,
+            eval,
+            pile: None,
             tt: vec![ENTREE_VIDE; n],
             masque: (n - 1) as u64,
             killers: vec![[COUP_AUCUN; 2]; MAX_PLY],
@@ -286,6 +323,11 @@ impl Recherche {
             limites.max_profondeur.min(PROF_MAX)
         };
 
+        // Pile d'accumulateurs posée sur la position de départ : une par appel
+        // (la racine change à chaque coup joué). Encodage complet des deux
+        // perspectives ici, puis uniquement des deltas dans l'arbre.
+        self.pile = self.eval.as_ref().map(|e| e.racine(pos));
+
         // Ordre racine initial : coup TT de la recherche précédente (grosse
         // source de gain entre coups successifs d'une même partie), puis
         // tactiques MVV-LVA, puis historique.
@@ -323,7 +365,9 @@ impl Recherche {
                 // les autres peuvent n'être que des bornes supérieures
                 // (fail-soft) — suffisant pour l'échantillonnage en
                 // température, qui ne sert qu'à l'exploration.
+                self.pile_pousse(pos, m);
                 let v = -self.negamax(&fille, d - 1, 1, f32::NEG_INFINITY, -alpha, false);
+                self.pile_depousse();
                 if self.stop {
                     interrompue = true;
                     break;
@@ -478,6 +522,9 @@ impl Recherche {
                 && a_piece_non_pion(pos)
             {
                 if let Ok(passe) = pos.clone().swap_turn() {
+                    // Null-move sur la pile : position inchangée, seules les
+                    // perspectives s'échangeront à l'évaluation (sommet dupliqué).
+                    self.pile_pousse_null();
                     let v = -self.negamax(
                         &passe,
                         profondeur - 1 - R_NULL,
@@ -486,6 +533,7 @@ impl Recherche {
                         -beta + EPS_NUL,
                         true,
                     );
+                    self.pile_depousse();
                     if self.stop {
                         break 'corps (0.0, COUP_AUCUN, false);
                     }
@@ -513,7 +561,11 @@ impl Recherche {
             for (_, m) in &ordonnes {
                 let mut fille = pos.clone();
                 fille.play_unchecked(m);
+                // Deltas du coup sur la pile (2 à 4 features, 2 perspectives),
+                // dépilés au retour quel que soit le chemin de sortie.
+                self.pile_pousse(pos, m);
                 let v = -self.negamax(&fille, profondeur - 1, ply + 1, -beta, -alpha, false);
+                self.pile_depousse();
                 if self.stop {
                     // Valeur jetée, surtout ne rien stocker en TT.
                     break 'corps (best, COUP_AUCUN, false);
@@ -616,7 +668,9 @@ impl Recherche {
         for (_, m) in &a_jouer {
             let mut fille = pos.clone();
             fille.play_unchecked(m);
+            self.pile_pousse(pos, m);
             let v = -self.quiesce(&fille, ply + 1, prof_restante - 1, -beta, -alpha);
+            self.pile_depousse();
             if self.stop {
                 return best; // valeur jetée de toute façon (itération abandonnée)
             }
@@ -635,11 +689,76 @@ impl Recherche {
 
     // --- Évaluation réseau ---------------------------------------------------
 
-    /// Encode la position dans le tampon réutilisé puis passe avant du réseau.
-    /// Sortie dans [-1, 1], perspective du trait (convention du projet).
+    /// Évaluation d'une feuille, perspective du trait, sortie dans [-1, 1].
+    ///
+    /// Chemin normal : lecture du sommet de la pile d'accumulateurs (`pos`
+    /// DOIT être la position du sommet — garanti par la discipline
+    /// pousse/depousse de negamax et quiesce) + tête 512→64→1.
+    /// Chemin de secours (eval None) : encode + forward complet, identique au
+    /// comportement d'avant l'intégration NNUE.
     fn evaluer(&mut self, pos: &Chess) -> f32 {
+        if let (Some(eval), Some(pile)) = (self.eval.as_ref(), self.pile.as_ref()) {
+            let v = pile.evalue(eval, pos);
+            // Parité échantillonnée, MODE DEBUG UNIQUEMENT : 1 nœud sur 4096
+            // (dont le tout premier de chaque recherche) est recalculé par le
+            // forward complet. Si l'assertion se déclenche, la pile a divergé
+            // (delta de coup faux, pousse/depousse déséquilibrés...) :
+            // basculer USE_NNUE à false (en tête de ce fichier) pour revenir
+            // au forward complet le temps de corriger src/nnue.rs. Tolérance
+            // 1e-3 : la dérive légitime (ordre des sommations f32 accumulées
+            // le long d'une partie) reste ~1e-5, un vrai bug de delta décale
+            // les pré-activations de plusieurs ordres de grandeur au-dessus.
+            #[cfg(debug_assertions)]
+            if self.noeuds % 4096 == 1 {
+                encode(pos, &mut self.tampon);
+                let reference = self.net.forward_one(&self.tampon);
+                debug_assert!(
+                    (v - reference).abs() <= 1e-3,
+                    "divergence NNUE au nœud {} : incrémental {v} vs forward complet {reference}",
+                    self.noeuds
+                );
+            }
+            return v;
+        }
         encode(pos, &mut self.tampon);
         self.net.forward_one(&self.tampon)
+    }
+
+    // --- Pile d'accumulateurs (no-ops en chemin de secours) ------------------
+
+    /// Empile les deltas du coup `m` joué depuis `pos_avant` (les deux
+    /// perspectives). À appeler juste avant CHAQUE récursion sur une fille.
+    #[inline]
+    fn pile_pousse(&mut self, pos_avant: &Chess, m: &Move) {
+        if let (Some(pile), Some(eval)) = (self.pile.as_mut(), self.eval.as_ref()) {
+            pile.pousse(eval, pos_avant, m);
+        }
+    }
+
+    /// Empile un null-move (sommet dupliqué, perspectives échangées à la
+    /// lecture).
+    #[inline]
+    fn pile_pousse_null(&mut self) {
+        if let Some(pile) = self.pile.as_mut() {
+            pile.pousse_null();
+        }
+    }
+
+    /// Dépile un étage. À appeler au retour de CHAQUE récursion, avant tout
+    /// branchement (stop, coupure...) pour rester en miroir exact des pousse.
+    #[inline]
+    fn pile_depousse(&mut self) {
+        if let Some(pile) = self.pile.as_mut() {
+            pile.depousse();
+        }
+    }
+
+    /// (Tests uniquement) Force le chemin de secours « forward complet » :
+    /// sert de référence aux tests de parité NNUE et au AVANT des benchs.
+    #[cfg(test)]
+    fn force_forward_complet(&mut self) {
+        self.eval = None;
+        self.pile = None;
     }
 
     // --- Limites -------------------------------------------------------------
@@ -759,7 +878,7 @@ mod tests {
     use crate::bots::{Bot, NetBot};
     use rand::rngs::StdRng;
     use rand::seq::SliceRandom;
-    use rand::SeedableRng;
+    use rand::{Rng, SeedableRng};
     use shakmaty::fen::Fen;
     use shakmaty::{CastlingMode, Square};
     use std::collections::HashMap;
@@ -1032,6 +1151,82 @@ mod tests {
             b.noeuds,
             a.noeuds
         );
+    }
+
+    /// (6) Parité NNUE / forward complet : même réseau (biais rendus non nuls
+    /// pour couvrir leur transport dans la pile d'accumulateurs), même
+    /// position, même graine, mêmes limites de nœuds → MÊME coup et MÊME
+    /// score (à 1e-4). Le chercheur de référence est forcé sur le chemin de
+    /// secours (encode + forward_one) via force_forward_complet() —
+    /// exactement le code d'avant l'intégration NNUE.
+    #[test]
+    fn nnue_meme_coup_et_score_que_forward_complet() {
+        let mut net = Arc::try_unwrap(reseau_reduit()).ok().expect("Arc unique");
+        let mut rng = StdRng::seed_from_u64(0xB1A15);
+        for biais in net.biases.iter_mut() {
+            for b in biais.iter_mut() {
+                *b = rng.gen::<f32>() * 0.2 - 0.1;
+            }
+        }
+        let net = Arc::new(net);
+
+        let pos = pos_de_fen(
+            "r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
+        );
+        let mut nnue = Recherche::new(net.clone(), 14);
+        let mut reference = Recherche::new(net, 14);
+        reference.force_forward_complet();
+
+        let a = nnue.cherche(&pos, limites_noeuds(4000));
+        let b = reference.cherche(&pos, limites_noeuds(4000));
+
+        assert_eq!(a.coup, b.coup, "coup NNUE != coup forward complet");
+        assert!(
+            (a.score - b.score).abs() <= 1e-4,
+            "scores divergents : NNUE {} vs forward complet {}",
+            a.score,
+            b.score
+        );
+        assert_eq!(a.profondeur, b.profondeur);
+        // Les scores racine de la dernière itération complète coïncident
+        // aussi coup par coup (même arbre, mêmes bornes fail-soft).
+        assert_eq!(a.scores_racine.len(), b.scores_racine.len());
+        for ((ma, va), (mb, vb)) in a.scores_racine.iter().zip(&b.scores_racine) {
+            assert_eq!(ma, mb);
+            assert!((va - vb).abs() <= 1e-4, "{ma:?} : {va} vs {vb}");
+        }
+    }
+
+    /// Bench NNUE (ignoré par défaut) : nœuds/s et profondeur atteinte en
+    /// 150 ms sur la position initiale, réseau complet [773,512,64,1] —
+    /// AVANT (forward complet forcé) puis APRÈS (évaluation incrémentale).
+    /// Lancer : `cargo test --lib search:: -- --ignored --nocapture`
+    /// (chiffres représentatifs en --release uniquement).
+    #[test]
+    #[ignore]
+    fn bench_nnue_avant_apres_150ms() {
+        let net = Arc::new(Mlp::new(0));
+        for (nom, forcer_forward) in
+            [("AVANT (encode + forward complet)", true), ("APRÈS (NNUE incrémental)   ", false)]
+        {
+            let mut r = Recherche::new(net.clone(), 20);
+            if forcer_forward {
+                r.force_forward_complet();
+            }
+            let debut = Instant::now();
+            let res = r.cherche(
+                &Chess::default(),
+                Limites { max_noeuds: 0, max_profondeur: 0, movetime_ms: 150 },
+            );
+            let d = debut.elapsed();
+            println!(
+                "{nom} : profondeur {:>2}, {:>8} noeuds en {:?} ({:.0} noeuds/s)",
+                res.profondeur,
+                res.noeuds,
+                d,
+                res.noeuds as f64 / d.as_secs_f64()
+            );
+        }
     }
 
     /// Fumée avec le réseau COMPLET (Mlp::new(0)) : la recherche s'intègre au
