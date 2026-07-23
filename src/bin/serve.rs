@@ -35,10 +35,16 @@
 //!   "opponent": "t1h", "thinking_ms": 42}
 //!
 //! Adversaires : "random" → RandomBot ; "material" → MaterialBot(depth 2) ;
-//! paliers → Mlp::load(models/chess_tXh.bin) + NetBot(temperature 0, depth 2) ;
-//! "latest" → chess_latest.bin rechargé à chaud si le mtime a changé (comme le
-//! serveur poker). Un palier absent → 400 avec message clair.
-//! L'IA joue avec une petite graine aléatoire à chaque partie (variété).
+//! paliers et "latest" → Mlp chargé + BotRecherche (négamax alpha-bêta,
+//! movetime 150 ms par coup, température 0). Le bot vit DANS la session :
+//! sa table de transposition est réutilisée entre les coups d'une même
+//! partie, et une nouvelle partie crée un nouveau bot.
+//! "latest" → models/chess_best.bin (modèle promu par gating) s'il existe,
+//! sinon chess_latest.bin ; rechargé à chaud si le mtime du fichier
+//! réellement servi change (comme le serveur poker) — le bot de la session
+//! est alors recréé avec le nouveau réseau. Un palier absent → 400 avec
+//! message clair. L'IA joue avec une petite graine aléatoire à chaque
+//! partie (variété).
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -54,9 +60,10 @@ use shakmaty::zobrist::{Zobrist64, ZobristHash};
 use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, Move, Position};
 use tiny_http::{Header, Method, Request, Response, Server};
 
-use echec::bots::{Bot, MaterialBot, NetBot, RandomBot};
+use echec::bots::{Bot, BotRecherche, MaterialBot, RandomBot};
 use echec::checkpoints::MILESTONES_H;
 use echec::nn::Mlp;
+use echec::search::Limites;
 
 /// Dossier des modèles (relatif au répertoire de lancement, comme l'entraîneur).
 const MODELS_DIR: &str = "models";
@@ -64,6 +71,13 @@ const MODELS_DIR: &str = "models";
 const WEB_DIR: &str = "web";
 /// Port d'écoute (IPv4 et IPv6).
 const PORT: u16 = 8778;
+/// Limites de recherche des adversaires réseau : 150 ms par coup,
+/// pas de plafond de nœuds ni de profondeur (le temps arbitre).
+const LIMITES_SERVEUR: Limites = Limites {
+    max_noeuds: 0,
+    max_profondeur: 0,
+    movetime_ms: 150,
+};
 
 // ---------------------------------------------------------------------------
 // Session de jeu
@@ -90,6 +104,12 @@ struct Session {
     /// Graine du prochain coup de l'IA (tirée au hasard à chaque partie,
     /// incrémentée à chaque coup pour la variété).
     graine: u64,
+    /// Bot de recherche des adversaires réseau, créé au premier coup de l'IA
+    /// et conservé toute la partie (sa table de transposition est réutilisée
+    /// entre les coups — c'est une grosse part de sa force). On garde aussi
+    /// le réseau qui a servi à le créer : si le rechargement à chaud fournit
+    /// un nouveau réseau (mtime changé), on recrée le bot.
+    bot: Option<(Arc<Mlp>, BotRecherche)>,
 }
 
 /// Hachage zobrist de la position courante (en passant légal uniquement).
@@ -114,6 +134,9 @@ impl Session {
             repetitions,
             thinking_ms: 0,
             graine: rand::thread_rng().gen(),
+            // Créé paresseusement au premier coup de l'IA (nouvelle partie
+            // = nouveau bot, donc table de transposition vierge).
+            bot: None,
         }
     }
 
@@ -172,8 +195,17 @@ struct Etat {
 
 /// Chemin du fichier modèle pour un identifiant d'adversaire réseau,
 /// None pour "random"/"material"/inconnu.
+///
+/// "latest" sert models/chess_best.bin (modèle promu par gating) s'il existe,
+/// sinon chess_latest.bin. Réévalué à CHAQUE appel : dès que le gating promeut
+/// un premier best, c'est lui qui est servi — et le rechargement à chaud
+/// (mtime dans le cache) surveille le fichier réellement servi.
 fn chemin_modele(id: &str) -> Option<String> {
     if id == "latest" {
+        let best = format!("{MODELS_DIR}/chess_best.bin");
+        if Path::new(&best).exists() {
+            return Some(best);
+        }
         return Some(format!("{MODELS_DIR}/chess_latest.bin"));
     }
     for &h in MILESTONES_H {
@@ -216,15 +248,53 @@ fn coup_ia(session: &mut Session, cache: &CacheModeles) -> Result<(), String> {
     let graine = session.graine;
     session.graine = session.graine.wrapping_add(1);
 
+    // Pour un adversaire réseau : (re)création du bot AVANT de chronométrer —
+    // thinking_ms mesure le coup, pas le chargement du fichier modèle.
+    if !matches!(session.opponent.as_str(), "random" | "material") {
+        let chemin = chemin_modele(&session.opponent)
+            .ok_or_else(|| format!("adversaire inconnu : {}", session.opponent))?;
+        match charger_modele(cache, &chemin) {
+            Ok(net) => {
+                // Bot absent (premier coup de la partie) ou réseau rechargé à
+                // chaud (nouveau Arc dans le cache) → nouveau bot, TT vierge.
+                let recreer = match &session.bot {
+                    Some((ancien, _)) => !Arc::ptr_eq(ancien, &net),
+                    None => true,
+                };
+                if recreer {
+                    session.bot = Some((
+                        net.clone(),
+                        // Température 0 : meilleur coup de la recherche (la
+                        // force est l'objectif) ; la variété vient de la
+                        // graine de la partie.
+                        BotRecherche::new(net, graine, LIMITES_SERVEUR, 0.0),
+                    ));
+                }
+            }
+            // Rechargement impossible (ex. fichier momentanément illisible
+            // pendant son remplacement par l'entraîneur) : si un bot de
+            // session existe déjà, on continue avec lui — le coup humain est
+            // déjà joué et aucun endpoint ne relance le coup IA, une erreur
+            // 400 ici laisserait la partie coincée jusqu'à new-game. Le coup
+            // suivant retentera le rechargement. Sans bot existant (premier
+            // coup IA de la partie), l'erreur remonte : rien pour jouer.
+            Err(e) => {
+                if session.bot.is_none() {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
     let debut = Instant::now();
     let coup = match session.opponent.as_str() {
         "random" => RandomBot::new(graine).choose(&session.pos),
         "material" => MaterialBot::new(graine, 2).choose(&session.pos),
-        id => {
-            let chemin =
-                chemin_modele(id).ok_or_else(|| format!("adversaire inconnu : {id}"))?;
-            let net = charger_modele(cache, &chemin)?;
-            NetBot::new(&net, graine, 0.0, 2).choose(&session.pos)
+        _ => {
+            // Bot garanti présent : créé ci-dessus, ou conservé du coup
+            // précédent si le rechargement à chaud vient d'échouer.
+            let (_, bot) = session.bot.as_mut().expect("bot présent à ce stade");
+            bot.choose(&session.pos)
         }
     };
     session.thinking_ms = debut.elapsed().as_millis() as u64;
@@ -293,10 +363,18 @@ fn checkpoints_json() -> serde_json::Value {
             "available": Path::new(&chemin).exists(),
         }));
     }
+    // "latest" : chess_best.bin (promu par gating) prioritaire, sinon
+    // chess_latest.bin — le libellé dit lequel est réellement servi.
+    let best_present = Path::new(&format!("{MODELS_DIR}/chess_best.bin")).exists();
+    let latest_present = Path::new(&format!("{MODELS_DIR}/chess_latest.bin")).exists();
     opponents.push(serde_json::json!({
         "id": "latest",
-        "label": "IA — dernier modèle",
-        "available": Path::new(&format!("{MODELS_DIR}/chess_latest.bin")).exists(),
+        "label": if best_present {
+            "IA — dernier modèle (gating)"
+        } else {
+            "IA — dernier modèle"
+        },
+        "available": best_present || latest_present,
     }));
     serde_json::json!({"opponents": opponents})
 }

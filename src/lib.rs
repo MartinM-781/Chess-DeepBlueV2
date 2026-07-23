@@ -9,5 +9,6 @@ pub mod checkpoints;
 pub mod elo;
 pub mod features;
 pub mod nn;
+pub mod search;
 pub mod selfplay;
 pub mod uci;

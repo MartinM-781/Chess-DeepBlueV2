@@ -1,13 +1,17 @@
-//! Adversaires : bot aléatoire, bot matériel (alpha-bêta), bot réseau.
+//! Adversaires : bot aléatoire, bot matériel (alpha-bêta), bot réseau,
+//! bot recherche (négamax complet du module `search`).
 //! Tous renvoient None uniquement s'il n'existe aucun coup légal.
+
+use std::sync::Arc;
 
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
-use shakmaty::{Chess, Move, Position};
+use shakmaty::{Board, Chess, Color, Move, Position};
 
 use crate::features::{encode, N_FEATURES};
 use crate::nn::Mlp;
+use crate::search;
 
 pub trait Bot {
     fn choose(&mut self, pos: &Chess) -> Option<Move>;
@@ -252,5 +256,143 @@ impl<'a> Bot for NetBot<'a> {
                 negamax_reseau(net, fille, d - 1, 1, f32::NEG_INFINITY, f32::INFINITY, &mut buf)
             })
         }
+    }
+}
+
+/// Échantillonne un coup parmi les scores racine par softmax(score / T).
+/// Les scores sont clampés à [-2, 2] AVANT le softmax : un score de mat
+/// (±SCORE_MAT) ne doit pas écraser la distribution — un mat « vaut » 2.
+/// Softmax stabilisé par soustraction du max. None si `scores` est vide.
+pub(crate) fn echantillonne_scores_racine(
+    scores: &[(Move, f32)],
+    temperature: f32,
+    rng: &mut StdRng,
+) -> Option<Move> {
+    if scores.is_empty() {
+        return None;
+    }
+    let t = temperature.max(1e-6);
+    let clamps: Vec<f32> = scores.iter().map(|(_, s)| s.clamp(-2.0, 2.0)).collect();
+    let vmax = clamps.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let poids: Vec<f32> = clamps.iter().map(|v| ((v - vmax) / t).exp()).collect();
+    let somme: f32 = poids.iter().sum();
+    let mut tirage = rng.gen::<f32>() * somme;
+    for (i, w) in poids.iter().enumerate() {
+        tirage -= w;
+        if tirage <= 0.0 {
+            return Some(scores[i].0.clone());
+        }
+    }
+    // Filet de sécurité numérique : dernier coup.
+    scores.last().map(|(m, _)| m.clone())
+}
+
+/// Vrai si `pos` est exactement la position initiale des échecs.
+fn est_position_initiale(pos: &Chess) -> bool {
+    pos.fullmoves().get() == 1
+        && pos.turn() == Color::White
+        && pos.halfmoves() == 0
+        && pos.board() == &Board::default()
+}
+
+/// Bot piloté par la recherche complète (`search::Recherche`) : alpha-bêta à
+/// approfondissement itératif, TT persistante entre les coups d'une même
+/// partie. `temperature == 0` → meilleur coup ; `temperature > 0` → softmax
+/// sur les scores racine (clampés, voir `echantillonne_scores_racine`).
+pub struct BotRecherche {
+    /// UN chercheur persistant : la TT est réutilisée entre coups (gros gain),
+    /// et vidée au début de chaque partie via `nouvelle_partie()`.
+    recherche: search::Recherche,
+    rng: StdRng,
+    limites: search::Limites,
+    temperature: f32,
+}
+
+impl BotRecherche {
+    /// Taille de la table de transposition : 2^20 ≈ 1M d'entrées.
+    const TAILLE_TT_LOG2: u32 = 20;
+
+    pub fn new(net: Arc<Mlp>, seed: u64, limites: search::Limites, temperature: f32) -> Self {
+        BotRecherche {
+            recherche: search::Recherche::new(net, Self::TAILLE_TT_LOG2),
+            rng: StdRng::seed_from_u64(seed),
+            limites,
+            temperature,
+        }
+    }
+}
+
+impl Bot for BotRecherche {
+    fn choose(&mut self, pos: &Chess) -> Option<Move> {
+        // Détection du premier coup d'une partie : la position initiale ne
+        // peut réapparaître en cours de partie (fullmoves croît), on peut donc
+        // vider TT/killers/historique sans risque de faux positif.
+        if est_position_initiale(pos) {
+            self.recherche.nouvelle_partie();
+        }
+        let res = self.recherche.cherche(pos, self.limites);
+        if self.temperature > 0.0 {
+            if let Some(m) =
+                echantillonne_scores_racine(&res.scores_racine, self.temperature, &mut self.rng)
+            {
+                return Some(m);
+            }
+        }
+        res.coup
+    }
+}
+
+#[cfg(test)]
+mod tests_recherche {
+    use super::*;
+
+    /// Le clamp à [-2, 2] empêche un score de mat (±SCORE_MAT) d'écraser le
+    /// softmax : à T = 1, les autres coups restent échantillonnés.
+    #[test]
+    fn echantillonnage_mat_ne_crase_pas() {
+        let coups = Chess::default().legal_moves();
+        assert!(coups.len() >= 2);
+        // Premier coup : score de mat (+SCORE_MAT), les autres : 0.
+        let scores: Vec<(Move, f32)> = coups
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.clone(), if i == 0 { crate::search::SCORE_MAT } else { 0.0 }))
+            .collect();
+        let mut rng = StdRng::seed_from_u64(1);
+        let mut vu_mat = false;
+        let mut vu_autre = false;
+        for _ in 0..300 {
+            let m = echantillonne_scores_racine(&scores, 1.0, &mut rng).unwrap();
+            if m == scores[0].0 {
+                vu_mat = true;
+            } else {
+                vu_autre = true;
+            }
+        }
+        assert!(vu_mat, "le coup de mat doit rester le plus probable");
+        assert!(vu_autre, "les autres coups ne doivent pas être écrasés (clamp à 2)");
+    }
+
+    /// À température quasi nulle, le meilleur coup est (quasi) toujours choisi.
+    #[test]
+    fn echantillonnage_froid_choisit_le_meilleur() {
+        let coups = Chess::default().legal_moves();
+        let scores: Vec<(Move, f32)> = coups
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.clone(), if i == 3 { 1.5 } else { -0.5 }))
+            .collect();
+        let mut rng = StdRng::seed_from_u64(2);
+        for _ in 0..100 {
+            let m = echantillonne_scores_racine(&scores, 0.01, &mut rng).unwrap();
+            assert_eq!(m, scores[3].0);
+        }
+    }
+
+    /// Liste vide → None (aucun coup légal).
+    #[test]
+    fn echantillonnage_vide() {
+        let mut rng = StdRng::seed_from_u64(3);
+        assert!(echantillonne_scores_racine(&[], 0.5, &mut rng).is_none());
     }
 }
