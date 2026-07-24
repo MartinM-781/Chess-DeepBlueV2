@@ -1,4 +1,5 @@
-//! Réseau de valeur : MLP maison 773 → 512 → 64 → 1 (ReLU cachées, tanh en sortie),
+//! Réseau de valeur : MLP maison (par défaut 773 → 512 → 64 → 1, architecture
+//! libre via `new_avec_tailles` — ReLU cachées, tanh en sortie),
 //! optimiseur Adam, sérialisation binaire maison (pas de dépendance).
 //! `forward_*` doit être utilisable depuis plusieurs threads (&self, aucune mutation).
 
@@ -43,13 +44,43 @@ fn gaussienne(rng: &mut StdRng) -> f32 {
 }
 
 impl Mlp {
-    /// Réseau [N_FEATURES, 512, 64, 1], init He, graine déterministe.
+    /// Réseau [N_FEATURES, 512, 64, 1] (architecture par défaut), init He,
+    /// graine déterministe.
     pub fn new(seed: u64) -> Self {
-        Self::avec_tailles(vec![N_FEATURES, 512, 64, 1], seed)
+        Self::new_avec_tailles(&[N_FEATURES, 512, 64, 1], seed)
     }
 
-    /// Construction générique (privée : les tailles publiques sont figées par `new`,
-    /// mais les tests utilisent de petits réseaux pour aller vite).
+    /// Réseau d'architecture ARBITRAIRE [N_FEATURES, c1, …, 1] : même init que
+    /// `new` (He, biais et moments Adam à zéro), seules les tailles changent —
+    /// la dernière couche reste lue en tanh par `avancer`/`train_batch`.
+    /// Sert à élargir le réseau (ex. [773,1024,128,1]) qu'on amorce ensuite
+    /// par distillation du champion actuel.
+    /// Panique avec un message clair si `tailles[0]` n'est pas N_FEATURES,
+    /// s'il y a moins de deux tailles (entrée puis sortie au minimum) ou si la
+    /// dernière taille n'est pas 1 : tout le code (`avancer` lit `courant[0]`,
+    /// `train_batch` construit un delta par échantillon, l'évaluation
+    /// incrémentale) suppose une sortie SCALAIRE — mieux vaut échouer ici
+    /// qu'une panique d'indexation différée en plein entraînement.
+    pub fn new_avec_tailles(tailles: &[usize], seed: u64) -> Mlp {
+        assert!(
+            tailles.len() >= 2,
+            "new_avec_tailles: il faut au moins deux tailles (entrée puis sortie), reçu {tailles:?}"
+        );
+        assert_eq!(
+            tailles[0], N_FEATURES,
+            "new_avec_tailles: la couche d'entrée doit faire N_FEATURES = {N_FEATURES}, reçu {}",
+            tailles[0]
+        );
+        assert_eq!(
+            *tailles.last().unwrap(), 1,
+            "new_avec_tailles: la dernière couche doit valoir 1 (sortie scalaire tanh), reçu {tailles:?}"
+        );
+        Self::avec_tailles(tailles.to_vec(), seed)
+    }
+
+    /// Construction générique (privée : elle accepte n'importe quelle taille
+    /// d'entrée pour les petits réseaux de test ; l'API publique passe par
+    /// `new`/`new_avec_tailles` qui imposent N_FEATURES en entrée).
     fn avec_tailles(sizes: Vec<usize>, seed: u64) -> Self {
         assert!(sizes.len() >= 2, "il faut au moins une couche entrée→sortie");
         let mut rng = StdRng::seed_from_u64(seed);
@@ -479,5 +510,123 @@ mod tests {
             let seul = net.forward_one(&xs[i * 10..(i + 1) * 10]);
             assert_eq!(lot[i], seul, "ligne {i} : lot != unitaire");
         }
+    }
+
+    /// new_avec_tailles sur l'architecture ÉLARGIE réelle [773,1024,128,1] :
+    /// la loss chute sur un problème jouet (la rétropropagation traverse bien
+    /// toutes les couches), puis l'aller-retour disque est EXACT.
+    #[test]
+    fn new_avec_tailles_apprend_et_serialise_1024_128() {
+        let mut net = Mlp::new_avec_tailles(&[N_FEATURES, 1024, 128, 1], 12);
+        assert_eq!(net.sizes, vec![N_FEATURES, 1024, 128, 1]);
+        assert_eq!(net.steps, 0);
+
+        // Jouet : 4 entrées clairsemées en 0/1 (comme les vraies features),
+        // cibles arbitraires dans (-1, 1).
+        let n = 4;
+        let mut xs = vec![0.0f32; n * N_FEATURES];
+        for i in 0..n {
+            for k in 0..40 {
+                xs[i * N_FEATURES + (i * 131 + k * 19) % N_FEATURES] = 1.0;
+            }
+        }
+        let cibles = [0.7f32, -0.6, 0.4, -0.3];
+
+        // lr 0.001 : à 0.005, Adam (pas ≈ -lr·signe(g) sur ~900 k poids) fait
+        // d'abord chuter la loss puis la projette sur un plateau saturé
+        // (tanh/ReLU morts) dont elle ne sort plus — mesuré : 0.494 → 0.675.
+        // À 0.001, la même config converge (0.494 → 0.001 en 31 pas).
+        let loss_initiale = net.train_batch(&xs, &cibles, 0.001);
+        let mut loss_finale = loss_initiale;
+        for _ in 0..30 {
+            loss_finale = net.train_batch(&xs, &cibles, 0.001);
+        }
+        assert!(
+            loss_finale < loss_initiale * 0.5,
+            "la loss ne chute pas sur [773,1024,128,1] : {loss_initiale} -> {loss_finale}"
+        );
+        assert_eq!(net.steps, 31);
+
+        // Aller-retour disque exact (tailles, steps, poids, biais, moments).
+        let chemin = chemin_temporaire("elargi_1024");
+        net.save(&chemin).expect("échec de la sauvegarde");
+        let relu = Mlp::load(&chemin).expect("échec du chargement");
+        let _ = std::fs::remove_file(&chemin);
+        assert_eq!(relu.sizes, net.sizes);
+        assert_eq!(relu.steps, net.steps);
+        assert_eq!(relu.weights, net.weights);
+        assert_eq!(relu.biases, net.biases);
+        assert_eq!(relu.adam_mw, net.adam_mw);
+        assert_eq!(relu.adam_vw, net.adam_vw);
+        assert_eq!(relu.adam_mb, net.adam_mb);
+        assert_eq!(relu.adam_vb, net.adam_vb);
+    }
+
+    /// Apprentissage d'une tête PROFONDE (3 couches cachées) : seul test du
+    /// crate à exercer `train_batch` au-delà de 2 couches cachées — la
+    /// batterie de parité nnue (test 6b, [773,256,64,32,1]) ne couvre ce
+    /// chemin que côté INFÉRENCE. Convergence puis aller-retour disque exact.
+    #[test]
+    fn train_batch_apprend_tete_profonde_32_16_8() {
+        let mut net = Mlp::new_avec_tailles(&[N_FEATURES, 32, 16, 8, 1], 9);
+        assert_eq!(net.sizes, vec![N_FEATURES, 32, 16, 8, 1]);
+
+        // Mêmes entrées jouets que le test [773,1024,128,1] : clairsemées 0/1.
+        let n = 4;
+        let mut xs = vec![0.0f32; n * N_FEATURES];
+        for i in 0..n {
+            for k in 0..40 {
+                xs[i * N_FEATURES + (i * 131 + k * 19) % N_FEATURES] = 1.0;
+            }
+        }
+        let cibles = [0.7f32, -0.6, 0.4, -0.3];
+
+        let loss_initiale = net.train_batch(&xs, &cibles, 1e-3);
+        let mut loss_finale = loss_initiale;
+        for _ in 0..300 {
+            loss_finale = net.train_batch(&xs, &cibles, 1e-3);
+        }
+        assert!(
+            loss_finale < loss_initiale * 0.2,
+            "la loss ne chute pas sur [773,32,16,8,1] : {loss_initiale} -> {loss_finale}"
+        );
+        assert_eq!(net.steps, 301);
+
+        // Aller-retour disque exact, moments Adam non triviaux compris.
+        let chemin = chemin_temporaire("profond_32_16_8");
+        net.save(&chemin).expect("échec de la sauvegarde");
+        let relu = Mlp::load(&chemin).expect("échec du chargement");
+        let _ = std::fs::remove_file(&chemin);
+        assert_eq!(relu.sizes, net.sizes);
+        assert_eq!(relu.steps, net.steps);
+        assert_eq!(relu.weights, net.weights);
+        assert_eq!(relu.biases, net.biases);
+        assert_eq!(relu.adam_mw, net.adam_mw);
+        assert_eq!(relu.adam_vw, net.adam_vw);
+        assert_eq!(relu.adam_mb, net.adam_mb);
+        assert_eq!(relu.adam_vb, net.adam_vb);
+    }
+
+    /// Garde de new_avec_tailles : une entrée qui n'est pas N_FEATURES panique.
+    #[test]
+    #[should_panic(expected = "N_FEATURES")]
+    fn new_avec_tailles_refuse_mauvaise_entree() {
+        let _ = Mlp::new_avec_tailles(&[10, 4, 1], 1);
+    }
+
+    /// Garde de new_avec_tailles : une sortie non scalaire panique à la
+    /// construction (plutôt qu'une indexation hors bornes en plein
+    /// entraînement ou des sorties surnuméraires ignorées en silence).
+    #[test]
+    #[should_panic(expected = "sortie scalaire")]
+    fn new_avec_tailles_refuse_sortie_non_scalaire() {
+        let _ = Mlp::new_avec_tailles(&[N_FEATURES, 8, 2], 1);
+    }
+
+    /// Garde de new_avec_tailles : moins de deux tailles panique.
+    #[test]
+    #[should_panic(expected = "deux tailles")]
+    fn new_avec_tailles_refuse_moins_de_deux_couches() {
+        let _ = Mlp::new_avec_tailles(&[N_FEATURES], 1);
     }
 }

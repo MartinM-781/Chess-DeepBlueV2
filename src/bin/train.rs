@@ -483,6 +483,12 @@ fn main() {
         .expect("construction du pool rayon global");
 
     // 1. Reprise : modèle + état cumulés s'ils existent, sinon départ à neuf.
+    //    ATTENTION : le départ à neuf crée l'architecture PAR DÉFAUT de
+    //    `Mlp::new` ([773,512,64,1]), pas le réseau élargi. Le flux nominal
+    //    pour élargir est : distill.exe → copier l'élève sur chess_latest.bin
+    //    → relancer train.exe, qui reprend alors les tailles lues du fichier
+    //    (tout le chargement est générique). L'architecture est journalisée
+    //    ci-dessous pour rendre visible tout départ à neuf inattendu.
     let chemin_latest = checkpoints::latest_path(&opt.out);
     let net = if Path::new(&chemin_latest).exists() {
         Mlp::load(&chemin_latest).expect("chargement de chess_latest.bin")
@@ -493,14 +499,15 @@ fn main() {
     let mut etat = TrainState::load(&opt.out);
     if etat.cycles > 0 {
         println!(
-            "reprise : {} cycles, {:.3} h, {} parties, {} positions",
+            "reprise : {} cycles, {:.3} h, {} parties, {} positions, architecture {:?}",
             etat.cycles,
             etat.trained_secs / 3600.0,
             etat.games,
-            etat.positions
+            etat.positions,
+            net.sizes
         );
     } else {
-        println!("réseau neuf (graine {})", opt.seed);
+        println!("réseau neuf (graine {}, architecture {:?})", opt.seed, net.sizes);
     }
     // Marqueur de changement de régime pour les courbes du dashboard : posé une
     // seule fois, à la première activation du régime recherche.

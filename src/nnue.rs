@@ -40,14 +40,16 @@ struct CoucheSup {
 /// la couche 1 est stockée TRANSPOSÉE (une colonne de `h1` f32 contiguë par
 /// feature) pour que l'ajout/retrait d'une feature soit un parcours linéaire.
 pub struct EvalIncrementale {
-    /// Largeur de la couche 1 (512 pour le réseau réel).
+    /// Largeur de la couche 1 (`sizes[1]` : 512 pour le réseau par défaut).
     h1: usize,
     /// Colonnes de la couche 1, à plat : colonne de la feature f =
     /// `cols[f*h1 .. (f+1)*h1]`.
     cols: Vec<f32>,
     /// Biais de la couche 1 (placés dans l'accumulateur initial).
     biais1: Vec<f32>,
-    /// Couches au-dessus de l'accumulateur (512→64→1 pour le réseau réel).
+    /// Couches au-dessus de l'accumulateur, en nombre ARBITRAIRE (512→64 puis
+    /// 64→1 pour le réseau par défaut ; toute tête ReLU…tanh convient, ex.
+    /// [1024,128,1] élargie ou [256,64,32,1] profonde).
     sup: Vec<CoucheSup>,
 }
 
@@ -63,6 +65,13 @@ impl EvalIncrementale {
         assert_eq!(
             net.sizes[0], N_FEATURES,
             "EvalIncrementale: la couche d'entrée doit faire N_FEATURES"
+        );
+        // Même garde que `Mlp::new_avec_tailles` : `evalue` lit `courant[0]`
+        // et suppose une sortie scalaire tanh — refus immédiat et lisible.
+        assert_eq!(
+            *net.sizes.last().unwrap(), 1,
+            "EvalIncrementale: la dernière couche doit valoir 1 (sortie scalaire tanh), reçu {:?}",
+            net.sizes
         );
         let h1 = net.sizes[1];
         assert_eq!(net.weights[0].len(), h1 * N_FEATURES);
@@ -275,7 +284,8 @@ impl PileAccus {
             *v = v.max(0.0);
         }
 
-        // Couches supérieures : mêmes boucles que `Mlp::avancer` (row-major,
+        // Couches supérieures : boucle GÉNÉRIQUE sur `sup` (une, deux ou
+        // davantage de couches), mêmes boucles que `Mlp::avancer` (row-major,
         // même ordre de sommation → mêmes arrondis sur cette partie).
         let n_sup = eval.sup.len();
         let mut suivant: Vec<f32> = Vec::new();
@@ -695,6 +705,222 @@ mod tests {
         let eval = EvalIncrementale::new(&net);
         let mut pile = eval.racine(&Chess::default());
         pile.depousse();
+    }
+
+    /// Garde de EvalIncrementale::new : un réseau à sortie non scalaire est
+    /// refusé à la construction (`evalue` lirait `courant[0]` en ignorant
+    /// silencieusement les autres sorties).
+    #[test]
+    #[should_panic(expected = "sortie scalaire")]
+    fn eval_incrementale_refuse_sortie_non_scalaire() {
+        // Mlp construit par les champs publics : sizes se termine par 2.
+        let sizes = vec![N_FEATURES, 4, 2];
+        let weights = vec![vec![0.0f32; 4 * N_FEATURES], vec![0.0f32; 2 * 4]];
+        let biases = vec![vec![0.0f32; 4], vec![0.0f32; 2]];
+        let zw: Vec<Vec<f32>> = weights.iter().map(|w| vec![0.0; w.len()]).collect();
+        let zb: Vec<Vec<f32>> = biases.iter().map(|b| vec![0.0; b.len()]).collect();
+        let net = Mlp {
+            sizes,
+            weights,
+            biases,
+            adam_mw: zw.clone(),
+            adam_vw: zw,
+            adam_mb: zb.clone(),
+            adam_vb: zb,
+            steps: 0,
+        };
+        let _ = EvalIncrementale::new(&net);
+    }
+
+    // -----------------------------------------------------------------------
+    // 6. Mêmes garanties de parité pour des architectures NON par défaut,
+    // créées par `Mlp::new_avec_tailles` (graine fixe) : le réseau ÉLARGI
+    // [773,1024,128,1] (cible de la distillation) et une tête PROFONDE
+    // [773,256,64,32,1] (trois couches au-dessus de l'accumulateur).
+    // -----------------------------------------------------------------------
+
+    /// Batterie complète pour une architecture donnée, reprenant les mêmes
+    /// vérifications que les tests 1 à 4 : parité statique, parités
+    /// incrémentales sur parties aléatoires ET scriptées (les quatre roques,
+    /// promotions avec/sans capture, prises en passant des deux camps),
+    /// null-move (avec retour exact après depousse) et marche pousse/depousse.
+    /// Les effectifs sont réduits par rapport aux tests 1-2 : les forwards de
+    /// référence de ces réseaux larges coûtent cher en debug.
+    fn batterie_parite(
+        tailles: &[usize],
+        graine: u64,
+        n_statique: usize,
+        n_parties: u64,
+        contexte: &str,
+    ) {
+        // Réseau créé par le constructeur PUBLIC générique ; biais rendus non
+        // nuls (comme au test 1) pour qu'une perte des biais soit détectée.
+        let mut net = Mlp::new_avec_tailles(tailles, graine);
+        assert_eq!(net.sizes, tailles);
+        let mut rng = StdRng::seed_from_u64(graine ^ 0xB1A15);
+        for biais in net.biases.iter_mut() {
+            for b in biais.iter_mut() {
+                *b = rng.gen::<f32>() * 0.2 - 0.1;
+            }
+        }
+        let eval = EvalIncrementale::new(&net);
+
+        // --- Parité statique sur des positions de parties aléatoires. ---
+        let mut positions = vec![Chess::default()];
+        let mut g = 0u64;
+        while positions.len() < n_statique {
+            for (pos, _) in partie_aleatoire(&Chess::default(), graine * 1000 + g, 90) {
+                positions.push(pos);
+                if positions.len() >= n_statique {
+                    break;
+                }
+            }
+            g += 1;
+        }
+        for (i, pos) in positions.iter().enumerate() {
+            let attendu = reference(&net, pos);
+            let obtenu = eval.racine(pos).evalue(&eval, pos);
+            assert!(
+                (attendu - obtenu).abs() <= TOL,
+                "{contexte}, statique {i} : incrémental {obtenu} vs référence {attendu}"
+            );
+        }
+
+        // --- Parité incrémentale : parties aléatoires + scripts des tests
+        // 2b/2c/2c bis/2d, qui GARANTISSENT la couverture roques/promotions/
+        // en passant indépendamment de l'aléa. ---
+        let mut parties: Vec<(Vec<(Chess, Move)>, String)> = Vec::new();
+        for p in 0..n_parties {
+            parties.push((
+                partie_aleatoire(&Chess::default(), graine * 1000 + 500 + p, 120),
+                format!("{contexte}, partie aléatoire {p}"),
+            ));
+        }
+        parties.push((
+            construit_partie(&Chess::default(), &[
+                "e2e4", "d7d5", "g1f3", "b8c6", "f1c4", "c8f5", "e1g1", "d8d6", "d2d3", "e8c8",
+            ]),
+            format!("{contexte}, O-O blanc / O-O-O noir"),
+        ));
+        parties.push((
+            construit_partie(&Chess::default(), &[
+                "d2d4", "e7e5", "c1e3", "f8e7", "b1c3", "g8f6", "d1d2", "e8g8", "e1c1",
+            ]),
+            format!("{contexte}, O-O-O blanc / O-O noir"),
+        ));
+        parties.push((
+            construit_partie(
+                &pos_de_fen("rnbqkb1r/ppppppPp/8/8/8/8/PPPPPPpP/RNBQKB1R w KQkq - 0 1"),
+                &["g7h8q", "g2h1n"],
+            ),
+            format!("{contexte}, promotions avec capture"),
+        ));
+        parties.push((
+            construit_partie(&pos_de_fen("8/4k1P1/8/8/8/8/6p1/4K3 w - - 0 1"), &["g7g8q", "g2g1n"]),
+            format!("{contexte}, promotions calmes"),
+        ));
+        parties.push((
+            construit_partie(&Chess::default(), &[
+                "e2e4", "g8f6", "e4e5", "d7d5", "e5d6", "c7d6", "g1f3", "b7b5", "f3g1", "b5b4",
+                "c2c4", "b4c3",
+            ]),
+            format!("{contexte}, prises en passant"),
+        ));
+        let (mut roques, mut promotions, mut en_passants) = (0usize, 0usize, 0usize);
+        for (partie, nom) in &parties {
+            for (_, m) in partie {
+                if m.is_castle() {
+                    roques += 1;
+                }
+                if m.promotion().is_some() {
+                    promotions += 1;
+                }
+                if m.is_en_passant() {
+                    en_passants += 1;
+                }
+            }
+            verifie_partie(&net, &eval, partie, nom);
+        }
+        // Plancher garanti par les seuls scripts (4 roques, 4 promotions, 2 e.p.).
+        assert!(
+            roques >= 4 && promotions >= 4 && en_passants >= 2,
+            "{contexte} : couverture insuffisante ({roques} roques, {promotions} promotions, {en_passants} e.p.)"
+        );
+
+        // --- Null-move en cours de partie, et retour EXACT après depousse. ---
+        let mut testes = 0;
+        for p in 0..3u64 {
+            let partie = partie_aleatoire(&Chess::default(), graine * 1000 + 800 + p, 60);
+            if partie.is_empty() {
+                continue;
+            }
+            let mut pile = eval.racine(&partie[0].0);
+            for (avant, m) in &partie {
+                pile.pousse(&eval, avant, m);
+                let apres = avant.clone().play(m).expect("coup légal");
+                if let Some(inverse) = inverse_trait(&apres) {
+                    let avant_null = pile.evalue(&eval, &apres);
+                    pile.pousse_null();
+                    let obtenu = pile.evalue(&eval, &inverse);
+                    let attendu = reference(&net, &inverse);
+                    assert!(
+                        (attendu - obtenu).abs() <= TOL,
+                        "{contexte}, null-move partie {p} : {obtenu} vs {attendu}"
+                    );
+                    pile.depousse();
+                    assert_eq!(
+                        pile.evalue(&eval, &apres),
+                        avant_null,
+                        "{contexte} : depousse du null-move ne restitue pas l'évaluation"
+                    );
+                    testes += 1;
+                }
+            }
+        }
+        assert!(testes > 10, "{contexte} : trop peu de null-moves testés ({testes})");
+
+        // --- Marche aléatoire pousse/depousse, parité après CHAQUE pas. ---
+        let mut rng = StdRng::seed_from_u64(graine.wrapping_mul(31) + 7);
+        let mut pile = eval.racine(&Chess::default());
+        let mut positions = vec![Chess::default()];
+        for pas in 0..250 {
+            let sommet = positions.last().unwrap().clone();
+            let coups = sommet.legal_moves();
+            let pousser = !coups.is_empty() && (positions.len() == 1 || rng.gen_bool(0.6));
+            if pousser {
+                let m = coups[rng.gen_range(0..coups.len())].clone();
+                pile.pousse(&eval, &sommet, &m);
+                positions.push(sommet.play(&m).expect("coup légal"));
+            } else if positions.len() > 1 {
+                pile.depousse();
+                positions.pop();
+            } else {
+                break;
+            }
+            let pos = positions.last().unwrap();
+            let attendu = reference(&net, pos);
+            let obtenu = pile.evalue(&eval, pos);
+            assert!(
+                (attendu - obtenu).abs() <= TOL,
+                "{contexte}, marche pas {pas} (profondeur {}) : {obtenu} vs {attendu}",
+                positions.len()
+            );
+        }
+    }
+
+    /// 6a. Réseau ÉLARGI [773,1024,128,1] (architecture cible de la
+    /// distillation) : toute la batterie de parité.
+    #[test]
+    fn parite_reseau_elargi_1024_128() {
+        batterie_parite(&[N_FEATURES, 1024, 128, 1], 101, 60, 4, "réseau [773,1024,128,1]");
+    }
+
+    /// 6b. Tête PROFONDE [773,256,64,32,1] : trois couches au-dessus de
+    /// l'accumulateur, la boucle générique de `evalue` est réellement exercée
+    /// au-delà du schéma à deux couches.
+    #[test]
+    fn parite_tete_profonde_256_64_32() {
+        batterie_parite(&[N_FEATURES, 256, 64, 32, 1], 202, 120, 8, "réseau [773,256,64,32,1]");
     }
 
     /// 5. Bench (ignoré par défaut) : évals/s de evalue() contre forward_one()
