@@ -1,0 +1,6 @@
+# Compilation pour LE processeur de cette machine (i7-13700H : AVX2, FMA...).
+# Les boucles denses du réseau (accumulateurs NNUE, têtes, apprentissage)
+# se vectorisent 8 flottants par 8 au lieu du x86-64 générique (SSE2).
+# Contrepartie assumée : le binaire n'est pas portable sur une autre machine.
+[build]
+rustflags = ["-C", "target-cpu=native"]
