@@ -27,6 +27,20 @@
 //!                         mais v_racine (étiquettes TD-leaf ET arbitrage)
 //!                         vient de la recherche du mentor — anti chambre
 //!                         d'écho du TD auto-référentiel (vide = désactivé)
+//!   --mentor-poids 1.0    poids de l'étiqueteur EXTERNE (mentor OU oracle)
+//!                         dans les étiquettes TD-leaf et l'arbitrage :
+//!                         v = poids·v_étiqueteur + (1-poids)·v_élève ;
+//!                         1.0 = étiquettes externes pures ; desserrer (0.7)
+//!                         laisse la recherche de l'élève ré-entrer dans ses
+//!                         étiquettes — sans effet hors --mentor/--oracle
+//!   --oracle ""           régime recherche : chemin d'un moteur UCI externe
+//!                         (Stockfish) lancé PLEINE FORCE comme étiqueteur —
+//!                         même rôle que --mentor (les deux sont EXCLUSIFS),
+//!                         mais le plafond de qualité des étiquettes devient
+//!                         celui du moteur, plus celui du champion maison ;
+//!                         mélange oracle/élève piloté par --mentor-poids,
+//!                         comme en mentorat (vide = désactivé)
+//!   --oracle-movetime 15  budget (ms) de chaque évaluation de l'oracle
 //!
 //! Régime « recherche » (search_nodes > 0) :
 //!   - self-play via selfplay::play_training_game_recherche (un chercheur par
@@ -35,6 +49,13 @@
 //!   - mentorat (--mentor non vide) : selfplay::play_training_game_mentor à la
 //!     place — DEUX chercheurs par tâche (élève + mentor, mêmes limites de
 //!     nœuds), l'élève choisit les coups, la recherche du mentor étiquette ;
+//!   - oracle (--oracle non vide, exclusif avec --mentor) : selfplay::
+//!     play_training_game_oracle — un POOL de `threads` moteurs UCI pleine
+//!     force est lancé au démarrage (Mutex<Vec<UciEngine>>) ; chaque tâche
+//!     rayon emprunte un moteur (pop), joue sa partie, le rend (push) —
+//!     compatible with_max_len(1), là où map_init relancerait un processus
+//!     par partie ; moteur mort ou emprunt raté → relance, et si la relance
+//!     échoue la partie se joue SANS oracle (repli élève, jamais de panique) ;
 //!   - estimation Elo mesurée avec BotRecherche (1200 nœuds) au lieu de
 //!     NetBot d2 : le saut de la courbe Elo au changement de régime est VOULU
 //!     (il mesure l'étage recherche) ;
@@ -72,7 +93,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write as _;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use rand::rngs::StdRng;
@@ -90,6 +111,7 @@ use echec::features::N_FEATURES;
 use echec::nn::Mlp;
 use echec::search;
 use echec::selfplay::{self, GameRecord};
+use echec::uci::UciEngine;
 
 /// Plis max d'une partie de self-play ou de gating (au-delà : arbitrage en
 /// nulle, comme en arène).
@@ -133,6 +155,8 @@ struct Options {
     gate_games: usize,
     mentor: String,
     mentor_poids: f32,
+    oracle: String,
+    oracle_movetime: u32,
 }
 
 /// Tampon de rejeu : anneau de positions encodées à capacité fixe.
@@ -218,6 +242,8 @@ fn parse_options() -> Options {
         gate_games: 64,
         mentor: String::new(),
         mentor_poids: 1.0,
+        oracle: String::new(),
+        oracle_movetime: 15,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -244,12 +270,17 @@ fn parse_options() -> Options {
             "--mentor-poids" => {
                 opt.mentor_poids = parse_valeur(&valeur(&args, i, &nom), &nom)
             }
+            "--oracle" => opt.oracle = valeur(&args, i, &nom),
+            "--oracle-movetime" => {
+                opt.oracle_movetime = parse_valeur(&valeur(&args, i, &nom), &nom)
+            }
             _ => {
                 eprintln!("option inconnue : {nom}");
                 eprintln!(
                     "options : --out --threads --games-per-cycle --temperature --lr \
                      --eval-games --replay --elo-every --elo-games --seed \
-                     --search-nodes --td-lambda --gate-every --gate-games --mentor"
+                     --search-nodes --td-lambda --gate-every --gate-games --mentor \
+                     --mentor-poids --oracle --oracle-movetime"
                 );
                 std::process::exit(2);
             }
@@ -492,6 +523,14 @@ fn main() {
     echec::pleine_puissance(); // jamais bridé par l'EcoQoS Windows
     let opt = parse_options();
 
+    // Étiqueteurs EXCLUSIFS : le mentor (réseau maison) et l'oracle (moteur
+    // UCI externe) remplissent le même rôle — les deux à la fois n'a pas de
+    // sens et masquerait une erreur de ligne de commande.
+    if !opt.mentor.is_empty() && !opt.oracle.is_empty() {
+        eprintln!("--mentor et --oracle sont exclusifs : choisir un seul etiqueteur");
+        std::process::exit(2);
+    }
+
     fs::create_dir_all(&opt.out).expect("création du dossier --out");
     // Direct : les parties de self-play retransmettent (une seule à la fois,
     // voir src/direct.rs) dans ce fichier, servi par serve.exe sur /api/live
@@ -554,6 +593,33 @@ fn main() {
         }
         None
     };
+    // Oracle (régime recherche uniquement) : POOL de moteurs UCI PLEINE FORCE
+    // lancés UNE FOIS au démarrage, un par thread rayon. Chaque tâche de
+    // self-play emprunte un moteur (pop), joue sa partie, le rend (push) —
+    // schéma compatible avec with_max_len(1) (une tâche = une partie), là où
+    // map_init relancerait un processus par partie. Un échec au lancement est
+    // une erreur de configuration (chemin faux, binaire absent) : sortie
+    // propre immédiate plutôt qu'une nuit d'étiquettes de repli.
+    let oracle_pool: Option<Mutex<Vec<UciEngine>>> =
+        if opt.search_nodes > 0 && !opt.oracle.is_empty() {
+            let mut moteurs: Vec<UciEngine> = Vec::with_capacity(opt.threads);
+            for _ in 0..opt.threads {
+                match UciEngine::lance_pleine_force(&opt.oracle, opt.oracle_movetime) {
+                    Ok(m) => moteurs.push(m),
+                    Err(e) => {
+                        eprintln!("--oracle {} : lancement impossible ({e})", opt.oracle);
+                        std::process::exit(2);
+                    }
+                }
+            }
+            println!("oracle : {} (movetime {} ms)", opt.oracle, opt.oracle_movetime);
+            Some(Mutex::new(moteurs))
+        } else {
+            if !opt.oracle.is_empty() {
+                println!("attention : --oracle ignore en regime 1-pli (--search-nodes 0)");
+            }
+            None
+        };
     // Marqueur de changement de régime pour les courbes du dashboard : posé une
     // seule fois, à la première activation du régime recherche.
     if opt.search_nodes > 0 {
@@ -566,6 +632,21 @@ fn main() {
                 &chemin_events,
                 "elapsed_hours,label",
                 &format!("{:.3},recherche", etat.trained_secs / 3600.0),
+            );
+        }
+    }
+    // Marqueur « oracle » : même mécanisme, posé une seule fois à la première
+    // activation de l'étiquetage par moteur externe.
+    if oracle_pool.is_some() {
+        let chemin_events = format!("{}/events.csv", opt.out);
+        let deja = fs::read_to_string(&chemin_events)
+            .map(|s| s.contains("oracle"))
+            .unwrap_or(false);
+        if !deja {
+            append_csv(
+                &chemin_events,
+                "elapsed_hours,label",
+                &format!("{:.3},oracle", etat.trained_secs / 3600.0),
             );
         }
     }
@@ -601,7 +682,8 @@ fn main() {
             // Régime recherche : chaque tâche rayon crée SON chercheur (TT
             // locale, clone d'Arc du réseau) et joue une partie TD-leaf —
             // en mentorat, DEUX chercheurs (élève + mentor, même taille de
-            // TT), les coups à l'élève, les étiquettes au mentor.
+            // TT), les coups à l'élève, les étiquettes au mentor ; en mode
+            // oracle, un moteur UCI emprunté au pool étiquette à la place.
             // Les Recherche — donc les clones d'Arc du réseau ÉLÈVE — sont
             // créés et droppés À L'INTÉRIEUR de chaque fermeture map : à la
             // sortie du collect, seul l'Arc principal survit et
@@ -629,22 +711,60 @@ fn main() {
                 .map(|&g| {
                     let mut eleve =
                         search::Recherche::new(net.clone(), TAILLE_TT_LOG2_SELFPLAY);
-                    let partie = match &mentor {
-                        Some(m) => {
-                            let mut prof =
-                                search::Recherche::new(m.clone(), TAILLE_TT_LOG2_SELFPLAY);
-                            selfplay::play_training_game_mentor(
+                    let partie = if let Some(pool) = &oracle_pool {
+                        // Emprunt d'un moteur au pool : pop sous verrou, le
+                        // verrou est relâché PENDANT la partie (le guard est
+                        // un temporaire de l'instruction). Un verrou
+                        // empoisonné est récupéré via into_inner — jamais de
+                        // panique dans une tâche de self-play.
+                        let emprunte = pool.lock().unwrap_or_else(|e| e.into_inner()).pop();
+                        // Santé du moteur emprunté : un isready draine les
+                        // restes éventuels et détecte un processus mort.
+                        let vivant = match emprunte {
+                            Some(mut m) => m.pret().is_ok().then_some(m),
+                            None => None,
+                        };
+                        // Moteur mort ou emprunt raté (pool vide) → relance ;
+                        // relance impossible → la partie se joue SANS oracle
+                        // (repli élève, auto-étiquetée).
+                        let mut moteur = vivant.or_else(|| {
+                            UciEngine::lance_pleine_force(&opt.oracle, opt.oracle_movetime)
+                                .ok()
+                        });
+                        let partie = match moteur.as_mut() {
+                            Some(o) => selfplay::play_training_game_oracle(
                                 &mut eleve,
-                                &mut prof,
+                                o,
                                 g,
                                 &opts_recherche,
-                            )
+                            ),
+                            None => selfplay::play_training_game_recherche(
+                                &mut eleve,
+                                g,
+                                &opts_recherche,
+                            ),
+                        };
+                        // Restitution (un moteur relancé remplace le mort :
+                        // la taille du pool reste stable).
+                        if let Some(m) = moteur {
+                            pool.lock().unwrap_or_else(|e| e.into_inner()).push(m);
                         }
-                        None => selfplay::play_training_game_recherche(
+                        partie
+                    } else if let Some(m) = &mentor {
+                        let mut prof =
+                            search::Recherche::new(m.clone(), TAILLE_TT_LOG2_SELFPLAY);
+                        selfplay::play_training_game_mentor(
+                            &mut eleve,
+                            &mut prof,
+                            g,
+                            &opts_recherche,
+                        )
+                    } else {
+                        selfplay::play_training_game_recherche(
                             &mut eleve,
                             g,
                             &opts_recherche,
-                        ),
+                        )
                     };
                     let n = fait.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if n % 8 == 0 || n == total {

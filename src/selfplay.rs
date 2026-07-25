@@ -2,8 +2,10 @@
 //! température pour explorer), chaque position visitée est étiquetée à la fin par
 //! le résultat DU POINT DE VUE DU TRAIT de cette position (z ∈ {-1, 0, 1}).
 //! Variantes pilotées par la recherche : `play_training_game_recherche`
-//! (cibles TD-leaf auto-étiquetées) et `play_training_game_mentor` (coups
-//! choisis par l'élève, étiquettes fournies par la recherche d'un mentor).
+//! (cibles TD-leaf auto-étiquetées), `play_training_game_mentor` (coups
+//! choisis par l'élève, étiquettes fournies par la recherche d'un mentor) et
+//! `play_training_game_oracle` (étiquettes fournies par l'évaluation d'un
+//! moteur UCI externe pleine force, voir uci.rs).
 
 use std::collections::HashMap;
 
@@ -19,6 +21,7 @@ use crate::direct;
 use crate::features::{encode, N_FEATURES};
 use crate::nn::Mlp;
 use crate::search;
+use crate::uci::UciEngine;
 
 pub struct GameRecord {
     /// Positions encodées, concaténées (n_positions × N_FEATURES).
@@ -121,12 +124,14 @@ pub struct OptionsRecherche {
     pub plis_arbitrage: u32,
     /// Arbitrage en nulle au-delà de ce nombre de plis.
     pub max_plies: u32,
-    /// Poids de l'étiqueteur (prof) dans la valeur mémorisée en mode mentoré :
-    /// v = poids_prof·v_prof + (1-poids_prof)·v_élève. 1.0 (défaut) = mentorat
-    /// pur (comportement historique). Desserrer vers 0.7 quand l'élève a
-    /// convergé : sa propre recherche ré-entre dans les étiquettes, ce qui lui
-    /// permet de DÉPASSER le prof au lieu d'en rester le clone. Sans effet
-    /// hors mode mentoré.
+    /// Poids de l'étiqueteur EXTERNE (prof en mode mentoré, oracle UCI en
+    /// mode oracle) dans la valeur mémorisée :
+    /// v = poids_prof·v_étiqueteur + (1-poids_prof)·v_élève. 1.0 (défaut) =
+    /// étiquettes externes pures (comportement historique). Desserrer vers
+    /// 0.7 quand l'élève a convergé : sa propre recherche ré-entre dans les
+    /// étiquettes, ce qui lui permet de DÉPASSER le prof au lieu d'en rester
+    /// le clone. Sans effet hors modes mentoré et oracle (self-play
+    /// classique : le chercheur s'étiquette lui-même).
     pub poids_prof: f32,
 }
 
@@ -178,7 +183,7 @@ pub fn play_training_game_recherche(
     seed: u64,
     opts: &OptionsRecherche,
 ) -> GameRecord {
-    partie_recherche_interne(recherche, None, seed, opts)
+    partie_recherche_interne(recherche, Etiqueteur::Aucun, seed, opts)
 }
 
 /// Partie de self-play MENTORÉE — remède à la chambre d'écho du TD
@@ -197,28 +202,74 @@ pub fn play_training_game_mentor(
     seed: u64,
     opts: &OptionsRecherche,
 ) -> GameRecord {
-    partie_recherche_interne(eleve, Some(prof), seed, opts)
+    partie_recherche_interne(eleve, Etiqueteur::Prof(prof), seed, opts)
+}
+
+/// Partie de self-play ORACLE — même déroulé que le mentorat (l'élève choisit
+/// tous les coups avec sa recherche, mêmes températures/ouverture), mais la
+/// valeur mémorisée de chaque position vient de l'ÉVALUATION d'un moteur UCI
+/// externe pleine force (`UciEngine::evalue_fen` sur la FEN de la position
+/// courante, AVANT le coup — aucun décalage). CONVENTION PARTAGÉE : le score
+/// UCI est du point de vue du camp au trait, comme v_racine — aucun
+/// renversement de signe. `poids_prof` mélange oracle/élève comme en
+/// mentorat : v = poids_prof·v_oracle + (1-poids_prof)·v_élève, et
+/// l'arbitrage s'appuie sur ce mélange. Si l'oracle ne répond pas (processus
+/// mort ou FIGÉ au-delà de l'échéance de lecture — voir uci.rs —, ligne
+/// imparsable) : repli silencieux sur le score de l'élève pour
+/// CETTE position — la partie continue, jamais de panique.
+pub fn play_training_game_oracle(
+    chercheur: &mut search::Recherche,
+    oracle: &mut UciEngine,
+    seed: u64,
+    opts: &OptionsRecherche,
+) -> GameRecord {
+    partie_recherche_interne(chercheur, Etiqueteur::Oracle(oracle), seed, opts)
+}
+
+/// « Qui étiquette » les positions du self-play piloté par la recherche : la
+/// valeur mémorisée de chaque position (cibles TD-leaf) ET l'arbitrage
+/// viennent de cette source. Interne — les fonctions publiques ci-dessus
+/// choisissent la variante.
+enum Etiqueteur<'a> {
+    /// Le chercheur s'étiquette lui-même (self-play classique).
+    Aucun,
+    /// La recherche d'un réseau mentor étiquette (mêmes limites de nœuds).
+    Prof(&'a mut search::Recherche),
+    /// L'évaluation d'un moteur UCI externe pleine force étiquette
+    /// (budget movetime fixé par `UciEngine::lance_pleine_force`).
+    Oracle(&'a mut UciEngine),
 }
 
 /// Cœur commun du self-play piloté par la recherche, paramétré par « qui
-/// étiquette » : `chercheur` choisit les coups ; `etiqueteur` fournit le
-/// v_racine mémorisé (cibles TD-leaf) ET l'arbitrage — `None` : le chercheur
-/// s'étiquette lui-même (self-play classique), `Some(prof)` : la recherche du
-/// prof étiquette les MÊMES positions avec les MÊMES limites (mentorat).
+/// étiquette » (voir `Etiqueteur`) : `chercheur` choisit les coups ;
+/// l'étiqueteur fournit le v_racine mémorisé (cibles TD-leaf) ET l'arbitrage —
+/// `Aucun` : le chercheur s'étiquette lui-même (self-play classique),
+/// `Prof` : la recherche du prof étiquette les MÊMES positions avec les MÊMES
+/// limites (mentorat), `Oracle` : l'évaluation d'un moteur UCI externe
+/// étiquette (repli élève position par position si le moteur ne répond pas).
 fn partie_recherche_interne(
     chercheur: &mut search::Recherche,
-    mut etiqueteur: Option<&mut search::Recherche>,
+    mut etiqueteur: Etiqueteur,
     seed: u64,
     opts: &OptionsRecherche,
 ) -> GameRecord {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut pos = Chess::default();
     // Une partie = une TT propre (killers et historique compris) — pour les
-    // DEUX chercheurs en mode mentoré.
+    // DEUX chercheurs en mode mentoré ; l'oracle reçoit l'équivalent UCI
+    // (`ucinewgame`).
     chercheur.nouvelle_partie();
-    if let Some(p) = etiqueteur.as_mut() {
-        p.nouvelle_partie();
+    match &mut etiqueteur {
+        Etiqueteur::Prof(p) => p.nouvelle_partie(),
+        // Un échec ici n'est PAS fatal : evalue_fen renverra None et le repli
+        // élève s'appliquera position par position.
+        Etiqueteur::Oracle(o) => {
+            let _ = o.nouvelle_partie();
+        }
+        Etiqueteur::Aucun => {}
     }
+    // Une source d'étiquettes EXTERNE existe-t-elle ? (jauge « prof » du direct)
+    let a_etiqueteur = !matches!(etiqueteur, Etiqueteur::Aucun);
 
     let limites = search::Limites {
         max_noeuds: opts.nodes_par_coup,
@@ -273,30 +324,48 @@ fn partie_recherche_interne(
         }
 
         let res = chercheur.cherche(&pos, limites);
-        // v_racine mémorisé : score racine de l'ÉTIQUETEUR sur la position
-        // COURANTE (aucun décalage : v_racines[i] ↔ position i AVANT le coup
-        // i), du chercheur lui-même sans étiqueteur. Mêmes limites de nœuds.
-        let v_racine = match etiqueteur.as_mut() {
+        // v_racine mémorisé : valeur de l'ÉTIQUETEUR sur la position COURANTE
+        // (aucun décalage : v_racines[i] ↔ position i AVANT le coup i), du
+        // chercheur lui-même sans étiqueteur.
+        let v_racine = match &mut etiqueteur {
+            Etiqueteur::Aucun => res.score.clamp(-1.0, 1.0),
             // Mentorat : mélange prof/élève selon poids_prof (1.0 = prof pur,
             // comportement historique). Les deux scores sont du point de vue
             // du MÊME trait sur la MÊME position : le mélange est légitime.
-            Some(p) => {
+            // Mêmes limites de nœuds que l'élève.
+            Etiqueteur::Prof(p) => {
                 let v_prof = p.cherche(&pos, limites).score.clamp(-1.0, 1.0);
                 let v_eleve = res.score.clamp(-1.0, 1.0);
                 opts.poids_prof * v_prof + (1.0 - opts.poids_prof) * v_eleve
             }
-            None => res.score.clamp(-1.0, 1.0),
+            // Oracle : évaluation du moteur externe sur la MÊME position (FEN
+            // mode Legal, comme partout). Convention UCI = score du point de
+            // vue du camp au trait, identique à v_racine : AUCUN renversement
+            // de signe. evalue_fen renvoie déjà une valeur dans [-1, 1]
+            // (tanh(cp/300) ou ±1 sur les mats) ; poids_prof mélange
+            // oracle/élève comme en mentorat. Moteur muet/mort → repli sur le
+            // score de l'élève pour CETTE position, la partie CONTINUE.
+            Etiqueteur::Oracle(o) => {
+                let fen = Fen::from_position(pos.clone(), EnPassantMode::Legal).to_string();
+                let v_eleve = res.score.clamp(-1.0, 1.0);
+                match o.evalue_fen(&fen) {
+                    Some(v_oracle) => {
+                        opts.poids_prof * v_oracle + (1.0 - opts.poids_prof) * v_eleve
+                    }
+                    None => v_eleve,
+                }
+            }
         };
 
         // Direct : évaluations mémorisées AVANT tout break (l'arbitrage peut
         // terminer la partie plus bas), converties du point de vue du trait
         // vers le point de vue des BLANCS. v_eleve = recherche de l'élève
-        // (celui qui choisit les coups), v_prof = recherche du mentor
-        // (null hors mode mentoré).
+        // (celui qui choisit les coups), v_prof = étiqueteur externe (mentor
+        // ou oracle ; null en self-play classique).
         if journaliste.is_some() {
             let signe = if pos.turn() == Color::White { 1.0 } else { -1.0 };
             dernier_v_eleve = Some(res.score.clamp(-1.0, 1.0) * signe);
-            dernier_v_prof = etiqueteur.is_some().then(|| v_racine * signe);
+            dernier_v_prof = a_etiqueteur.then(|| v_racine * signe);
         }
 
         // Enregistre la position AVANT le coup, du point de vue du trait.
@@ -461,6 +530,29 @@ mod tests {
         assert!(rec.result == 1.0 || rec.result == 0.0 || rec.result == -1.0);
         // Cibles bornées : |z| <= lambda + (1-lambda) = 1.
         assert!(rec.zs.iter().all(|z| z.abs() <= 1.0 + 1e-6));
+    }
+
+    /// Une partie oracle complète (élève 300 nœuds/coup, Stockfish pleine
+    /// force movetime 10 ms) se termine et produit des cibles finies dans
+    /// [-1, 1]. `cargo test --lib -- --ignored partie_oracle`.
+    #[test]
+    #[ignore = "nécessite engines/stockfish en local"]
+    fn partie_oracle_se_termine() {
+        let mut eleve = search::Recherche::new(Arc::new(Mlp::new(42)), 16);
+        let mut oracle = UciEngine::lance_pleine_force(
+            "engines/stockfish/stockfish-windows-x86-64-avx2.exe",
+            10,
+        )
+        .expect("lancement de l'oracle");
+        let mut opts = OptionsRecherche::default();
+        opts.nodes_par_coup = 300;
+        let rec = play_training_game_oracle(&mut eleve, &mut oracle, 7, &opts);
+        assert!(rec.plies > 0 && rec.plies <= opts.max_plies,
+                "nombre de plis aberrant : {}", rec.plies);
+        assert_eq!(rec.xs.len(), rec.zs.len() * N_FEATURES);
+        assert!(rec.result == 1.0 || rec.result == 0.0 || rec.result == -1.0);
+        // Cibles finies et bornées : |z| <= lambda + (1-lambda) = 1.
+        assert!(rec.zs.iter().all(|z| z.is_finite() && z.abs() <= 1.0 + 1e-6));
     }
 
     /// Le mentor ne change QUE les étiquettes, jamais le déroulé : avec le

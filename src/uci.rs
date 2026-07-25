@@ -1,11 +1,18 @@
-//! Client UCI minimal pour piloter un moteur externe (Stockfish) à force
-//! limitée (UCI_LimitStrength + UCI_Elo), afin de recaler l'échelle Elo maison
-//! sur une référence réelle (voir src/bin/calibrate.rs).
+//! Client UCI minimal pour piloter un moteur externe (Stockfish) :
+//! - à force limitée (UCI_LimitStrength + UCI_Elo), afin de recaler l'échelle
+//!   Elo maison sur une référence réelle (voir src/bin/calibrate.rs) ;
+//! - PLEINE FORCE comme étiqueteur (« oracle ») du self-play d'entraînement :
+//!   `lance_pleine_force` + `evalue_fen` (voir selfplay.rs et bin/train.rs).
 //!
 //! Points de vigilance couverts ici :
-//! - lecture ligne à ligne bloquante UNIQUEMENT quand une réponse est attendue
+//! - lecture ligne à ligne UNIQUEMENT quand une réponse est attendue
 //!   (uciok, readyok, bestmove) : les `info ...` émis pendant `go` sont drainés
 //!   dans la même boucle, donc pas de deadlock tuyau plein ;
+//! - ÉCHÉANCE sur chaque lecture (thread lecteur + canal, `recv_timeout`) :
+//!   un moteur vivant mais FIGÉ (blocage interne, processus suspendu) est tué
+//!   et signalé en erreur au lieu de bloquer un ouvrier de self-play pour la
+//!   nuit — l'appelant se replie (repli élève, voir selfplay.rs) et le pool
+//!   de train.rs remplace le moteur au prochain emprunt ;
 //! - stderr redirigé vers null (un moteur bavard ne peut pas se bloquer dessus) ;
 //! - EOF détecté (moteur mort → erreur propre, jamais de boucle infinie) ;
 //! - bornes UCI_Elo lues dans la sortie de `uci` et clamp systématique ;
@@ -16,6 +23,8 @@
 
 use std::io::{BufRead, BufReader, Error, ErrorKind, Result, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use shakmaty::fen::Fen;
@@ -32,14 +41,40 @@ const ELO_MAX_DEFAUT: u32 = 3190;
 /// Attente maximale de la fin du processus après `quit` avant kill.
 const DELAI_QUIT: Duration = Duration::from_millis(500);
 
+/// Échéance de lecture par LIGNE attendue du moteur (voir `ligne_avant`) —
+/// plancher très généreux : même machine saturée (pool de moteurs + rayon au
+/// complet), un moteur sain répond en millisecondes ; seul un moteur FIGÉ la
+/// dépasse. Un faux positif coûterait un moteur (relancé) ; un vrai blocage
+/// non détecté coûterait la nuit d'entraînement.
+const DELAI_REPONSE: Duration = Duration::from_secs(10);
+
+/// Échéance adaptée à une réponse de `go movetime N` : plancher DELAI_REPONSE,
+/// étiré à 10×N quand le movetime demandé est long (calibration).
+fn delai_go(movetime_ms: u64) -> Duration {
+    DELAI_REPONSE.max(Duration::from_millis(movetime_ms.saturating_mul(10)))
+}
+
 /// Moteur UCI externe (processus enfant + tuyaux).
 pub struct UciEngine {
     enfant: Child,
     entree: ChildStdin,
-    sortie: BufReader<ChildStdout>,
+    /// Lignes de stdout, lues par le thread `lecteur` et reçues ici : le canal
+    /// permet une échéance (`recv_timeout`) là où un `read_line` direct
+    /// bloquerait pour toujours face à un moteur vivant mais figé.
+    lignes: mpsc::Receiver<String>,
+    /// Thread lecteur de stdout — rejoint au Drop, après la mort du processus
+    /// (l'EOF termine sa boucle : jointure bornée, aucun thread fuité).
+    lecteur: Option<JoinHandle<()>>,
+    /// Moteur condamné (échéance dépassée → kill, ou EOF) : toute lecture
+    /// ultérieure échoue immédiatement, sans consommer d'éventuels restes du
+    /// canal (une vieille ligne ne doit jamais acquitter une commande neuve).
+    mort: bool,
     /// Bornes du spin UCI_Elo annoncées par le moteur.
     pub elo_min: u32,
     pub elo_max: u32,
+    /// Budget de réflexion (ms) de chaque `evalue_fen` — fixé par
+    /// `lance_pleine_force` (défaut prudent pour un moteur venu de `lance`).
+    movetime_ms: u32,
 }
 
 /// Erreur d'E/S étiquetée (contexte du protocole UCI).
@@ -47,10 +82,42 @@ fn erreur(msg: String) -> Error {
     Error::new(ErrorKind::InvalidData, msg)
 }
 
+/// Lit stdout du moteur ligne à ligne dans un thread dédié et pousse chaque
+/// ligne dans un canal : le fil appelant peut alors imposer une échéance
+/// (`recv_timeout`, voir `ligne_avant`) — impossible avec un `read_line`
+/// direct, qui bloquerait pour toujours face à un moteur vivant mais figé.
+/// EOF ou erreur de lecture → fin du thread → canal déconnecté, détecté par
+/// l'appelant comme « moteur mort ». `send` sur un canal non borné ne bloque
+/// jamais : le thread se termine toujours une fois le processus mort.
+fn demarre_lecteur(sortie: ChildStdout) -> (mpsc::Receiver<String>, JoinHandle<()>) {
+    let (emetteur, recepteur) = mpsc::channel();
+    let lecteur = std::thread::spawn(move || {
+        let mut sortie = BufReader::new(sortie);
+        loop {
+            let mut ligne = String::new();
+            match sortie.read_line(&mut ligne) {
+                Ok(0) | Err(_) => return, // EOF ou tuyau cassé : moteur mort
+                Ok(_) => {
+                    if emetteur.send(ligne).is_err() {
+                        return; // récepteur disparu (UciEngine droppé)
+                    }
+                }
+            }
+        }
+    });
+    (recepteur, lecteur)
+}
+
 impl UciEngine {
     /// Lance le moteur et fait le handshake `uci` → `uciok`, en relevant les
     /// bornes du spin UCI_Elo au passage.
     pub fn lance(chemin: &str) -> Result<UciEngine> {
+        UciEngine::lance_avec_delai(chemin, DELAI_REPONSE)
+    }
+
+    /// Cœur de `lance`, échéance de handshake paramétrable — les tests d'un
+    /// « moteur » figé ou mort n'attendent pas DELAI_REPONSE.
+    fn lance_avec_delai(chemin: &str, delai: Duration) -> Result<UciEngine> {
         let mut enfant = Command::new(chemin)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -62,24 +129,26 @@ impl UciEngine {
             .stdin
             .take()
             .ok_or_else(|| erreur("stdin du moteur indisponible".into()))?;
-        let sortie = BufReader::new(
-            enfant
-                .stdout
-                .take()
-                .ok_or_else(|| erreur("stdout du moteur indisponible".into()))?,
-        );
+        let sortie = enfant
+            .stdout
+            .take()
+            .ok_or_else(|| erreur("stdout du moteur indisponible".into()))?;
+        let (lignes, lecteur) = demarre_lecteur(sortie);
         let mut moteur = UciEngine {
             enfant,
             entree,
-            sortie,
+            lignes,
+            lecteur: Some(lecteur),
+            mort: false,
             elo_min: ELO_MIN_DEFAUT,
             elo_max: ELO_MAX_DEFAUT,
+            movetime_ms: 15,
         };
         moteur.envoie("uci")?;
         // Draine l'en-tête (id, option ...) jusqu'à uciok, en relevant les
         // bornes de « option name UCI_Elo type spin default X min Y max Z ».
         loop {
-            let ligne = moteur.ligne()?;
+            let ligne = moteur.ligne_avant(delai)?;
             if ligne.trim() == "uciok" {
                 break;
             }
@@ -105,17 +174,40 @@ impl UciEngine {
         self.entree.flush()
     }
 
-    /// Lit une ligne complète ; EOF (moteur mort) → erreur propre.
-    fn ligne(&mut self) -> Result<String> {
-        let mut tampon = String::new();
-        let n = self.sortie.read_line(&mut tampon)?;
-        if n == 0 {
+    /// Attend la prochaine ligne du moteur, au plus `delai` :
+    /// - canal déconnecté (EOF : moteur mort) → erreur propre, comme avant ;
+    /// - échéance dépassée (moteur VIVANT mais figé — blocage interne,
+    ///   processus suspendu) → kill immédiat + erreur : mieux vaut perdre un
+    ///   moteur (le pool de train.rs le remplace au prochain emprunt) qu'un
+    ///   ouvrier rayon bloqué qui calerait la nuit d'entraînement en silence.
+    /// Un moteur condamné échoue immédiatement, SANS consommer les restes du
+    /// canal (une vieille ligne « readyok » ne doit jamais acquitter une
+    /// commande postérieure à la condamnation).
+    fn ligne_avant(&mut self, delai: Duration) -> Result<String> {
+        if self.mort {
             return Err(Error::new(
-                ErrorKind::UnexpectedEof,
-                "le moteur UCI a fermé sa sortie (processus mort ?)",
+                ErrorKind::BrokenPipe,
+                "moteur UCI condamné (mort ou figé)",
             ));
         }
-        Ok(tampon)
+        match self.lignes.recv_timeout(delai) {
+            Ok(ligne) => Ok(ligne),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.mort = true;
+                Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "le moteur UCI a fermé sa sortie (processus mort ?)",
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.mort = true;
+                let _ = self.enfant.kill();
+                Err(Error::new(
+                    ErrorKind::TimedOut,
+                    format!("moteur UCI muet au-delà de {delai:?} : figé, tué"),
+                ))
+            }
+        }
     }
 
     /// `isready` → attend `readyok` (draine tout le reste, y compris d'éventuels
@@ -123,7 +215,7 @@ impl UciEngine {
     pub fn pret(&mut self) -> Result<()> {
         self.envoie("isready")?;
         loop {
-            if self.ligne()?.trim() == "readyok" {
+            if self.ligne_avant(DELAI_REPONSE)?.trim() == "readyok" {
                 return Ok(());
             }
         }
@@ -145,6 +237,49 @@ impl UciEngine {
         self.pret()
     }
 
+    /// Lance le moteur PLEINE FORCE — aucun UCI_LimitStrength : l'étiqueteur
+    /// (oracle) du self-play doit évaluer au niveau maximal du moteur, pas au
+    /// niveau bridé de la calibration. `movetime_ms` est mémorisé et sert de
+    /// budget à chaque `evalue_fen`. Mêmes garanties que `lance` (handshake
+    /// uciok + readyok), plus un `ucinewgame` initial.
+    pub fn lance_pleine_force(chemin: &str, movetime_ms: u32) -> Result<UciEngine> {
+        let mut moteur = UciEngine::lance(chemin)?;
+        moteur.movetime_ms = movetime_ms;
+        moteur.nouvelle_partie()?;
+        Ok(moteur)
+    }
+
+    /// Évalue une position : `position fen ...` + `go movetime ...`, draine
+    /// les lignes `info` en mémorisant le score de CHACUNE, et renvoie celui
+    /// de la DERNIÈRE reçue avant `bestmove` (la plus profonde), converti dans
+    /// [-1, 1] par `score_de_ligne_info`.
+    ///
+    /// CONVENTION UCI CRUCIALE : « score cp X » / « score mate N » sont du
+    /// point de vue du CAMP AU TRAIT — exactement notre convention v_racine
+    /// interne. AUCUN renversement de signe, ni ici ni chez l'appelant.
+    ///
+    /// Toute erreur d'E/S (moteur mort, EOF, tuyau cassé, moteur FIGÉ au-delà
+    /// de l'échéance de lecture — alors tué) ou absence de score avant
+    /// `bestmove` → None, JAMAIS de panique : l'appelant se replie sur sa
+    /// propre évaluation et la partie continue.
+    pub fn evalue_fen(&mut self, fen: &str) -> Option<f32> {
+        self.envoie(&format!("position fen {fen}")).ok()?;
+        // max(1) : « go movetime 0 » est indéfini chez certains moteurs.
+        self.envoie(&format!("go movetime {}", self.movetime_ms.max(1)))
+            .ok()?;
+        let mut dernier: Option<f32> = None;
+        let delai = delai_go(self.movetime_ms as u64);
+        loop {
+            let ligne = self.ligne_avant(delai).ok()?;
+            if ligne.split_whitespace().next() == Some("bestmove") {
+                return dernier;
+            }
+            if let Some(v) = score_de_ligne_info(&ligne) {
+                dernier = Some(v);
+            }
+        }
+    }
+
     /// Demande le meilleur coup sur une FEN donnée en `movetime_ms` ms.
     /// Renvoie le coup UCI brut (« e2e4 », promotion « e7e8q » à 5 caractères).
     /// Les lignes `info ...` émises pendant la recherche sont consommées ici
@@ -152,8 +287,9 @@ impl UciEngine {
     pub fn meilleur_coup_fen(&mut self, fen: &str, movetime_ms: u64) -> Result<String> {
         self.envoie(&format!("position fen {fen}"))?;
         self.envoie(&format!("go movetime {movetime_ms}"))?;
+        let delai = delai_go(movetime_ms);
         loop {
-            let ligne = self.ligne()?;
+            let ligne = self.ligne_avant(delai)?;
             let mut mots = ligne.split_whitespace();
             if mots.next() == Some("bestmove") {
                 let coup = mots
@@ -172,22 +308,57 @@ impl UciEngine {
     }
 }
 
+/// Extrait la valeur d'une ligne UCI contenant « score ... », convertie dans
+/// [-1, 1] pour coller à l'échelle des cibles d'entraînement :
+/// - « score cp X »   → tanh(X/300) — écrasement doux : ±300 cp ≈ ±0.76 ;
+/// - « score mate N » → +1.0 si N > 0 (le trait mate), sinon -1.0 (N <= 0 :
+///   le trait se fait mater ; « mate 0 » = déjà maté).
+///
+/// CONVENTION UCI : le score est du point de vue du CAMP AU TRAIT — identique
+/// à notre v_racine interne, donc AUCUN renversement de signe.
+/// « lowerbound »/« upperbound » (émis APRÈS le nombre) sont acceptés tels
+/// quels : la valeur bornée est une approximation suffisante pour étiqueter.
+/// Ligne sans score exploitable → None.
+fn score_de_ligne_info(ligne: &str) -> Option<f32> {
+    let mots: Vec<&str> = ligne.split_whitespace().collect();
+    let i = mots.iter().position(|m| *m == "score")?;
+    match (mots.get(i + 1)?, mots.get(i + 2)?) {
+        (&"cp", x) => x.parse::<f32>().ok().map(|cp| (cp / 300.0).tanh()),
+        (&"mate", n) => n
+            .parse::<i32>()
+            .ok()
+            .map(|n| if n > 0 { 1.0 } else { -1.0 }),
+        _ => None,
+    }
+}
+
 impl Drop for UciEngine {
     fn drop(&mut self) {
         // Sortie polie ; si le moteur traîne (ou si l'écriture échoue), kill.
         let _ = self.envoie("quit");
         let debut = Instant::now();
+        let mut termine = false;
         loop {
             match self.enfant.try_wait() {
-                Ok(Some(_)) => return, // terminé proprement, pas de zombie
+                Ok(Some(_)) => {
+                    termine = true; // terminé proprement, pas de zombie
+                    break;
+                }
                 Ok(None) if debut.elapsed() < DELAI_QUIT => {
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 _ => break,
             }
         }
-        let _ = self.enfant.kill();
-        let _ = self.enfant.wait();
+        if !termine {
+            let _ = self.enfant.kill();
+            let _ = self.enfant.wait();
+        }
+        // Le processus est mort : le thread lecteur rencontre l'EOF et se
+        // termine de lui-même — jointure bornée, aucun thread fuité.
+        if let Some(lecteur) = self.lecteur.take() {
+            let _ = lecteur.join();
+        }
     }
 }
 
@@ -298,6 +469,63 @@ mod tests {
         assert!(pos.legal_moves().contains(&m), "coup hors liste légale : {coup}");
     }
 
+    /// Parsing des scores UCI sur transcriptions simulées, SANS moteur.
+    /// Convention : score du point de vue du camp au trait, AUCUN renversement
+    /// de signe — tanh(cp/300) tel quel, mate → ±1.
+    #[test]
+    fn parse_score_ligne_info() {
+        // cp négatif : le trait est mal — transmis tel quel.
+        assert_eq!(
+            score_de_ligne_info("info depth 12 score cp -35 nodes 12345 pv e2e4"),
+            Some((-35.0f32 / 300.0).tanh())
+        );
+        // mate négatif : le trait se fait mater → -1.
+        assert_eq!(score_de_ligne_info("score mate -3"), Some(-1.0));
+        // mate positif : le trait mate → +1 ; mate 0 : le trait EST maté → -1.
+        assert_eq!(
+            score_de_ligne_info("info depth 5 seldepth 5 score mate 2 pv h5f7"),
+            Some(1.0)
+        );
+        assert_eq!(score_de_ligne_info("info depth 0 score mate 0"), Some(-1.0));
+        // lowerbound/upperbound (après le nombre) : valeur bornée telle quelle.
+        assert_eq!(
+            score_de_ligne_info("info depth 20 score cp 13 lowerbound nodes 99"),
+            Some((13.0f32 / 300.0).tanh())
+        );
+        assert_eq!(
+            score_de_ligne_info("info depth 20 score cp 250 upperbound"),
+            Some((250.0f32 / 300.0).tanh())
+        );
+        // Lignes sans score exploitable → None (jamais de panique).
+        assert_eq!(score_de_ligne_info("info string NNUE evaluation using nn.nnue"), None);
+        assert_eq!(score_de_ligne_info("bestmove e2e4 ponder e7e5"), None);
+        assert_eq!(score_de_ligne_info("info depth 1 score cp abc"), None);
+        assert_eq!(score_de_ligne_info("info depth 1 score"), None);
+    }
+
+    /// Oracle pleine force réel : évaluations cohérentes, du point de vue du
+    /// trait — position initiale proche de 0, camp au trait sans sa dame
+    /// nettement négatif. `cargo test --lib -- --ignored evalue`.
+    #[test]
+    #[ignore = "nécessite engines/stockfish en local"]
+    fn evalue_fen_pleine_force_reel() {
+        let mut oracle =
+            UciEngine::lance_pleine_force(CHEMIN, 30).expect("lancement de l'oracle");
+        // Position initiale : équilibrée → |v| < 0.3.
+        let v = oracle
+            .evalue_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+            .expect("évaluation de la position initiale");
+        assert!(v.abs() < 0.3, "position initiale : v = {v}");
+        assert!(v.is_finite() && v.abs() <= 1.0);
+        // Les NOIRS au trait, SANS leur dame (tout le reste symétrique) :
+        // le trait est perdant → v < -0.5, sans renversement de signe.
+        let v = oracle
+            .evalue_fen("rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1")
+            .expect("évaluation trait sans dame");
+        assert!(v < -0.5, "trait sans dame : v = {v}");
+        assert!(v.is_finite() && v >= -1.0);
+    }
+
     /// Le StockfishBot complet joue un coup légal via le trait Bot.
     #[test]
     #[ignore = "nécessite engines/stockfish en local"]
@@ -306,5 +534,33 @@ mod tests {
         let pos = Chess::default();
         let m = bot.choose(&pos).expect("un coup");
         assert!(pos.legal_moves().contains(&m));
+    }
+
+    /// ÉCHÉANCE : un processus VIVANT qui ne parlera jamais UCI (cmd.exe
+    /// interactif — il bavarde puis attend stdin pour toujours) ne bloque pas
+    /// `lance` : l'échéance du handshake tombe, le processus est tué et
+    /// l'erreur est propre — là où un `read_line` direct aurait bloqué un
+    /// ouvrier de self-play pour la nuit. Sans Stockfish, donc PAS ignoré.
+    #[test]
+    #[cfg(windows)]
+    fn moteur_fige_tue_a_l_echeance() {
+        let debut = Instant::now();
+        let resultat = UciEngine::lance_avec_delai("cmd", Duration::from_millis(300));
+        assert!(resultat.is_err(), "cmd.exe ne doit jamais réussir le handshake uci");
+        assert!(
+            debut.elapsed() < Duration::from_secs(8),
+            "l'échéance devrait tomber en ~0,3 s, pas en {:?}",
+            debut.elapsed()
+        );
+    }
+
+    /// Un processus qui se termine sans jamais dire uciok (EOF immédiat) est
+    /// détecté comme MORT : erreur propre et rapide, jamais de blocage ni de
+    /// panique. Sans Stockfish, donc PAS ignoré.
+    #[test]
+    #[cfg(windows)]
+    fn moteur_mort_eof_detecte() {
+        let resultat = UciEngine::lance_avec_delai("whoami", Duration::from_secs(5));
+        assert!(resultat.is_err(), "whoami n'est pas un moteur UCI");
     }
 }
