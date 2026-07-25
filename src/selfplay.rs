@@ -121,6 +121,13 @@ pub struct OptionsRecherche {
     pub plis_arbitrage: u32,
     /// Arbitrage en nulle au-delà de ce nombre de plis.
     pub max_plies: u32,
+    /// Poids de l'étiqueteur (prof) dans la valeur mémorisée en mode mentoré :
+    /// v = poids_prof·v_prof + (1-poids_prof)·v_élève. 1.0 (défaut) = mentorat
+    /// pur (comportement historique). Desserrer vers 0.7 quand l'élève a
+    /// convergé : sa propre recherche ré-entre dans les étiquettes, ce qui lui
+    /// permet de DÉPASSER le prof au lieu d'en rester le clone. Sans effet
+    /// hors mode mentoré.
+    pub poids_prof: f32,
 }
 
 impl Default for OptionsRecherche {
@@ -134,6 +141,7 @@ impl Default for OptionsRecherche {
             seuil_arbitrage: 0.92,
             plis_arbitrage: 4,
             max_plies: 400,
+            poids_prof: 1.0,
         }
     }
 }
@@ -269,10 +277,16 @@ fn partie_recherche_interne(
         // COURANTE (aucun décalage : v_racines[i] ↔ position i AVANT le coup
         // i), du chercheur lui-même sans étiqueteur. Mêmes limites de nœuds.
         let v_racine = match etiqueteur.as_mut() {
-            Some(p) => p.cherche(&pos, limites).score,
-            None => res.score,
-        }
-        .clamp(-1.0, 1.0);
+            // Mentorat : mélange prof/élève selon poids_prof (1.0 = prof pur,
+            // comportement historique). Les deux scores sont du point de vue
+            // du MÊME trait sur la MÊME position : le mélange est légitime.
+            Some(p) => {
+                let v_prof = p.cherche(&pos, limites).score.clamp(-1.0, 1.0);
+                let v_eleve = res.score.clamp(-1.0, 1.0);
+                opts.poids_prof * v_prof + (1.0 - opts.poids_prof) * v_eleve
+            }
+            None => res.score.clamp(-1.0, 1.0),
+        };
 
         // Direct : évaluations mémorisées AVANT tout break (l'arbitrage peut
         // terminer la partie plus bas), converties du point de vue du trait

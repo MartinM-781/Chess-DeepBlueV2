@@ -132,6 +132,7 @@ struct Options {
     gate_every: u64,
     gate_games: usize,
     mentor: String,
+    mentor_poids: f32,
 }
 
 /// Tampon de rejeu : anneau de positions encodées à capacité fixe.
@@ -216,6 +217,7 @@ fn parse_options() -> Options {
         gate_every: 10,
         gate_games: 64,
         mentor: String::new(),
+        mentor_poids: 1.0,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -239,6 +241,9 @@ fn parse_options() -> Options {
             "--gate-every" => opt.gate_every = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--gate-games" => opt.gate_games = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--mentor" => opt.mentor = valeur(&args, i, &nom),
+            "--mentor-poids" => {
+                opt.mentor_poids = parse_valeur(&valeur(&args, i, &nom), &nom)
+            }
             _ => {
                 eprintln!("option inconnue : {nom}");
                 eprintln!(
@@ -610,6 +615,7 @@ fn main() {
                 nodes_par_coup: opt.search_nodes,
                 lambda: opt.td_lambda,
                 max_plies: MAX_PLIES,
+                poids_prof: opt.mentor_poids,
                 ..Default::default()
             };
             // Progression en direct : une ligne toutes les 8 parties terminées,
