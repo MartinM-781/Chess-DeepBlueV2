@@ -1,6 +1,9 @@
 //! Partie d'auto-apprentissage : le réseau joue contre lui-même (1 pli + softmax
 //! température pour explorer), chaque position visitée est étiquetée à la fin par
 //! le résultat DU POINT DE VUE DU TRAIT de cette position (z ∈ {-1, 0, 1}).
+//! Variantes pilotées par la recherche : `play_training_game_recherche`
+//! (cibles TD-leaf auto-étiquetées) et `play_training_game_mentor` (coups
+//! choisis par l'élève, étiquettes fournies par la recherche d'un mentor).
 
 use std::collections::HashMap;
 
@@ -164,10 +167,47 @@ pub fn play_training_game_recherche(
     seed: u64,
     opts: &OptionsRecherche,
 ) -> GameRecord {
+    partie_recherche_interne(recherche, None, seed, opts)
+}
+
+/// Partie de self-play MENTORÉE — remède à la chambre d'écho du TD
+/// auto-référentiel : l'ÉLÈVE choisit les coups (sa recherche, mêmes
+/// températures/ouverture/échantillonnage que `play_training_game_recherche`),
+/// mais la valeur mémorisée de CHAQUE position enregistrée est le score racine
+/// de la recherche du PROF sur cette même position (mêmes limites de nœuds,
+/// clampé [-1,1]) — v_prof[i] correspond à la position i AVANT le coup i,
+/// aucun décalage — et l'arbitrage s'appuie lui aussi sur le v_racine du prof,
+/// plus fiable. Les cibles restent `cibles_td_leaf(camps, v_prof, result,
+/// lambda)`. Les choix de coups ne dépendent PAS du prof : avec le même réseau
+/// des deux côtés, le déroulé est identique à `play_training_game_recherche`.
+pub fn play_training_game_mentor(
+    eleve: &mut search::Recherche,
+    prof: &mut search::Recherche,
+    seed: u64,
+    opts: &OptionsRecherche,
+) -> GameRecord {
+    partie_recherche_interne(eleve, Some(prof), seed, opts)
+}
+
+/// Cœur commun du self-play piloté par la recherche, paramétré par « qui
+/// étiquette » : `chercheur` choisit les coups ; `etiqueteur` fournit le
+/// v_racine mémorisé (cibles TD-leaf) ET l'arbitrage — `None` : le chercheur
+/// s'étiquette lui-même (self-play classique), `Some(prof)` : la recherche du
+/// prof étiquette les MÊMES positions avec les MÊMES limites (mentorat).
+fn partie_recherche_interne(
+    chercheur: &mut search::Recherche,
+    mut etiqueteur: Option<&mut search::Recherche>,
+    seed: u64,
+    opts: &OptionsRecherche,
+) -> GameRecord {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut pos = Chess::default();
-    // Une partie = une TT propre (killers et historique compris).
-    recherche.nouvelle_partie();
+    // Une partie = une TT propre (killers et historique compris) — pour les
+    // DEUX chercheurs en mode mentoré.
+    chercheur.nouvelle_partie();
+    if let Some(p) = etiqueteur.as_mut() {
+        p.nouvelle_partie();
+    }
 
     let limites = search::Limites {
         max_noeuds: opts.nodes_par_coup,
@@ -206,8 +246,15 @@ pub fn play_training_game_recherche(
             break;
         }
 
-        let res = recherche.cherche(&pos, limites);
-        let v_racine = res.score.clamp(-1.0, 1.0);
+        let res = chercheur.cherche(&pos, limites);
+        // v_racine mémorisé : score racine de l'ÉTIQUETEUR sur la position
+        // COURANTE (aucun décalage : v_racines[i] ↔ position i AVANT le coup
+        // i), du chercheur lui-même sans étiqueteur. Mêmes limites de nœuds.
+        let v_racine = match etiqueteur.as_mut() {
+            Some(p) => p.cherche(&pos, limites).score,
+            None => res.score,
+        }
+        .clamp(-1.0, 1.0);
 
         // Enregistre la position AVANT le coup, du point de vue du trait.
         encode(&pos, &mut buf);
@@ -322,5 +369,45 @@ mod tests {
             avec,
             sans
         );
+    }
+
+    /// Une partie mentorée (réseaux élève et prof DISTINCTS) à 300 nœuds/coup
+    /// se termine et produit un enregistrement cohérent.
+    #[test]
+    fn partie_mentor_se_termine() {
+        let mut eleve = search::Recherche::new(Arc::new(Mlp::new(42)), 16);
+        let mut prof = search::Recherche::new(Arc::new(Mlp::new(43)), 16);
+        let mut opts = OptionsRecherche::default();
+        opts.nodes_par_coup = 300;
+        let rec = play_training_game_mentor(&mut eleve, &mut prof, 7, &opts);
+        assert!(rec.plies > 0 && rec.plies <= opts.max_plies,
+                "nombre de plis aberrant : {}", rec.plies);
+        assert_eq!(rec.xs.len(), rec.zs.len() * N_FEATURES);
+        assert!(rec.result == 1.0 || rec.result == 0.0 || rec.result == -1.0);
+        // Cibles bornées : |z| <= lambda + (1-lambda) = 1.
+        assert!(rec.zs.iter().all(|z| z.abs() <= 1.0 + 1e-6));
+    }
+
+    /// Le mentor ne change QUE les étiquettes, jamais le déroulé : avec le
+    /// MÊME réseau en élève et en prof, la partie mentorée reproduit
+    /// exactement la partie auto-étiquetée (mêmes plies, même résultat, mêmes
+    /// positions — et mêmes étiquettes : le prof, déterministe, recherche les
+    /// mêmes positions avec la même TT que le chercheur solo), sur 3 graines.
+    #[test]
+    fn mentor_meme_deroule_que_recherche() {
+        let net = Arc::new(Mlp::new(42));
+        let mut opts = OptionsRecherche::default();
+        opts.nodes_par_coup = 300;
+        for g in [3u64, 5, 11] {
+            let mut solo = search::Recherche::new(net.clone(), 16);
+            let attendu = play_training_game_recherche(&mut solo, g, &opts);
+            let mut eleve = search::Recherche::new(net.clone(), 16);
+            let mut prof = search::Recherche::new(net.clone(), 16);
+            let obtenu = play_training_game_mentor(&mut eleve, &mut prof, g, &opts);
+            assert_eq!(attendu.plies, obtenu.plies, "graine {g} : plies");
+            assert_eq!(attendu.result, obtenu.result, "graine {g} : result");
+            assert_eq!(attendu.xs, obtenu.xs, "graine {g} : positions divergentes");
+            assert_eq!(attendu.zs, obtenu.zs, "graine {g} : etiquettes divergentes");
+        }
     }
 }

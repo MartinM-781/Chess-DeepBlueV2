@@ -22,11 +22,19 @@
 //!   --gate-games 64       parties du duel de gating, jouées par PAIRES à
 //!                         ouverture aléatoire partagée, couleurs échangées
 //!                         (arrondi au nombre pair inférieur)
+//!   --mentor ""           régime recherche : chemin d'un réseau MENTOR figé.
+//!                         L'élève (chess_latest) choisit toujours les coups,
+//!                         mais v_racine (étiquettes TD-leaf ET arbitrage)
+//!                         vient de la recherche du mentor — anti chambre
+//!                         d'écho du TD auto-référentiel (vide = désactivé)
 //!
 //! Régime « recherche » (search_nodes > 0) :
 //!   - self-play via selfplay::play_training_game_recherche (un chercheur par
 //!     tâche rayon, cibles TD-leaf λ) — moins de positions par cycle que le
 //!     régime 1-pli (arbitrage), c'est attendu ;
+//!   - mentorat (--mentor non vide) : selfplay::play_training_game_mentor à la
+//!     place — DEUX chercheurs par tâche (élève + mentor, mêmes limites de
+//!     nœuds), l'élève choisit les coups, la recherche du mentor étiquette ;
 //!   - estimation Elo mesurée avec BotRecherche (1200 nœuds) au lieu de
 //!     NetBot d2 : le saut de la courbe Elo au changement de régime est VOULU
 //!     (il mesure l'étage recherche) ;
@@ -123,6 +131,7 @@ struct Options {
     td_lambda: f32,
     gate_every: u64,
     gate_games: usize,
+    mentor: String,
 }
 
 /// Tampon de rejeu : anneau de positions encodées à capacité fixe.
@@ -206,6 +215,7 @@ fn parse_options() -> Options {
         td_lambda: 0.3,
         gate_every: 10,
         gate_games: 64,
+        mentor: String::new(),
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -228,12 +238,13 @@ fn parse_options() -> Options {
             "--td-lambda" => opt.td_lambda = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--gate-every" => opt.gate_every = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--gate-games" => opt.gate_games = parse_valeur(&valeur(&args, i, &nom), &nom),
+            "--mentor" => opt.mentor = valeur(&args, i, &nom),
             _ => {
                 eprintln!("option inconnue : {nom}");
                 eprintln!(
                     "options : --out --threads --games-per-cycle --temperature --lr \
                      --eval-games --replay --elo-every --elo-games --seed \
-                     --search-nodes --td-lambda --gate-every --gate-games"
+                     --search-nodes --td-lambda --gate-every --gate-games --mentor"
                 );
                 std::process::exit(2);
             }
@@ -509,6 +520,31 @@ fn main() {
     } else {
         println!("réseau neuf (graine {}, architecture {:?})", opt.seed, net.sizes);
     }
+    // Mentor (régime recherche uniquement) : réseau FIGÉ chargé une fois au
+    // démarrage, dont la recherche étiquette les positions du self-play
+    // pendant que l'élève choisit les coups (anti chambre d'écho). Arc
+    // DISTINCT de celui du réseau élève : ses clones ne gênent jamais
+    // l'Arc::get_mut de l'apprentissage.
+    let mentor: Option<Arc<Mlp>> = if opt.search_nodes > 0 && !opt.mentor.is_empty() {
+        match Mlp::load(&opt.mentor) {
+            Ok(m) => {
+                println!(
+                    "mentorat : etiquettes par la recherche de {} {:?}",
+                    opt.mentor, m.sizes
+                );
+                Some(Arc::new(m))
+            }
+            Err(e) => {
+                eprintln!("--mentor {} : chargement impossible ({e})", opt.mentor);
+                std::process::exit(2);
+            }
+        }
+    } else {
+        if !opt.mentor.is_empty() {
+            println!("attention : --mentor ignore en regime 1-pli (--search-nodes 0)");
+        }
+        None
+    };
     // Marqueur de changement de régime pour les courbes du dashboard : posé une
     // seule fois, à la première activation du régime recherche.
     if opt.search_nodes > 0 {
@@ -551,11 +587,14 @@ fn main() {
             .collect();
         let parties: Vec<GameRecord> = if opt.search_nodes > 0 {
             // Régime recherche : chaque tâche rayon crée SON chercheur (TT
-            // locale, clone d'Arc du réseau) et joue une partie TD-leaf.
-            // Les Recherche — donc les clones d'Arc — sont créés et droppés
-            // À L'INTÉRIEUR de chaque fermeture map : à la sortie du collect,
-            // seul l'Arc principal survit et l'Arc::get_mut de l'apprentissage
-            // réussit.
+            // locale, clone d'Arc du réseau) et joue une partie TD-leaf —
+            // en mentorat, DEUX chercheurs (élève + mentor, même taille de
+            // TT), les coups à l'élève, les étiquettes au mentor.
+            // Les Recherche — donc les clones d'Arc du réseau ÉLÈVE — sont
+            // créés et droppés À L'INTÉRIEUR de chaque fermeture map : à la
+            // sortie du collect, seul l'Arc principal survit et
+            // l'Arc::get_mut de l'apprentissage réussit (les Arc du mentor
+            // pointent un réseau distinct et ne le gênent pas).
             // NB : --temperature ne s'applique PAS ici (régime 1-pli
             // uniquement, voir l'en-tête) — les températures du régime
             // recherche (0.2, ouverture 0.8) sont les défauts FIGÉS du
@@ -575,10 +614,25 @@ fn main() {
                 .par_iter()
                 .with_max_len(1)
                 .map(|&g| {
-                    let mut recherche =
+                    let mut eleve =
                         search::Recherche::new(net.clone(), TAILLE_TT_LOG2_SELFPLAY);
-                    let partie =
-                        selfplay::play_training_game_recherche(&mut recherche, g, &opts_recherche);
+                    let partie = match &mentor {
+                        Some(m) => {
+                            let mut prof =
+                                search::Recherche::new(m.clone(), TAILLE_TT_LOG2_SELFPLAY);
+                            selfplay::play_training_game_mentor(
+                                &mut eleve,
+                                &mut prof,
+                                g,
+                                &opts_recherche,
+                            )
+                        }
+                        None => selfplay::play_training_game_recherche(
+                            &mut eleve,
+                            g,
+                            &opts_recherche,
+                        ),
+                    };
                     let n = fait.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if n % 8 == 0 || n == total {
                         println!("  self-play : {n}/{total} parties");
