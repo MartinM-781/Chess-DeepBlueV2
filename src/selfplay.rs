@@ -9,10 +9,13 @@ use std::collections::HashMap;
 
 use rand::rngs::StdRng;
 use rand::SeedableRng;
+use shakmaty::fen::Fen;
+use shakmaty::san::San;
 use shakmaty::zobrist::{Zobrist64, ZobristHash};
-use shakmaty::{Chess, Color, EnPassantMode, Position};
+use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, Position};
 
 use crate::bots::{echantillonne_scores_racine, Bot, NetBot};
+use crate::direct;
 use crate::features::{encode, N_FEATURES};
 use crate::nn::Mlp;
 use crate::search;
@@ -215,6 +218,21 @@ fn partie_recherche_interne(
         movetime_ms: 0,
     };
 
+    // Direct : cette partie tente de « prendre le micro » — si obtenu, chaque
+    // coup joué est publié dans live.json (page /live du dashboard). Pour
+    // toutes les autres parties, le surcoût se limite à ce compare_exchange
+    // raté (et à rien du tout si le direct n'est pas configuré).
+    let journaliste = direct::prendre_le_micro();
+    let cycle = direct::cycle_courant();
+    // État du direct — rempli SEULEMENT micro en main (SAN et FEN coûtent).
+    let mut historique_san: Vec<String> = Vec::new();
+    let mut dernier_uci: Option<String> = None;
+    // Dernières évaluations converties CÔTÉ BLANCS (élève, prof) : les jauges
+    // de la page /live sont fixes, alors que le trait (et donc la perspective
+    // des scores de recherche) alterne à chaque coup.
+    let mut dernier_v_eleve: Option<f32> = None;
+    let mut dernier_v_prof: Option<f32> = None;
+
     let mut xs: Vec<f32> = Vec::new();
     let mut camps: Vec<Color> = Vec::new();
     let mut v_racines: Vec<f32> = Vec::new();
@@ -256,6 +274,17 @@ fn partie_recherche_interne(
         }
         .clamp(-1.0, 1.0);
 
+        // Direct : évaluations mémorisées AVANT tout break (l'arbitrage peut
+        // terminer la partie plus bas), converties du point de vue du trait
+        // vers le point de vue des BLANCS. v_eleve = recherche de l'élève
+        // (celui qui choisit les coups), v_prof = recherche du mentor
+        // (null hors mode mentoré).
+        if journaliste.is_some() {
+            let signe = if pos.turn() == Color::White { 1.0 } else { -1.0 };
+            dernier_v_eleve = Some(res.score.clamp(-1.0, 1.0) * signe);
+            dernier_v_prof = etiqueteur.is_some().then(|| v_racine * signe);
+        }
+
         // Enregistre la position AVANT le coup, du point de vue du trait.
         encode(&pos, &mut buf);
         xs.extend_from_slice(&buf);
@@ -290,8 +319,23 @@ fn partie_recherche_interne(
         } else {
             res.coup.expect("coups légaux non vides")
         };
+        // Direct : phase du coup joué (avant l'incrément de plies) et SAN
+        // calculé AVANT de jouer (il a besoin de la position de départ).
+        let phase = if plies < opts.plis_ouverture { "ouverture" } else { "normale" };
+        if journaliste.is_some() {
+            historique_san.push(San::from_move(&pos, &m).to_string());
+        }
         pos = pos.play(&m).expect("coup légal");
         plies += 1;
+
+        // Direct : publie la position APRÈS le coup, SAN cumulés, v_* du
+        // point de vue des blancs (mémorisés au moment de la recherche).
+        if let Some(j) = &journaliste {
+            dernier_uci = Some(m.to_uci(CastlingMode::Standard).to_string());
+            let fen = Fen::from_position(pos.clone(), EnPassantMode::Legal).to_string();
+            j.publie(cycle, plies, &fen, dernier_uci.as_deref(), &historique_san,
+                     dernier_v_eleve, dernier_v_prof, phase, None);
+        }
 
         // 3e occurrence du même zobrist → nulle par répétition.
         let compteur = repetitions.entry(zobrist(&pos)).or_insert(0);
@@ -300,6 +344,23 @@ fn partie_recherche_interne(
             result = 0.0;
             break;
         }
+    }
+
+    // Direct : publication finale avec le résultat — la page /live garde la
+    // position finale à l'écran le temps qu'une autre partie prenne le micro
+    // (rendu au Drop du Journaliste, à la sortie de cette fonction).
+    if let Some(j) = &journaliste {
+        let resultat = if result > 0.0 {
+            "1-0"
+        } else if result < 0.0 {
+            "0-1"
+        } else {
+            "1/2-1/2"
+        };
+        let phase = if plies < opts.plis_ouverture { "ouverture" } else { "normale" };
+        let fen = Fen::from_position(pos.clone(), EnPassantMode::Legal).to_string();
+        j.publie(cycle, plies, &fen, dernier_uci.as_deref(), &historique_san,
+                 dernier_v_eleve, dernier_v_prof, phase, Some(resultat));
     }
 
     let zs = cibles_td_leaf(&camps, &v_racines, result, opts.lambda);

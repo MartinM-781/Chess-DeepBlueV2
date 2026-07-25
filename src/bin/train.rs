@@ -488,6 +488,10 @@ fn main() {
     let opt = parse_options();
 
     fs::create_dir_all(&opt.out).expect("création du dossier --out");
+    // Direct : les parties de self-play retransmettent (une seule à la fois,
+    // voir src/direct.rs) dans ce fichier, servi par serve.exe sur /api/live
+    // et affiché par la page /live.
+    echec::direct::configure(&format!("{}/live.json", opt.out));
     rayon::ThreadPoolBuilder::new()
         .num_threads(opt.threads)
         .build_global()
@@ -579,6 +583,9 @@ fn main() {
 
     loop {
         let debut_cycle = Instant::now();
+        // Direct : numéro du cycle affiché par la page /live — etat.cycles est
+        // incrémenté en FIN de cycle, celui qui se joue est donc le suivant.
+        echec::direct::annonce_cycle(etat.cycles + 1);
 
         // 2. Self-play : graines dérivées de seed + parties déjà jouées, pour
         //    qu'une reprise continue exactement la séquence de parties.

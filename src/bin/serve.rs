@@ -5,7 +5,8 @@
 //! d'abord, ne servir qu'IPv4 coûte 2 s par requête).
 //!
 //! Fichiers statiques depuis ./web : "/" → index.html, "/training" → training.html,
-//! sinon chemin relatif dans web/ (Content-Type selon l'extension : html, js, css).
+//! "/live" → live.html, sinon chemin relatif dans web/ (Content-Type selon
+//! l'extension : html, js, css).
 //!
 //! Une seule session de jeu (Mutex), comme le serveur poker.
 //!
@@ -25,6 +26,9 @@
 //!                          "games": [...]}, "state": {"trained_secs": ..,
 //!                          "games": .., "positions": .., "cycles": ..}}
 //!                          (lecture de models/metrics.csv + models/state.json à chaque appel)
+//!  GET  /api/live        → models/live.json tel quel (partie de self-play
+//!                          retransmise par l'entraîneur, voir src/direct.rs) ;
+//!                          404 propre si rien n'a encore été publié.
 //!
 //! Schéma de l'état ("state") :
 //!  {"fen": "...", "turn": "white"|"black", "your_color": "white"|"black",
@@ -527,6 +531,7 @@ fn servir_statique(chemin: &str) -> Rep {
     let relatif = match chemin {
         "/" => "index.html",
         "/training" => "training.html",
+        "/live" => "live.html",
         autre => autre.trim_start_matches('/'),
     };
     // Pas de traversée de répertoire.
@@ -557,6 +562,17 @@ fn erreur_404() -> Rep {
     Response::from_string("404 — introuvable")
         .with_header(entete("Content-Type", "text/plain; charset=utf-8"))
         .with_status_code(404)
+}
+
+/// GET /api/live : renvoie models/live.json tel quel — le fichier est écrit
+/// ATOMIQUEMENT par l'entraîneur (src/direct.rs), un lecteur ne voit jamais
+/// de JSON partiel. 404 propre tant que rien n'a été publié.
+fn api_live() -> Rep {
+    match std::fs::read(format!("{MODELS_DIR}/live.json")) {
+        Ok(donnees) => Response::from_data(donnees)
+            .with_header(entete("Content-Type", "application/json; charset=utf-8")),
+        Err(_) => erreur_json(404, "pas de direct : l'entraîneur n'a encore rien publié"),
+    }
 }
 
 /// POST /api/new-game
@@ -663,6 +679,7 @@ fn traiter(mut req: Request, etat: &Etat) {
         "/api/state" if est_get => reponse_json(200, &etat_json(&etat.session.lock().unwrap())),
         "/api/checkpoints" if est_get => reponse_json(200, &checkpoints_json()),
         "/api/progress" if est_get => reponse_json(200, &progress_json()),
+        "/api/live" if est_get => api_live(),
         "/api/new-game" if est_post => api_new_game(etat, &corps),
         "/api/move" if est_post => api_move(etat, &corps),
         c if c.starts_with("/api/") => erreur_json(404, "route API inconnue"),

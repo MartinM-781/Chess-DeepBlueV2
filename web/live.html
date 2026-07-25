@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Échecs IA — Direct du self-play</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+  /* ---- Spécifique à la page « Direct » : jauges d'évaluation et badges ---- */
+
+  /* Point de vie du direct (vert : flux frais, rouge : rien au micro) */
+  .live-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+              background: var(--good); vertical-align: middle; margin-right: 6px; }
+  .live-dot.stale { background: var(--bad); }
+
+  /* Jauges horizontales sous le plateau : avantage côté BLANCS ∈ [-1, 1].
+     Barre bicolore façon jauge de moteur : la part blanche part de la gauche,
+     largeur (v+1)/2 — le reste, sombre, est la part des noirs. */
+  .live-gauges { max-width: 640px; margin: 16px auto 0; display: flex;
+                 flex-direction: column; gap: 10px; }
+  .gauge { background: var(--surface); border: 1px solid var(--border);
+           border-radius: 10px; padding: 9px 12px; }
+  .gauge.off { opacity: 0.4; }
+  .gauge-head { display: flex; justify-content: space-between; align-items: baseline;
+                margin-bottom: 6px; }
+  .gauge-name { color: var(--muted); font-size: 10.5px; text-transform: uppercase;
+                letter-spacing: 0.6px; }
+  .gauge-val { color: var(--ink); font-size: 13.5px; font-weight: 600;
+               font-variant-numeric: tabular-nums; }
+  .gauge-track { position: relative; height: 14px; border-radius: 7px;
+                 background: var(--piece-black); border: 1px solid var(--border);
+                 overflow: hidden; }
+  .gauge-fill { position: absolute; top: 0; bottom: 0; left: 0; width: 50%;
+                background: linear-gradient(180deg, #fdfcf7, #d9d4c3);
+                transition: width 0.3s ease; }
+  .gauge-center { position: absolute; top: 0; bottom: 0; left: 50%; width: 2px;
+                  margin-left: -1px; background: var(--series-1); opacity: 0.85;
+                  z-index: 1; }
+  /* Fort désaccord élève / prof : les deux jauges s'embrasent */
+  .live-gauges.diverge .gauge-track { border-color: var(--bad);
+                                      box-shadow: 0 0 9px rgba(208, 59, 59, 0.4); }
+  .diverge-note { text-align: center; color: var(--bad); font-size: 12px;
+                  min-height: 16px; font-variant-numeric: tabular-nums; }
+
+  /* Badge de phase (ouverture chaude / régime normal) */
+  .badge-phase { display: inline-block; padding: 3px 11px; border-radius: 999px;
+                 font-size: 12.5px; font-weight: 600; }
+  .badge-phase.ouverture { color: var(--series-3);
+                           background: rgba(201, 133, 0, 0.16);
+                           border: 1px solid rgba(201, 133, 0, 0.5); }
+  .badge-phase.normale { color: var(--ink-2); background: var(--surface-2);
+                         border: 1px solid var(--border); }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">♞ <strong>Échecs IA</strong> — 🔴 Direct du self-play</div>
+  <div class="sub"><span class="live-dot" id="live-dot"></span>Une partie d'entraînement « prend le micro » et se joue sous vos yeux ·
+    <a class="head-link" href="/">← plateau</a> ·
+    <a class="head-link" href="/training">📈 courbes d'entraînement</a></div>
+</header>
+
+<main class="layout">
+  <!-- ============================ PLATEAU ============================ -->
+  <section class="game">
+    <div class="board-wrap">
+      <div class="board-frame">
+        <div class="board" id="board"></div>
+        <div class="banner" id="banner" hidden>
+          <div class="banner-title" id="banner-title"></div>
+          <div class="banner-sub" id="banner-sub"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Jauges d'évaluation (côté blancs) : recherche de l'élève et du prof -->
+    <div class="live-gauges" id="gauges">
+      <div class="gauge" id="g-eleve">
+        <div class="gauge-head">
+          <span class="gauge-name">Élève — recherche</span>
+          <span class="gauge-val" id="val-eleve">—</span>
+        </div>
+        <div class="gauge-track"><div class="gauge-fill" id="fill-eleve"></div><div class="gauge-center"></div></div>
+      </div>
+      <div class="gauge" id="g-prof">
+        <div class="gauge-head">
+          <span class="gauge-name">Prof — recherche du mentor</span>
+          <span class="gauge-val" id="val-prof">—</span>
+        </div>
+        <div class="gauge-track"><div class="gauge-fill" id="fill-prof"></div><div class="gauge-center"></div></div>
+      </div>
+      <div class="diverge-note" id="diverge-note"></div>
+    </div>
+
+    <div class="status" id="status">Connexion au direct…</div>
+    <div class="hint">Évaluations ∈ [−1, 1] du point de vue des blancs · trait bleu = égalité ·
+      jauges rouges = fort désaccord élève / prof</div>
+  </section>
+
+  <!-- ============================ PANNEAU ============================ -->
+  <aside class="panel">
+    <div class="tiles">
+      <div class="tile"><div class="tile-value" id="tile-cycle">—</div><div class="tile-label">Cycle</div></div>
+      <div class="tile"><div class="tile-value" id="tile-ply">—</div><div class="tile-label">Pli</div></div>
+      <div class="tile"><div class="tile-value small"><span class="badge-phase normale" id="badge-phase">—</span></div><div class="tile-label">Phase</div></div>
+      <div class="tile"><div class="tile-value small" id="tile-prev">—</div><div class="tile-label">Partie précédente</div></div>
+    </div>
+
+    <div class="card-box">
+      <div class="card-box-head"><h2>Historique de la partie au micro (SAN)</h2></div>
+      <div class="moves" id="moves">
+        <div class="moves-empty">En attente d'une partie…</div>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<script src="/live.js"></script>
+</body>
+</html>
