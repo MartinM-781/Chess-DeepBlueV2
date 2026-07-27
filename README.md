@@ -27,8 +27,7 @@ journal de bord — rien n'est lissé :
 ![Courbes d'entraînement en direct](docs/courbes.png)
 
 **Le plateau** — ici la position finale de la première partie **Claude vs champion**
-(l'agent LLM qui construit le projet a affronté sa créature : nulle par triple
-répétition en 39 coups) :
+(nulle par triple répétition en 39 coups) :
 
 ![Le plateau de jeu](docs/plateau.png)
 
@@ -95,9 +94,9 @@ Le chemin réel, avec ses impasses — chaque leçon est un commit :
    **30 générations de champions** en ~40 h de calcul (147 duels de gating),
    Elo maison dans la bande 1450-1650 (pic à ~1660) après 75 h d'entraînement
    cumulé et 100 000+ parties de self-play.
-5. **Première partie contre Claude** (l'agent LLM qui construit et entraîne ce
-   projet a joué contre sa créature, en cliquant sur le plateau comme n'importe
-   quel visiteur) : **nulle par triple répétition en 39 coups**. Le champion a
+5. **Première partie contre Claude** (l'assistant IA, en cliquant sur le
+   plateau comme n'importe quel visiteur) : **nulle par triple répétition
+   en 39 coups**. Le champion a
    perdu un cavalier dès l'ouverture (aucun livre : il improvise), puis a
    puni trois imprécisions adverses en 150 ms chacune pour égaliser et
    prendre l'avantage... avant d'accepter la répétition en finale de tours.
