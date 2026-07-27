@@ -64,8 +64,17 @@ Le chemin réel, avec ses impasses — chaque leçon est un commit :
    17 %), a convergé sous mentorat (50 %)… sans pouvoir dépasser son professeur.
    *Leçon : un élève ne dépasse pas le prof dont il copie toutes les notes.*
 4. **Oracle Stockfish** : les étiquettes passent de ~1300 à ~2600+ Elo de
-   qualité. Première promotion en 2 cycles, puis **une génération de champion
-   par heure** — 1658 Elo maison et la courbe monte encore.
+   qualité. Première promotion en 2 cycles, puis le cliquet s'installe :
+   **30 générations de champions** en ~40 h de calcul (147 duels de gating),
+   Elo maison dans la bande 1450-1650 (pic à ~1660) après 75 h d'entraînement
+   cumulé et 100 000+ parties de self-play.
+5. **Première partie contre un humain** (l'opérateur du projet, aidé de
+   l'analyse) : **nulle par triple répétition en 39 coups**. Le champion a
+   perdu un cavalier dès l'ouverture (aucun livre : il improvise), puis a
+   puni trois imprécisions adverses en 150 ms chacune pour égaliser et
+   prendre l'avantage... avant d'accepter la répétition en finale de tours.
+   Diagnostic gratuit : tactiquement impitoyable, ouvertures et finales
+   encore naïves — les deux prochains chantiers s'écrivent d'eux-mêmes.
 
 ## Lancer
 
