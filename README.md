@@ -17,6 +17,32 @@ le niveau de Deep Blue.
 | **/training** | Les courbes en direct : Elo estimé, % de points contre les bots de référence, loss, duels de gating, marqueurs des changements de régime |
 | **/live** | 🔴 Regarder l'IA s'entraîner : le plateau d'une partie de self-play en cours, avec les évaluations de l'élève **et** du professeur côte à côte |
 
+## En images
+
+**La courbe d'une ascension** — de ~400 à ~1650 Elo maison : chaque trait vertical
+gris est un changement de régime (« recherche », « oracle »), chaque pointillé
+jaune un palier devenu adversaire jouable. Les creux racontent les impasses du
+journal de bord — rien n'est lissé :
+
+![Courbes d'entraînement en direct](docs/courbes.png)
+
+**Le plateau** — ici la position finale de la première partie humain-champion
+(nulle par triple répétition en 39 coups) :
+
+![Le plateau de jeu](docs/plateau.png)
+
+**🔴 Le direct du self-play** — une partie d'entraînement « prend le micro » :
+les deux jauges montrent l'évaluation de l'élève et celle du professeur sur la
+même position — leurs désaccords sont la matière première de l'apprentissage :
+
+![Le direct du self-play](docs/direct.png)
+
+**La partie humain vs champion, en accéléré** (enregistrée pendant la session) :
+
+![Chapitre 1 — l'ouverture et l'échange des dames](docs/partie_vs_ia_1_ouverture.gif)
+
+![Chapitre 2 — la finale de tours jusqu'à la nulle](docs/partie_vs_ia_2_finale.gif)
+
 ## Architecture
 
 - **Règles** : [`shakmaty`](https://crates.io/crates/shakmaty) (bitboards).
