@@ -78,6 +78,9 @@ body {
 .board {
   display: grid;
   grid-template-columns: repeat(8, 1fr);
+  /* Rangées EXPLICITEMENT uniformes : sans ça, les rangées vides s'écrasent
+     (les glyphes des pièces gonflent les leurs) à certaines largeurs de fenêtre. */
+  grid-template-rows: repeat(8, 1fr);
   aspect-ratio: 1 / 1;
   user-select: none;
 }
