@@ -56,7 +56,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use shakmaty::fen::Fen;
 use shakmaty::san::San;
 use shakmaty::uci::UciMove;
@@ -82,6 +83,11 @@ const LIMITES_SERVEUR: Limites = Limites {
     max_profondeur: 0,
     movetime_ms: 150,
 };
+/// Livre d'ouvertures au plateau : l'IA (adversaires réseau uniquement) joue
+/// un coup du livre tant que la partie a moins de ce nombre de demi-coups ET
+/// que la position courante est un préfixe exact d'une ligne du livre
+/// (departs::coup_du_livre garantit l'exactitude — aucun coup hors ligne).
+const PLIS_LIVRE_MAX: usize = 12;
 
 // ---------------------------------------------------------------------------
 // Session de jeu
@@ -255,6 +261,19 @@ fn coup_ia(session: &mut Session, cache: &CacheModeles) -> Result<(), String> {
     // Pour un adversaire réseau : (re)création du bot AVANT de chronométrer —
     // thinking_ms mesure le coup, pas le chargement du fichier modèle.
     if !matches!(session.opponent.as_str(), "random" | "material") {
+        // LIVRE AU PLATEAU : en tout début de partie, si la position courante
+        // est un préfixe exact d'une ligne du livre d'ouvertures, l'IA joue
+        // la continuation du livre directement — thinking_ms ~0, c'est voulu
+        // (« livre » : aucun temps de réflexion, le coup est déjà connu).
+        // history_san.len() = demi-coups joués depuis le début de la partie.
+        if session.history_san.len() < PLIS_LIVRE_MAX {
+            let mut rng = StdRng::seed_from_u64(graine);
+            if let Some(m) = echec::departs::coup_du_livre(&session.pos, &mut rng) {
+                session.thinking_ms = 0;
+                session.jouer(&m);
+                return Ok(());
+            }
+        }
         let chemin = chemin_modele(&session.opponent)
             .ok_or_else(|| format!("adversaire inconnu : {}", session.opponent))?;
         match charger_modele(cache, &chemin) {

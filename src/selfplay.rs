@@ -183,7 +183,24 @@ pub fn play_training_game_recherche(
     seed: u64,
     opts: &OptionsRecherche,
 ) -> GameRecord {
-    partie_recherche_interne(recherche, Etiqueteur::Aucun, seed, opts)
+    partie_recherche_interne(recherche, Etiqueteur::Aucun, Chess::default(),
+                             opts.plis_ouverture, None, seed, opts)
+}
+
+/// Comme `play_training_game_recherche`, mais la partie démarre de
+/// `depart.pos` (position d'ouverture du livre, finale générée, ...) et les
+/// plis « chauds » (température d'ouverture) sont `depart.plis_chauds` au lieu
+/// de `opts.plis_ouverture`. Tout le reste est identique — le hachage zobrist
+/// de la position de départ est bien inséré dans le suivi des répétitions, et
+/// `depart.etiquette` est retransmise au direct (clé « depart » de live.json).
+pub fn play_training_game_recherche_depuis(
+    recherche: &mut search::Recherche,
+    depart: &crate::departs::Depart,
+    seed: u64,
+    opts: &OptionsRecherche,
+) -> GameRecord {
+    partie_recherche_interne(recherche, Etiqueteur::Aucun, depart.pos.clone(),
+                             depart.plis_chauds, Some(depart.etiquette), seed, opts)
 }
 
 /// Partie de self-play MENTORÉE — remède à la chambre d'écho du TD
@@ -202,7 +219,21 @@ pub fn play_training_game_mentor(
     seed: u64,
     opts: &OptionsRecherche,
 ) -> GameRecord {
-    partie_recherche_interne(eleve, Etiqueteur::Prof(prof), seed, opts)
+    partie_recherche_interne(eleve, Etiqueteur::Prof(prof), Chess::default(),
+                             opts.plis_ouverture, None, seed, opts)
+}
+
+/// Comme `play_training_game_mentor`, mais depuis `depart.pos` avec
+/// `depart.plis_chauds` plis chauds (voir `play_training_game_recherche_depuis`).
+pub fn play_training_game_mentor_depuis(
+    eleve: &mut search::Recherche,
+    prof: &mut search::Recherche,
+    depart: &crate::departs::Depart,
+    seed: u64,
+    opts: &OptionsRecherche,
+) -> GameRecord {
+    partie_recherche_interne(eleve, Etiqueteur::Prof(prof), depart.pos.clone(),
+                             depart.plis_chauds, Some(depart.etiquette), seed, opts)
 }
 
 /// Partie de self-play ORACLE — même déroulé que le mentorat (l'élève choisit
@@ -223,7 +254,21 @@ pub fn play_training_game_oracle(
     seed: u64,
     opts: &OptionsRecherche,
 ) -> GameRecord {
-    partie_recherche_interne(chercheur, Etiqueteur::Oracle(oracle), seed, opts)
+    partie_recherche_interne(chercheur, Etiqueteur::Oracle(oracle), Chess::default(),
+                             opts.plis_ouverture, None, seed, opts)
+}
+
+/// Comme `play_training_game_oracle`, mais depuis `depart.pos` avec
+/// `depart.plis_chauds` plis chauds (voir `play_training_game_recherche_depuis`).
+pub fn play_training_game_oracle_depuis(
+    chercheur: &mut search::Recherche,
+    oracle: &mut UciEngine,
+    depart: &crate::departs::Depart,
+    seed: u64,
+    opts: &OptionsRecherche,
+) -> GameRecord {
+    partie_recherche_interne(chercheur, Etiqueteur::Oracle(oracle), depart.pos.clone(),
+                             depart.plis_chauds, Some(depart.etiquette), seed, opts)
 }
 
 /// « Qui étiquette » les positions du self-play piloté par la recherche : la
@@ -247,14 +292,23 @@ enum Etiqueteur<'a> {
 /// `Prof` : la recherche du prof étiquette les MÊMES positions avec les MÊMES
 /// limites (mentorat), `Oracle` : l'évaluation d'un moteur UCI externe
 /// étiquette (repli élève position par position si le moteur ne répond pas).
+/// La partie démarre de `pos_depart` (position initiale pour les variantes
+/// historiques, position du livre/finale pour les variantes `_depuis`) et
+/// `plis_chauds` remplace `opts.plis_ouverture` comme durée de la phase à
+/// `temperature_ouverture`. `etiquette_depart` (Some pour les variantes
+/// `_depuis`, None sinon) est retransmise au direct sous la clé « depart »
+/// de live.json — la page /live peut indiquer la provenance du départ.
 fn partie_recherche_interne(
     chercheur: &mut search::Recherche,
     mut etiqueteur: Etiqueteur,
+    pos_depart: Chess,
+    plis_chauds: u32,
+    etiquette_depart: Option<&str>,
     seed: u64,
     opts: &OptionsRecherche,
 ) -> GameRecord {
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut pos = Chess::default();
+    let mut pos = pos_depart;
     // Une partie = une TT propre (killers et historique compris) — pour les
     // DEUX chercheurs en mode mentoré ; l'oracle reçoit l'équivalent UCI
     // (`ucinewgame`).
@@ -389,8 +443,8 @@ fn partie_recherche_interne(
             break;
         }
 
-        // Ouverture diversifiée, puis régime normal.
-        let t = if plies < opts.plis_ouverture {
+        // Ouverture diversifiée (plis « chauds »), puis régime normal.
+        let t = if plies < plis_chauds {
             opts.temperature_ouverture
         } else {
             opts.temperature
@@ -404,7 +458,7 @@ fn partie_recherche_interne(
         };
         // Direct : phase du coup joué (avant l'incrément de plies) et SAN
         // calculé AVANT de jouer (il a besoin de la position de départ).
-        let phase = if plies < opts.plis_ouverture { "ouverture" } else { "normale" };
+        let phase = if plies < plis_chauds { "ouverture" } else { "normale" };
         if journaliste.is_some() {
             historique_san.push(San::from_move(&pos, &m).to_string());
         }
@@ -412,12 +466,14 @@ fn partie_recherche_interne(
         plies += 1;
 
         // Direct : publie la position APRÈS le coup, SAN cumulés, v_* du
-        // point de vue des blancs (mémorisés au moment de la recherche).
+        // point de vue des blancs (mémorisés au moment de la recherche),
+        // étiquette du départ (null pour les variantes historiques).
         if let Some(j) = &journaliste {
             dernier_uci = Some(m.to_uci(CastlingMode::Standard).to_string());
             let fen = Fen::from_position(pos.clone(), EnPassantMode::Legal).to_string();
-            j.publie(cycle, plies, &fen, dernier_uci.as_deref(), &historique_san,
-                     dernier_v_eleve, dernier_v_prof, phase, None);
+            j.publie_avec_depart(cycle, plies, &fen, dernier_uci.as_deref(),
+                                 &historique_san, dernier_v_eleve, dernier_v_prof,
+                                 phase, None, etiquette_depart);
         }
 
         // 3e occurrence du même zobrist → nulle par répétition.
@@ -440,10 +496,11 @@ fn partie_recherche_interne(
         } else {
             "1/2-1/2"
         };
-        let phase = if plies < opts.plis_ouverture { "ouverture" } else { "normale" };
+        let phase = if plies < plis_chauds { "ouverture" } else { "normale" };
         let fen = Fen::from_position(pos.clone(), EnPassantMode::Legal).to_string();
-        j.publie(cycle, plies, &fen, dernier_uci.as_deref(), &historique_san,
-                 dernier_v_eleve, dernier_v_prof, phase, Some(resultat));
+        j.publie_avec_depart(cycle, plies, &fen, dernier_uci.as_deref(),
+                             &historique_san, dernier_v_eleve, dernier_v_prof,
+                             phase, Some(resultat), etiquette_depart);
     }
 
     let zs = cibles_td_leaf(&camps, &v_racines, result, opts.lambda);
@@ -553,6 +610,38 @@ mod tests {
         assert!(rec.result == 1.0 || rec.result == 0.0 || rec.result == -1.0);
         // Cibles finies et bornées : |z| <= lambda + (1-lambda) = 1.
         assert!(rec.zs.iter().all(|z| z.is_finite() && z.abs() <= 1.0 + 1e-6));
+    }
+
+    /// Une partie « depuis » une finale KRPvKR (variante recherche, 300
+    /// nœuds/coup, SANS oracle réel) se termine proprement : mêmes invariants
+    /// que le self-play classique, et le suivi des répétitions part bien de la
+    /// position de départ. C'est le chemin qu'emprunte
+    /// `play_training_game_oracle_depuis` (même cœur interne), testé ici sans
+    /// dépendre d'un moteur UCI local.
+    #[test]
+    fn partie_depuis_finale_krpvkr_se_termine() {
+        // Blancs : Rc1, Td1, Pc2 ; Noirs : Tc8, Rg8 — KRPvKR légal, trait blanc.
+        let pos: Chess = "2r3k1/8/8/8/8/8/2P5/2KR4 w - - 0 1"
+            .parse::<Fen>()
+            .expect("FEN lisible")
+            .into_position(CastlingMode::Standard)
+            .expect("position légale");
+        let depart = crate::departs::Depart {
+            pos,
+            etiquette: "finale:KRPvKR",
+            plis_chauds: 0,
+        };
+        let net = Arc::new(Mlp::new(42));
+        let mut recherche = search::Recherche::new(net, 16);
+        let mut opts = OptionsRecherche::default();
+        opts.nodes_par_coup = 300;
+        let rec = play_training_game_recherche_depuis(&mut recherche, &depart, 7, &opts);
+        assert!(rec.plies > 0 && rec.plies <= opts.max_plies,
+                "nombre de plis aberrant : {}", rec.plies);
+        assert_eq!(rec.xs.len(), rec.zs.len() * N_FEATURES);
+        assert!(rec.result == 1.0 || rec.result == 0.0 || rec.result == -1.0);
+        // Cibles bornées : |z| <= lambda + (1-lambda) = 1.
+        assert!(rec.zs.iter().all(|z| z.abs() <= 1.0 + 1e-6));
     }
 
     /// Le mentor ne change QUE les étiquettes, jamais le déroulé : avec le

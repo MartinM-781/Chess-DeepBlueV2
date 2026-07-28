@@ -38,6 +38,7 @@ pub fn pleine_puissance() {}
 pub mod arena;
 pub mod bots;
 pub mod checkpoints;
+pub mod departs;
 pub mod direct;
 pub mod elo;
 pub mod features;

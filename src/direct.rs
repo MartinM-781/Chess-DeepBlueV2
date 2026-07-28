@@ -11,10 +11,15 @@
 //!  "last_move": "uci"|null, "history_san": ["e4", ...],
 //!  "v_eleve": f32|null, "v_prof": f32|null,
 //!  "phase": "ouverture"|"normale", "result": null|"1-0"|"0-1"|"1/2-1/2",
-//!  "resultat_precedent": null|"1-0"|"0-1"|"1/2-1/2"}
+//!  "resultat_precedent": null|"1-0"|"0-1"|"1/2-1/2",
+//!  "depart": "etiquette"|null}
 //! Les v_* sont CÔTÉ BLANCS (la conversion depuis la perspective du trait est
 //! faite par l'appelant, dans selfplay.rs) ; v_prof est null hors mentorat ;
-//! result est non-null uniquement sur la publication finale d'une partie.
+//! result est non-null uniquement sur la publication finale d'une partie ;
+//! depart est l'étiquette de la position de départ tirée par departs::tirage
+//! (« ouverture:najdorf », « finale:KRPvKR », « initiale »), null pour une
+//! partie des variantes historiques — un front qui ignore cette clé n'affiche
+//! simplement rien (clé supplémentaire sans effet, web/live.js vérifié).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -93,6 +98,34 @@ impl Journaliste {
         phase: &str,
         result: Option<&str>,
     ) {
+        // Signature historique INTACTE : délègue avec depart = None (la clé
+        // « depart » est alors publiée à null, comme pour toute partie des
+        // variantes historiques).
+        self.publie_avec_depart(
+            cycle, ply, fen, last_move, history_san, v_eleve, v_prof, phase, result, None,
+        );
+    }
+
+    /// Comme `publie`, avec en plus l'étiquette du DÉPART de la partie
+    /// retransmise sous la clé « depart » du contrat : « ouverture:najdorf »,
+    /// « finale:KRPvKR », « initiale »… (voir src/departs.rs) — la page /live
+    /// peut ainsi indiquer la provenance d'une partie qui démarre d'une
+    /// position à 4-5 pièces sans historique SAN. None = variante historique
+    /// (clé publiée à null).
+    #[allow(clippy::too_many_arguments)]
+    pub fn publie_avec_depart(
+        &self,
+        cycle: u64,
+        ply: u32,
+        fen: &str,
+        last_move: Option<&str>,
+        history_san: &[String],
+        v_eleve: Option<f32>,
+        v_prof: Option<f32>,
+        phase: &str,
+        result: Option<&str>,
+        depart: Option<&str>,
+    ) {
         let Some(chemin) = CHEMIN.get() else { return };
         // « resultat_precedent » : l'issue de la partie publiée d'AVANT ;
         // si celle-ci se termine (result non-null), elle devient à son tour
@@ -117,6 +150,7 @@ impl Journaliste {
             "phase": phase,
             "result": result,
             "resultat_precedent": precedent,
+            "depart": depart,
         });
         let tmp = format!("{chemin}.tmp");
         if std::fs::write(&tmp, v.to_string()).is_ok() {
@@ -206,6 +240,7 @@ mod tests {
         assert!(v["v_prof"].is_null(), "v_prof null hors mentorat");
         assert_eq!(v["phase"], "normale");
         assert_eq!(v["result"], "1-0");
+        assert!(v["depart"].is_null(), "depart null via publie (signature historique)");
 
         // Publication suivante (nouvelle partie, mode mentoré) : le résultat
         // d'avant est devenu « resultat_precedent ».
@@ -219,5 +254,15 @@ mod tests {
         assert!((v2["v_prof"].as_f64().unwrap() + 0.5).abs() < 1e-6);
         assert_eq!(v2["phase"], "ouverture");
         assert_eq!(v2["history_san"], serde_json::json!([]));
+
+        // Publication via publie_avec_depart : l'étiquette du départ est
+        // retransmise telle quelle sous la clé « depart » (le reste du
+        // contrat est inchangé — resultat_precedent survit).
+        j.publie_avec_depart(4, 2, "fen3", None, &[], None, None, "normale", None,
+                             Some("finale:KRPvKR"));
+        let v3: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(chemin).unwrap()).unwrap();
+        assert_eq!(v3["depart"], "finale:KRPvKR");
+        assert_eq!(v3["resultat_precedent"], "1-0");
     }
 }

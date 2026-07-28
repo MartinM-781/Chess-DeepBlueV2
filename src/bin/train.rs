@@ -41,6 +41,19 @@
 //!                         mélange oracle/élève piloté par --mentor-poids,
 //!                         comme en mentorat (vide = désactivé)
 //!   --oracle-movetime 15  budget (ms) de chaque évaluation de l'oracle
+//!   --departs-ouvertures 0  régime recherche : proportion des parties de
+//!                         self-play qui démarrent d'une ouverture du livre
+//!                         (departs::tirage, rng dérivé de la graine de la
+//!                         partie — déterminisme préservé)
+//!   --departs-finales 0   idem, proportion des parties qui démarrent d'une
+//!                         finale générée ; le reste part de la position
+//!                         initiale. « 0 0 » = comportement historique STRICT
+//!                         (aucun tirage, mêmes trajectoires qu'avant).
+//!                         Défauts à ZÉRO : options ABSENTES = « 0 0 » — une
+//!                         ligne de commande historique reste bit-à-bit
+//!                         identique à avant ; l'activation des départs variés
+//!                         est un opt-in EXPLICITE par flags (valeurs
+//!                         conseillées : 0.6 et 0.2)
 //!
 //! Régime « recherche » (search_nodes > 0) :
 //!   - self-play via selfplay::play_training_game_recherche (un chercheur par
@@ -157,6 +170,8 @@ struct Options {
     mentor_poids: f32,
     oracle: String,
     oracle_movetime: u32,
+    departs_ouvertures: f32,
+    departs_finales: f32,
 }
 
 /// Tampon de rejeu : anneau de positions encodées à capacité fixe.
@@ -244,6 +259,8 @@ fn parse_options() -> Options {
         mentor_poids: 1.0,
         oracle: String::new(),
         oracle_movetime: 15,
+        departs_ouvertures: 0.0,
+        departs_finales: 0.0,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -274,13 +291,20 @@ fn parse_options() -> Options {
             "--oracle-movetime" => {
                 opt.oracle_movetime = parse_valeur(&valeur(&args, i, &nom), &nom)
             }
+            "--departs-ouvertures" => {
+                opt.departs_ouvertures = parse_valeur(&valeur(&args, i, &nom), &nom)
+            }
+            "--departs-finales" => {
+                opt.departs_finales = parse_valeur(&valeur(&args, i, &nom), &nom)
+            }
             _ => {
                 eprintln!("option inconnue : {nom}");
                 eprintln!(
                     "options : --out --threads --games-per-cycle --temperature --lr \
                      --eval-games --replay --elo-every --elo-games --seed \
                      --search-nodes --td-lambda --gate-every --gate-games --mentor \
-                     --mentor-poids --oracle --oracle-movetime"
+                     --mentor-poids --oracle --oracle-movetime \
+                     --departs-ouvertures --departs-finales"
                 );
                 std::process::exit(2);
             }
@@ -620,6 +644,18 @@ fn main() {
             }
             None
         };
+    // Départs variés (régime recherche uniquement) : proportion des parties
+    // qui démarrent d'une ouverture du livre / d'une finale générée.
+    // « 0 0 » = comportement historique STRICT (aucun tirage).
+    let utilise_departs =
+        opt.search_nodes > 0 && (opt.departs_ouvertures > 0.0 || opt.departs_finales > 0.0);
+    if opt.search_nodes > 0 {
+        println!(
+            "departs : ouvertures {:.0} %, finales {:.0} %",
+            opt.departs_ouvertures * 100.0,
+            opt.departs_finales * 100.0
+        );
+    }
     // Marqueur de changement de régime pour les courbes du dashboard : posé une
     // seule fois, à la première activation du régime recherche.
     if opt.search_nodes > 0 {
@@ -711,6 +747,19 @@ fn main() {
                 .map(|&g| {
                     let mut eleve =
                         search::Recherche::new(net.clone(), TAILLE_TT_LOG2_SELFPLAY);
+                    // Départ de la partie : ouverture du livre / finale
+                    // générée / position initiale, tiré d'un rng DÉRIVÉ de la
+                    // graine de la partie (déterminisme : même graine → même
+                    // départ, reprise comprise). None = variantes historiques,
+                    // trajectoires strictement identiques à avant.
+                    let depart = utilise_departs.then(|| {
+                        let mut rng_depart = StdRng::seed_from_u64(derive_graine(g, 0xDE9A47));
+                        echec::departs::tirage(
+                            &mut rng_depart,
+                            opt.departs_ouvertures,
+                            opt.departs_finales,
+                        )
+                    });
                     let partie = if let Some(pool) = &oracle_pool {
                         // Emprunt d'un moteur au pool : pop sous verrou, le
                         // verrou est relâché PENDANT la partie (le guard est
@@ -731,14 +780,27 @@ fn main() {
                             UciEngine::lance_pleine_force(&opt.oracle, opt.oracle_movetime)
                                 .ok()
                         });
-                        let partie = match moteur.as_mut() {
-                            Some(o) => selfplay::play_training_game_oracle(
+                        let partie = match (moteur.as_mut(), &depart) {
+                            (Some(o), Some(d)) => selfplay::play_training_game_oracle_depuis(
+                                &mut eleve,
+                                o,
+                                d,
+                                g,
+                                &opts_recherche,
+                            ),
+                            (Some(o), None) => selfplay::play_training_game_oracle(
                                 &mut eleve,
                                 o,
                                 g,
                                 &opts_recherche,
                             ),
-                            None => selfplay::play_training_game_recherche(
+                            (None, Some(d)) => selfplay::play_training_game_recherche_depuis(
+                                &mut eleve,
+                                d,
+                                g,
+                                &opts_recherche,
+                            ),
+                            (None, None) => selfplay::play_training_game_recherche(
                                 &mut eleve,
                                 g,
                                 &opts_recherche,
@@ -753,18 +815,35 @@ fn main() {
                     } else if let Some(m) = &mentor {
                         let mut prof =
                             search::Recherche::new(m.clone(), TAILLE_TT_LOG2_SELFPLAY);
-                        selfplay::play_training_game_mentor(
-                            &mut eleve,
-                            &mut prof,
-                            g,
-                            &opts_recherche,
-                        )
+                        match &depart {
+                            Some(d) => selfplay::play_training_game_mentor_depuis(
+                                &mut eleve,
+                                &mut prof,
+                                d,
+                                g,
+                                &opts_recherche,
+                            ),
+                            None => selfplay::play_training_game_mentor(
+                                &mut eleve,
+                                &mut prof,
+                                g,
+                                &opts_recherche,
+                            ),
+                        }
                     } else {
-                        selfplay::play_training_game_recherche(
-                            &mut eleve,
-                            g,
-                            &opts_recherche,
-                        )
+                        match &depart {
+                            Some(d) => selfplay::play_training_game_recherche_depuis(
+                                &mut eleve,
+                                d,
+                                g,
+                                &opts_recherche,
+                            ),
+                            None => selfplay::play_training_game_recherche(
+                                &mut eleve,
+                                g,
+                                &opts_recherche,
+                            ),
+                        }
                     };
                     let n = fait.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if n % 8 == 0 || n == total {
