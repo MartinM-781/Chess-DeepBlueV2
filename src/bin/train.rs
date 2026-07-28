@@ -949,7 +949,20 @@ fn main() {
         ) * 100.0;
 
         // 5. État cumulé + sauvegardes atomiques (.tmp puis rename).
-        let duree_cycle = debut_cycle.elapsed().as_secs_f64();
+        // Une mise en veille au MILIEU d'un cycle gonflerait trained_secs
+        // d'heures fantômes (le chrono mural tourne pendant le sommeil) : la
+        // durée créditée est plafonnée à 15 min — aucun cycle réel n'approche
+        // ce plafond (médiane ~3 min). Leçon des 16,9 h fantômes purgées des
+        // courbes le 28/07.
+        let duree_brute = debut_cycle.elapsed().as_secs_f64();
+        let duree_cycle = if duree_brute > 900.0 {
+            println!(
+                "  (cycle de {duree_brute:.0} s plafonné à 900 s — veille pendant le cycle ?)"
+            );
+            900.0
+        } else {
+            duree_brute
+        };
         let avant_h = etat.trained_secs / 3600.0;
         etat.trained_secs += duree_cycle;
         let apres_h = etat.trained_secs / 3600.0;
