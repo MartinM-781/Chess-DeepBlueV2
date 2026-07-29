@@ -3,6 +3,15 @@
 //! killers, historique), élagage null-move. Les feuilles calmes sont évaluées
 //! par le réseau (perspective du trait, [-1,1]) ; les mats sont exacts.
 //!
+//! RAFFINEMENTS (débrayables via `Recherche::mode_classique`, base des A/B) :
+//! - LMR : les coups calmes tardifs sont sondés à profondeur réduite en
+//!   fenêtre nulle, re-cherchés à pleine profondeur s'ils surprennent ;
+//! - fenêtres d'aspiration à la racine (à partir de l'itération 3) ;
+//! - SEE (échange statique sur la case d'arrivée, rayons X compris) : filtre
+//!   les prises perdantes en quiescence — sauf celles qui donnent échec,
+//!   repêchées pour que les mats restent visibles aux feuilles — et
+//!   départage les prises au tri.
+//!
 //! ÉVALUATION INCRÉMENTALE (src/nnue.rs) : les feuilles ne repassent plus par
 //! encode + forward complet — une pile d'accumulateurs de la couche 1 est
 //! maintenue par deltas le long de la ligne explorée (pousse avant chaque
@@ -23,7 +32,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use shakmaty::zobrist::{Zobrist64, ZobristHash};
-use shakmaty::{Chess, Color, EnPassantMode, Move, Position};
+use shakmaty::{Bitboard, Board, Chess, Color, EnPassantMode, Move, Piece, Position, Role, Square};
 
 use crate::features::{encode, N_FEATURES};
 use crate::nn::Mlp;
@@ -61,6 +70,10 @@ const R_NULL: u32 = 2;
 /// Largeur de la fenêtre nulle du null-move : les scores sont des f32 continus,
 /// on teste « >= beta » avec une fenêtre [beta - EPS_NUL, beta].
 const EPS_NUL: f32 = 1e-3;
+
+/// Demi-largeur initiale de la fenêtre d'aspiration à la racine (échelle
+/// réseau [-1,1]). Doublée à chaque échec jusqu'à la fenêtre pleine.
+const DELTA_ASPIRATION: f32 = 0.08;
 
 /// Le chrono (Instant::now) n'est consulté que tous les ~1024 nœuds : un appel
 /// d'horloge par nœud coûterait plus cher que le nœud lui-même.
@@ -173,6 +186,115 @@ fn cle_mvv_lva(m: &Move) -> i32 {
     cle
 }
 
+// --- SEE (Static Exchange Evaluation) ----------------------------------------
+
+/// Valeur SEE d'un rôle, en centièmes de pion. Le roi vaut « très grand » :
+/// il ne peut jamais être perdu avec profit, seulement conclure un échange
+/// (la remontée minimax refuse d'elle-même toute « prise du roi »).
+fn valeur_see(r: Role) -> i32 {
+    match r {
+        Role::Pawn => 100,
+        Role::Knight => 300,
+        Role::Bishop => 315,
+        Role::Rook => 500,
+        Role::Queen => 900,
+        Role::King => 20_000,
+    }
+}
+
+/// Moins cher attaquant de `camp` parmi `attaquants` (bitboard déjà filtré par
+/// l'occupation courante) : rôles parcourus par valeur croissante.
+fn moins_cher_attaquant(board: &Board, camp: Color, attaquants: Bitboard) -> Option<(Square, Role)> {
+    if attaquants.is_empty() {
+        return None;
+    }
+    for role in [Role::Pawn, Role::Knight, Role::Bishop, Role::Rook, Role::Queen, Role::King] {
+        if let Some(sq) = (attaquants & board.by_piece(Piece { color: camp, role })).first() {
+            return Some((sq, role));
+        }
+    }
+    None
+}
+
+/// SEE : gain matériel espéré du coup `m` (centièmes de pion, point de vue du
+/// camp qui joue), si les deux camps mènent l'échange optimal sur la case
+/// d'arrivée.
+///
+/// MÉTHODE (« swap algorithm » itératif) :
+/// 1. le coup est joué virtuellement : sa case de départ quitte l'occupation
+///    (et la case du pion pris en passant, qui n'est PAS la case d'arrivée) ;
+/// 2. tant que le camp au trait a des attaquants de la case, le MOINS CHER
+///    recapture : gains[d] = valeur(occupant) - gains[d-1], le recapturant
+///    devient l'occupant et sa case quitte l'occupation à son tour ;
+/// 3. rayons X : `Board::attacks_to(case, camp, occ)` est recalculé à chaque
+///    étage avec l'occupation RÉDUITE — tour/fou/dame alignés derrière une
+///    pièce retirée réapparaissent d'eux-mêmes dans le bitboard (le résultat
+///    est re-filtré par `& occ` pour écarter les pièces déjà consommées) ;
+/// 4. remontée minimax : gains[d-1] = -max(-gains[d-1], gains[d]) — chaque
+///    camp est libre de S'ARRÊTER de reprendre quand continuer le dessert.
+///
+/// Simplifications standard pour un SEE d'ordonnancement : clouages ignorés,
+/// promotion comptée pour le coup INITIAL seulement (pas les re-captures),
+/// roque → 0 (jamais une prise).
+pub fn see(pos: &Chess, m: &Move) -> i32 {
+    if m.is_castle() {
+        return 0;
+    }
+    let Some(from) = m.from() else {
+        return 0; // coups « posés » (variantes à réserve) : hors périmètre
+    };
+    let board = pos.board();
+    let to = m.to();
+    let mut occ = board.occupied().without(from);
+
+    // Victime initiale ; le pion pris en passant est retiré À LA MAIN de
+    // l'occupation (il ne se trouve pas sur la case d'arrivée).
+    let victime = if m.is_en_passant() {
+        occ = occ.without(Square::from_coords(to.file(), from.rank()));
+        valeur_see(Role::Pawn)
+    } else {
+        m.capture().map_or(0, valeur_see)
+    };
+
+    // Pièce désormais posée sur la case : le rôle joué, ou la pièce promue
+    // (la plus-value promo - pion s'ajoute au butin initial).
+    let (mut occupant, bonus_promo) = match m.promotion() {
+        Some(p) => (valeur_see(p), valeur_see(p) - valeur_see(Role::Pawn)),
+        None => (valeur_see(m.role()), 0),
+    };
+
+    // 32 pièces au plus sur l'échiquier : 33 étages suffisent toujours.
+    let mut gains = [0i32; 33];
+    gains[0] = victime + bonus_promo;
+    let mut d = 0usize;
+    let mut camp = !pos.turn();
+    while d + 1 < gains.len() {
+        let attaquants = board.attacks_to(to, camp, occ) & occ;
+        let Some((sq, role)) = moins_cher_attaquant(board, camp, attaquants) else {
+            break;
+        };
+        d += 1;
+        gains[d] = occupant - gains[d - 1];
+        occupant = valeur_see(role);
+        occ = occ.without(sq);
+        camp = !camp;
+    }
+    while d > 0 {
+        gains[d - 1] = -(-gains[d - 1]).max(gains[d]);
+        d -= 1;
+    }
+    gains[0]
+}
+
+/// Le coup `m` donne-t-il échec ? Test EXACT (le coup est joué sur une
+/// copie : échecs à la découverte compris). Appelé avec parcimonie — voir
+/// quiesce : repêchage des seules prises see < 0 candidates au rejet.
+fn donne_echec(pos: &Chess, m: &Move) -> bool {
+    let mut fille = pos.clone();
+    fille.play_unchecked(m);
+    fille.is_check()
+}
+
 /// Le trait possède-t-il au moins une pièce qui ne soit ni pion ni roi ?
 /// (Condition du null-move : évite les positions de zugzwang de finale de
 /// pions, où « passer » est souvent la meilleure option réelle.)
@@ -220,6 +342,11 @@ pub struct Resultat {
 /// chaque partie ou à chaque cycle avec l'Arc du réseau courant.
 pub struct Recherche {
     pub net: Arc<Mlp>,
+    /// À `true`, DÉBRAYE les trois raffinements (LMR, fenêtres d'aspiration,
+    /// SEE) : la recherche redevient strictement celle d'origine — même arbre,
+    /// mêmes nœuds. C'est la base de comparaison des tests A/B. Défaut : false
+    /// (raffinements actifs).
+    pub mode_classique: bool,
     /// Poids réorganisés pour l'évaluation incrémentale. `None` = chemin de
     /// secours forward complet : USE_NNUE à false, ou réseau sans couche
     /// cachée (les réseaux linéaires [773,1] de certains tests, où il n'y a
@@ -266,6 +393,7 @@ impl Recherche {
         let eval = (USE_NNUE && net.sizes.len() >= 3).then(|| EvalIncrementale::new(&net));
         Recherche {
             net,
+            mode_classique: false,
             eval,
             pile: None,
             tt: vec![ENTREE_VIDE; n],
@@ -339,61 +467,112 @@ impl Recherche {
         let coup_tt_racine = self.sonde(cle_racine).map_or(COUP_AUCUN, |e| e.coup);
         let couleur = pos.turn();
         let mut ordre: Vec<Move> = coups.iter().cloned().collect();
-        ordre.sort_by_cached_key(|m| Reverse(self.cle_ordre(m, coup_tt_racine, 0, couleur)));
+        ordre.sort_by_cached_key(|m| Reverse(self.cle_ordre(pos, m, coup_tt_racine, 0, couleur)));
 
         // Dernière itération COMPLÈTE : (meilleur coup, score, profondeur, scores racine).
         let mut complete: Option<(Move, f32, u32, Vec<(Move, f32)>)> = None;
 
-        for d in 1..=prof_max {
+        'iterations: for d in 1..=prof_max {
             // L'itération 1 ignore les limites : il faut TOUJOURS un coup.
             self.limites_actives = d > 1;
             if d > 1 && self.budget_epuise() {
                 break;
             }
 
-            let mut alpha = f32::NEG_INFINITY;
-            let mut best = f32::NEG_INFINITY;
-            let mut meilleur: Option<Move> = None;
-            let mut scores_iter: Vec<(Move, f32)> = Vec::with_capacity(ordre.len());
-            let mut interrompue = false;
+            // Fenêtre d'aspiration à la racine (raffinement débrayé en mode
+            // classique) : à partir de l'itération 3, on parie que le score
+            // restera proche de celui de l'itération précédente — fenêtre
+            // [prec - DELTA_ASPIRATION, prec + DELTA_ASPIRATION] — et en cas
+            // d'échec (fail-low/high) la passe est REFAITE en doublant la
+            // demi-largeur du côté fautif jusqu'à la fenêtre pleine. Scores de
+            // MAT (|prec| > SEUIL_MAT) : fenêtre pleine directement, ±0.08
+            // n'a aucun sens à l'échelle des mats.
+            let score_prec = complete.as_ref().map(|c| c.1);
+            let aspiration = !self.mode_classique
+                && d >= 3
+                && score_prec.is_some_and(|s| s.abs() <= SEUIL_MAT);
+            let mut demi = DELTA_ASPIRATION;
+            let (mut fen_bas, mut fen_haut) = if aspiration {
+                let s = score_prec.expect("aspiration exige une itération précédente");
+                (s - demi, s + demi)
+            } else {
+                (f32::NEG_INFINITY, f32::INFINITY)
+            };
 
-            for m in &ordre {
-                let mut fille = pos.clone();
-                fille.play_unchecked(m);
-                // Fenêtre racine : alpha monte, bêta reste infini (tous les
-                // coups racine sont cherchés). Le meilleur score est exact ;
-                // les autres peuvent n'être que des bornes supérieures
-                // (fail-soft) — suffisant pour l'échantillonnage en
-                // température, qui ne sert qu'à l'exploration.
-                self.pile_pousse(pos, m);
-                let v = -self.negamax(&fille, d - 1, 1, f32::NEG_INFINITY, -alpha, false);
-                self.pile_depousse();
-                if self.stop {
-                    interrompue = true;
-                    break;
+            // Une « passe » racine par fenêtre ; en fenêtre pleine (mode
+            // classique, d < 3, mats) la boucle ne fait qu'un seul tour et le
+            // corps est strictement la boucle racine d'origine.
+            let (best, meilleur, scores_iter) = loop {
+                let mut alpha = fen_bas;
+                let mut best = f32::NEG_INFINITY;
+                let mut meilleur: Option<Move> = None;
+                let mut scores_iter: Vec<(Move, f32)> = Vec::with_capacity(ordre.len());
+                let mut fail_high = false;
+
+                for m in &ordre {
+                    let mut fille = pos.clone();
+                    fille.play_unchecked(m);
+                    // Fenêtre racine : alpha monte, bêta est le plafond
+                    // d'aspiration (infini hors aspiration : tous les coups
+                    // racine sont cherchés). Le meilleur score est exact ;
+                    // les autres peuvent n'être que des bornes supérieures
+                    // (fail-soft) — suffisant pour l'échantillonnage en
+                    // température, qui ne sert qu'à l'exploration.
+                    self.pile_pousse(pos, m);
+                    let v = -self.negamax(&fille, d - 1, 1, -fen_haut, -alpha, false);
+                    self.pile_depousse();
+                    if self.stop {
+                        break 'iterations; // itération jetée : on garde la dernière complète
+                    }
+                    // Chrono aussi consulté entre deux coups racine : la granularité
+                    // en nœuds (INTERVALLE_CHRONO) peut être trop grossière quand le
+                    // réseau est lent ; ici l'appel d'horloge est gratuit à l'échelle
+                    // d'un sous-arbre. Sans incidence sur le déterminisme à budget de
+                    // nœuds fixe (fin = None dans ce cas).
+                    if self.limites_actives && self.fin.is_some_and(|f| Instant::now() >= f) {
+                        self.stop = true;
+                        break 'iterations;
+                    }
+                    scores_iter.push((m.clone(), v));
+                    if v > best {
+                        best = v;
+                        meilleur = Some(m.clone());
+                    }
+                    if v > alpha {
+                        alpha = v;
+                    }
+                    if v >= fen_haut {
+                        // Fail-high d'aspiration : le score crève le plafond,
+                        // la passe est invalide — élargir sans finir le tour.
+                        fail_high = true;
+                        break;
+                    }
                 }
-                // Chrono aussi consulté entre deux coups racine : la granularité
-                // en nœuds (INTERVALLE_CHRONO) peut être trop grossière quand le
-                // réseau est lent ; ici l'appel d'horloge est gratuit à l'échelle
-                // d'un sous-arbre. Sans incidence sur le déterminisme à budget de
-                // nœuds fixe (fin = None dans ce cas).
-                if self.limites_actives && self.fin.is_some_and(|f| Instant::now() >= f) {
-                    self.stop = true;
-                    interrompue = true;
-                    break;
+
+                if fail_high || best <= fen_bas {
+                    // Échec d'aspiration (impossible en fenêtre pleine : les
+                    // scores sont finis et fen_haut infini). Doublement du
+                    // côté fautif ; une borne déjà en zone de MAT saute
+                    // directement en fenêtre pleine.
+                    let s = score_prec.expect("échec d'aspiration sans fenêtre étroite");
+                    demi *= 2.0;
+                    let pleine = demi >= 2.0 || best.abs() > SEUIL_MAT;
+                    if fail_high {
+                        // Le coup fautif mène la re-passe (il y échouera haut
+                        // ou s'y prouvera le meilleur au plus vite).
+                        if let Some(m) = &meilleur {
+                            if let Some(i) = ordre.iter().position(|o| o == m) {
+                                ordre[..=i].rotate_right(1);
+                            }
+                        }
+                        fen_haut = if pleine { f32::INFINITY } else { s + demi };
+                    } else {
+                        fen_bas = if pleine { f32::NEG_INFINITY } else { s - demi };
+                    }
+                    continue;
                 }
-                scores_iter.push((m.clone(), v));
-                if v > best {
-                    best = v;
-                    meilleur = Some(m.clone());
-                }
-                if v > alpha {
-                    alpha = v;
-                }
-            }
-            if interrompue {
-                break; // itération jetée : on garde la dernière complète
-            }
+                break (best, meilleur, scores_iter);
+            };
 
             // Réordonne la racine pour l'itération suivante : meilleurs scores
             // d'abord (tri stable : le meilleur reste devant ses ex æquo).
@@ -548,28 +727,76 @@ impl Recherche {
                 }
             }
 
-            // Tri : coup TT > tactiques MVV-LVA > killers du ply > historique.
+            // Tri : coup TT > prises (SEE en mode raffiné, MVV-LVA en mode
+            // classique) > killers du ply > historique.
             let mut ordonnes: Vec<(i32, &Move)> = coups
                 .iter()
-                .map(|m| (self.cle_ordre(m, coup_tt, ply, pos.turn()), m))
+                .map(|m| (self.cle_ordre(pos, m, coup_tt, ply, pos.turn()), m))
                 .collect();
             ordonnes.sort_unstable_by_key(|(k, _)| Reverse(*k));
 
             let mut best = f32::NEG_INFINITY;
             let mut meilleur_coup = COUP_AUCUN;
+            let mut examines = 0u32; // coups déjà cherchés dans CE nœud
 
             for (_, m) in &ordonnes {
                 let mut fille = pos.clone();
                 fille.play_unchecked(m);
+                // LMR (Late Move Reductions, débrayé en mode classique) : un
+                // coup CALME tardif — 4e examiné ou au-delà, profondeur >= 3,
+                // ni prise ni promotion, pas en échec avant le coup et n'en
+                // donnant pas, jamais le coup TT ni un killer — est d'abord
+                // SONDÉ à profondeur réduite (1, puis 2 à partir du 8e coup)
+                // en fenêtre nulle : le tri étant bon, il échoue presque
+                // toujours sous alpha pour une fraction du prix. Si le sondage
+                // dépasse alpha, RE-recherche à pleine profondeur et pleine
+                // fenêtre : aucune décision n'est prise sur la seule foi d'une
+                // recherche réduite. (alpha est toujours fini dès le 2e coup
+                // d'un nœud ; la garde is_finite est une ceinture.)
+                let reduction = if !self.mode_classique
+                    && examines >= 3
+                    && profondeur >= 3
+                    && !en_echec
+                    && !m.is_capture()
+                    && !m.is_promotion()
+                    && alpha.is_finite()
+                {
+                    let c = compacter(m);
+                    let k = &self.killers[ply as usize];
+                    if c != coup_tt && c != k[0] && c != k[1] && !fille.is_check() {
+                        if examines >= 7 { 2 } else { 1 }
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
                 // Deltas du coup sur la pile (2 à 4 features, 2 perspectives),
                 // dépilés au retour quel que soit le chemin de sortie.
                 self.pile_pousse(pos, m);
-                let v = -self.negamax(&fille, profondeur - 1, ply + 1, -beta, -alpha, false);
+                let mut v = if reduction > 0 {
+                    // Sondage réduit, fenêtre nulle [alpha, alpha + EPS_NUL].
+                    -self.negamax(
+                        &fille,
+                        profondeur - 1 - reduction,
+                        ply + 1,
+                        -alpha - EPS_NUL,
+                        -alpha,
+                        false,
+                    )
+                } else {
+                    -self.negamax(&fille, profondeur - 1, ply + 1, -beta, -alpha, false)
+                };
+                if reduction > 0 && !self.stop && v > alpha {
+                    // Le coup réduit promet : re-recherche complète.
+                    v = -self.negamax(&fille, profondeur - 1, ply + 1, -beta, -alpha, false);
+                }
                 self.pile_depousse();
                 if self.stop {
                     // Valeur jetée, surtout ne rien stocker en TT.
                     break 'corps (best, COUP_AUCUN, false);
                 }
+                examines += 1;
                 if v > best {
                     best = v;
                     meilleur_coup = compacter(m);
@@ -655,12 +882,29 @@ impl Recherche {
             best = stand_pat;
         }
 
-        // En échec : toutes les évasions ; sinon tactiques seulement.
+        // En échec : toutes les évasions ; sinon tactiques seulement — et, en
+        // mode raffiné, les prises que le SEE juge PERDANTES (see < 0) sont
+        // ignorées d'office : la quiescence existe pour solder les échanges,
+        // pas pour explorer les sacrifices (les promotions calmes restent
+        // examinées ; sous échec, AUCUN filtre : toutes les évasions comptent
+        // pour garder les verdicts de mat exacts).
+        // REPÊCHAGE (audit « le mat est vu ») : une prise see < 0 qui DONNE
+        // ÉCHEC échappe au filtre. Le SEE est aveugle aux suites forcées :
+        // sur une prise qui MATE une case « défendue » (ex. Qxh7# du test
+        // 7 bis), le défenseur qu'il compte ne reprendra jamais — la partie
+        // est finie — et le filtre cachait ce mat aux feuilles, que le mode
+        // classique voyait. Le test donne_echec (play + is_check) n'est payé
+        // que par les prises déjà condamnées (see < 0, court-circuit du &&),
+        // une petite minorité.
         // Tri MVV-LVA, plus grosse victime d'abord (les évasions calmes,
         // clé 0, passent après les prises).
+        let filtre_see = !self.mode_classique && !en_echec;
         let mut a_jouer: Vec<(i32, &Move)> = coups
             .iter()
             .filter(|m| en_echec || m.is_capture() || m.is_promotion())
+            .filter(|m| {
+                !(filtre_see && m.is_capture() && see(pos, m) < 0 && !donne_echec(pos, m))
+            })
             .map(|m| (cle_mvv_lva(m), m))
             .collect();
         a_jouer.sort_unstable_by_key(|(k, _)| Reverse(*k));
@@ -710,8 +954,10 @@ impl Recherche {
             // les pré-activations de plusieurs ordres de grandeur au-dessus.
             #[cfg(debug_assertions)]
             if self.noeuds % 4096 == 1 {
-                encode(pos, &mut self.tampon);
-                let reference = self.net.forward_one(&self.tampon);
+                // Référence par le répartiteur de schéma : valide pour les
+                // réseaux Classique773 COMME RoiZones8 (encode+forward_one en
+                // dur paniquerait avec un réseau 6149).
+                let reference = crate::nn::evalue_position(&self.net, pos, &mut self.tampon);
                 debug_assert!(
                     (v - reference).abs() <= 1e-3,
                     "divergence NNUE au nœud {} : incrémental {v} vs forward complet {reference}",
@@ -819,18 +1065,27 @@ impl Recherche {
 
     // --- Tri des coups -------------------------------------------------------
 
-    /// Clé de tri décroissante d'un coup dans la recherche principale :
-    /// coup TT (1 000 000) > tactiques MVV-LVA (~100 000-190 000)
-    /// > promotions calmes (~90 000) > killers (80 000 / 79 000)
-    /// > historique (0..=60 000).
-    fn cle_ordre(&self, m: &Move, coup_tt: u16, ply: u32, couleur: Color) -> i32 {
+    /// Clé de tri décroissante d'un coup dans la recherche principale.
+    /// Mode classique : coup TT (1 000 000) > tactiques MVV-LVA
+    /// (~100 000-190 000) > promotions calmes (~90 000) > killers
+    /// (80 000 / 79 000) > historique (0..=60 000).
+    /// Mode raffiné : les PRISES sont départagées par le SEE et non plus par
+    /// MVV-LVA — prises see >= 0 (200 000 + see) AVANT les killers, prises
+    /// see < 0 (-1 000 000 + see) TOUT EN BAS, sous l'historique : une prise
+    /// perdante est un espoir plus maigre qu'un bon coup calme.
+    fn cle_ordre(&self, pos: &Chess, m: &Move, coup_tt: u16, ply: u32, couleur: Color) -> i32 {
         let c = compacter(m);
         if coup_tt != COUP_AUCUN && c == coup_tt {
             return 1_000_000;
         }
+        if !self.mode_classique && m.is_capture() {
+            let s = see(pos, m);
+            return if s >= 0 { 200_000 + s } else { -1_000_000 + s };
+        }
         let cle = cle_mvv_lva(m);
         if cle != 0 {
-            return cle; // prise et/ou promotion
+            // (classique) prise et/ou promotion ; (raffiné) promotion calme
+            return cle;
         }
         let k = &self.killers[ply as usize];
         if c == k[0] {
@@ -948,6 +1203,41 @@ mod tests {
             adam_vb: vec![vec![0.0]],
             steps: 0,
         })
+    }
+
+    /// Réseau matériel BRUITÉ : les poids de reseau_materiel() plus un petit
+    /// bruit positionnel déterministe (±0.008, LCG sur l'indice de feature).
+    /// L'évaluation reste linéaire (quasi gratuite en profil dev) et dominée
+    /// par le matériel, mais DISCRIMINE : avec le réseau matériel pur, presque
+    /// toutes les lignes calmes s'annulent à 0.0 exactement — arbres
+    /// squelettiques et fenêtres dégénérées, rien à mesurer. Le bruit imite
+    /// une composante positionnelle : arbres réalistes pour les A/B.
+    fn reseau_materiel_bruite() -> Arc<Mlp> {
+        reseau_materiel_bruite_amp(0.016)
+    }
+
+    /// Variante à amplitude de bruit réglable (crête à crête). `plans` : seuls
+    /// ces plans de pièces (0-5 nous, 6-11 eux) reçoivent du bruit — un bruit
+    /// PARCIMONIEUX préserve les égalités exactes des lignes calmes qui ne
+    /// touchent pas ces pièces, donc les coupures immédiates de la quiescence
+    /// (arbres compacts), tout en donnant une direction de jeu.
+    fn reseau_materiel_bruite_plans(amplitude: f32, plans: &[usize]) -> Arc<Mlp> {
+        let mut net = Arc::try_unwrap(reseau_materiel()).ok().expect("Arc unique");
+        let mut etat = 0x9E37_79B9_7F4A_7C15u64;
+        for (i, w) in net.weights[0].iter_mut().enumerate() {
+            // LCG 64 bits (constantes de Knuth) : déterministe, sans rand.
+            etat = etat
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            if plans.contains(&(i / 64)) {
+                *w += ((etat >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * amplitude;
+            }
+        }
+        Arc::new(net)
+    }
+
+    fn reseau_materiel_bruite_amp(amplitude: f32) -> Arc<Mlp> {
+        reseau_materiel_bruite_plans(amplitude, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
     }
 
     fn limites_prof(p: u32) -> Limites {
@@ -1254,6 +1544,278 @@ mod tests {
         assert!(res.coup.is_none());
         assert_eq!(res.score, -SCORE_MAT);
         assert!(res.scores_racine.is_empty());
+    }
+
+    /// Trouve le coup légal from→to (échoue s'il n'existe pas).
+    fn coup(pos: &Chess, de: Square, vers: Square) -> Move {
+        pos.legal_moves()
+            .iter()
+            .find(|m| m.from() == Some(de) && m.to() == vers)
+            .cloned()
+            .unwrap_or_else(|| panic!("coup {de}-{vers} illégal ici"))
+    }
+
+    /// (7) SEE, cas écrits à la main : les quatre archétypes du cahier des
+    /// charges, valeurs vérifiées au tableau noir avec l'algorithme d'échange.
+    #[test]
+    fn see_cas_unitaires() {
+        // (a) Prise gagnante simple : exd5 gagne la dame, personne ne défend.
+        let pos = pos_de_fen("k7/8/8/3q4/4P3/8/8/K7 w - - 0 1");
+        assert_eq!(see(&pos, &coup(&pos, Square::E4, Square::D5)), 900);
+
+        // (b) Échange perdant : Dxd5 prend un pion défendu par le pion c6 —
+        // +100 (pion) - 900 (dame reprise) = -800.
+        let pos = pos_de_fen("k7/8/2p5/3p4/8/8/3Q4/K7 w - - 0 1");
+        assert_eq!(see(&pos, &coup(&pos, Square::D2, Square::D5)), -800);
+
+        // (c) Rayon X derrière une tour : Txd5 (pion défendu par Td8), mais la
+        // Td1 soutient À TRAVERS la tour d3 partie prendre —
+        // +100 - 500 + 500 = +100. Sans rayons X, le SEE rendrait -400.
+        let pos = pos_de_fen("k2r4/8/8/3p4/8/3R4/8/K2R4 w - - 0 1");
+        assert_eq!(see(&pos, &coup(&pos, Square::D3, Square::D5)), 100);
+
+        // (d) Prise égale : exd5 pion contre pion, d5 défendu par c6 —
+        // +100 - 100 = 0 : l'échange ne rapporte rien mais ne coûte rien.
+        let pos = pos_de_fen("k7/8/2p5/3p4/4P3/8/8/K7 w - - 0 1");
+        assert_eq!(see(&pos, &coup(&pos, Square::E4, Square::D5)), 0);
+    }
+
+    /// (7 bis) Régression (audit « le mat est vu ») : une prise qui MATE mais
+    /// que le SEE juge perdante ne doit PAS être élaguée par le filtre de
+    /// quiescence du mode raffiné. Ici Qxh7# : h7 est « défendu » par le Cg5
+    /// — cloué de manière absolue par la Tg1, mais le SEE ignore les clouages
+    /// et compte sa reprise (see = -800 < 0) — et Rxh7 est interdit par le
+    /// soutien du Fc2 ; le défenseur compté par le SEE ne reprendra jamais
+    /// puisque la partie est finie. Les DEUX autres prises blanches (Txg5,
+    /// Fxh7) sont elles aussi filtrées (see < 0) : sans le repêchage des
+    /// prises qui donnent échec, la liste tactique était VIDE et la
+    /// quiescence rendait le stand-pat réseau (borné) au lieu du mat.
+    #[test]
+    fn quiescence_voit_le_mat_dune_prise_see_negative() {
+        let pos = pos_de_fen("5rk1/1Q5p/7p/6n1/8/8/2B5/K5R1 w - - 0 1");
+        // Pré-conditions du scénario : la prise a un SEE négatif ET mate.
+        let qxh7 = coup(&pos, Square::B7, Square::H7);
+        assert!(see(&pos, &qxh7) < 0, "le scénario exige see(Qxh7) < 0");
+        let apres = pos.clone().play(&qxh7).expect("Qxh7 légal");
+        assert!(
+            apres.legal_moves().is_empty() && apres.is_check(),
+            "le scénario exige que Qxh7 soit mat"
+        );
+        // Feuille de quiescence en mode raffiné (filtre SEE actif, ply 0,
+        // fenêtre pleine) : le mat doit être vu.
+        let mut r = Recherche::new(reseau_reduit(), 12);
+        let v = r.quiesce(&pos, 0, PROF_QUIESCENCE, f32::NEG_INFINITY, f32::INFINITY);
+        assert!(
+            v > SEUIL_MAT,
+            "mat invisible à la feuille de quiescence : {v} (attendu > {SEUIL_MAT})"
+        );
+    }
+
+    /// (8) Le mode classique (raffinements débrayés) reste la recherche
+    /// d'origine : mêmes mats exacts, mêmes scores. (Les tests (1) et (2)
+    /// couvrent déjà les mêmes mats AVEC raffinements — mode par défaut.)
+    #[test]
+    fn mode_classique_mats_intacts() {
+        for (fen, prof, attendu) in [
+            ("6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1", 2, SCORE_MAT - 1.0),
+            ("7k/8/8/8/8/8/R7/1R5K w - - 0 1", 4, SCORE_MAT - 3.0),
+        ] {
+            let mut r = Recherche::new(reseau_reduit(), 14);
+            r.mode_classique = true;
+            let res = r.cherche(&pos_de_fen(fen), limites_prof(prof));
+            assert!(
+                (res.score - attendu).abs() < 1e-3,
+                "{fen} : score {} attendu, obtenu {}",
+                attendu,
+                res.score
+            );
+        }
+    }
+
+    /// (9) Réduction mesurée : à profondeur 6 égale, la recherche raffinée
+    /// (LMR + aspiration + SEE) dépense au plus 60 % des nœuds de la
+    /// classique — position initiale et deux milieux de partie (Kiwipete et
+    /// la « position 5 » des suites perft : légales et bien connues).
+    /// Réseau matériel bruité : voir reseau_materiel_bruite() — il faut une
+    /// évaluation qui discrimine pour mesurer quoi que ce soit.
+    #[test]
+    fn raffinements_reduisent_les_noeuds_profondeur_6() {
+        let fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+        ];
+        let net = reseau_materiel_bruite();
+        let (mut tot_c, mut tot_r) = (0u64, 0u64);
+        for fen in fens {
+            let pos = pos_de_fen(fen);
+            let mut classique = Recherche::new(net.clone(), 18);
+            classique.mode_classique = true;
+            let nc = classique.cherche(&pos, limites_prof(6)).noeuds;
+            let mut raffinee = Recherche::new(net.clone(), 18);
+            let nr = raffinee.cherche(&pos, limites_prof(6)).noeuds;
+            println!(
+                "  {fen}\n    classique {nc} nœuds, raffinée {nr} nœuds ({:.1} %)",
+                100.0 * nr as f64 / nc as f64
+            );
+            tot_c += nc;
+            tot_r += nr;
+            assert!(
+                nr * 10 <= nc * 6,
+                "raffinée {nr} > 60 % de classique {nc} sur {fen}"
+            );
+        }
+        println!(
+            "  TOTAL : classique {tot_c}, raffinée {tot_r} ({:.1} %)",
+            100.0 * tot_r as f64 / tot_c as f64
+        );
+    }
+
+    /// Une partie chercheur A contre chercheur B au même budget de nœuds.
+    /// Renvoie le point côté A (1 victoire, 0.5 nulle, 0 défaite) et les plis.
+    fn partie_deux_chercheurs(
+        a: &mut Recherche,
+        b: &mut Recherche,
+        a_blanc: bool,
+        ouverture: &[Move],
+        budget: u64,
+    ) -> (f32, u32) {
+        let mut pos = Chess::default();
+        let mut repetitions: HashMap<u64, u8> = HashMap::new();
+        repetitions.insert(zobrist(&pos), 1);
+        for m in ouverture {
+            pos = pos.play(m).expect("coup d'ouverture légal");
+            *repetitions.entry(zobrist(&pos)).or_insert(0) += 1;
+        }
+        a.nouvelle_partie();
+        b.nouvelle_partie();
+        let limites = limites_noeuds(budget);
+        let mut plies = 0u32;
+        let resultat_blancs = loop {
+            let coups = pos.legal_moves();
+            if coups.is_empty() {
+                break if pos.is_check() {
+                    if pos.turn() == Color::White { -1.0 } else { 1.0 }
+                } else {
+                    0.0
+                };
+            }
+            if pos.is_insufficient_material() || pos.halfmoves() >= 100 || plies >= 200 {
+                break 0.0;
+            }
+            let tour_a = (pos.turn() == Color::White) == a_blanc;
+            let joueur = if tour_a { &mut *a } else { &mut *b };
+            let m = joueur.cherche(&pos, limites).coup.expect("coup légal");
+            pos = pos.play(&m).expect("coup légal");
+            plies += 1;
+            let c = repetitions.entry(zobrist(&pos)).or_insert(0);
+            *c += 1;
+            if *c >= 3 {
+                break 0.0;
+            }
+        };
+        let cote = if a_blanc { resultat_blancs } else { -resultat_blancs };
+        ((cote + 1.0) / 2.0, plies)
+    }
+
+    /// (10) A/B d'arène : raffiné vs classique, 20 parties à ouvertures
+    /// appariées (couleurs échangées), MÊME budget de 3000 nœuds et MÊME
+    /// réseau (jamais entraîné) pour les deux camps : à savoir égal, le duel
+    /// mesure l'apport des RAFFINEMENTS (profondeur effective à budget égal).
+    /// Réseau matériel à bruit PARCIMONIEUX (pièces mineures seulement) :
+    /// - matériel pur, quasi toutes les lignes calmes valent 0.0 exactement —
+    ///   13 nulles sur 20 mesurées, la profondeur supplémentaire n'a RIEN à
+    ///   encaisser (et le raffiné, à profondeur égale sur ces arbres déjà
+    ///   squelettiques, ne paie que le surcoût de ses sondages) ;
+    /// - bruit sur TOUTES les cases, plus une seule égalité exacte : les
+    ///   coupures immédiates de la quiescence disparaissent, les arbres
+    ///   décuplent et 3000 nœuds ne dépassent plus la profondeur 2-3, où LMR
+    ///   (prof >= 3) et aspiration (itération >= 3) s'engagent à peine ;
+    /// - bruit sur les seuls plans des mineures : les lignes calmes qui ne
+    ///   les touchent pas gardent leurs égalités (arbres compacts, profondeur
+    ///   4-5 au budget) ET le jeu a une direction — mesuré : +1 pli pour le
+    ///   raffiné sur la moitié des positions à 3000 nœuds.
+    /// Attendu >= 55 % ; l'assertion est à 50 % pour la marge de bruit et le
+    /// score EXACT est imprimé.
+    #[test]
+    fn arene_ab_raffine_bat_classique() {
+        let net = reseau_materiel_bruite_plans(0.016, &[1, 2, 7, 8]);
+        let mut raffine = Recherche::new(net.clone(), 16);
+        let mut classique = Recherche::new(net.clone(), 16);
+        classique.mode_classique = true;
+        let mut points = 0.0f32;
+        for paire in 0..10u64 {
+            // Ouverture aléatoire de 4 plis, partagée par les deux parties de
+            // la paire (équité : chaque camp la joue des deux couleurs).
+            let mut rng = StdRng::seed_from_u64(0xAB0 + paire);
+            let mut pos = Chess::default();
+            let mut ouverture = Vec::new();
+            for _ in 0..4 {
+                let m = pos
+                    .legal_moves()
+                    .choose(&mut rng)
+                    .cloned()
+                    .expect("ouverture jouable");
+                pos = pos.play(&m).expect("coup légal");
+                ouverture.push(m);
+            }
+            for a_blanc in [true, false] {
+                let (pts, plies) = partie_deux_chercheurs(
+                    &mut raffine,
+                    &mut classique,
+                    a_blanc,
+                    &ouverture,
+                    3000,
+                );
+                println!(
+                    "  paire {paire}, raffiné {} : {pts} en {plies} plis",
+                    if a_blanc { "blanc" } else { "noir" }
+                );
+                points += pts;
+            }
+        }
+        let score = points / 20.0;
+        println!("A/B raffiné vs classique (3000 nœuds/coup) : score raffiné = {score}");
+        assert!(
+            score >= 0.5,
+            "le raffiné ne domine pas le classique : {score} < 0.50"
+        );
+    }
+
+    /// Diagnostic (ignoré par défaut) : profondeur complète atteinte à 3000
+    /// nœuds, classique vs raffiné, réseau matériel bruité — vérifie que les
+    /// économies de nœuds se convertissent bien en profondeur au budget de
+    /// l'arène A/B.
+    #[test]
+    #[ignore]
+    fn diag_profondeur_a_budget_3000() {
+        let fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+        ];
+        for (nom, net) in [
+            ("matériel pur", reseau_materiel()),
+            ("bruit mineurs 0.016", reseau_materiel_bruite_plans(0.016, &[1, 2, 7, 8])),
+            ("bruit cavaliers 0.016", reseau_materiel_bruite_plans(0.016, &[1, 7])),
+            ("bruit rois 0.016", reseau_materiel_bruite_plans(0.016, &[5, 11])),
+            ("bruit total 0.016", reseau_materiel_bruite_amp(0.016)),
+        ] {
+            println!("=== {nom} ===");
+            for fen in fens {
+                let pos = pos_de_fen(fen);
+                let mut c = Recherche::new(net.clone(), 16);
+                c.mode_classique = true;
+                let rc = c.cherche(&pos, limites_noeuds(3000));
+                let mut r = Recherche::new(net.clone(), 16);
+                let rr = r.cherche(&pos, limites_noeuds(3000));
+                println!(
+                    "  classique : prof {} | raffiné : prof {}  ({fen})",
+                    rc.profondeur, rr.profondeur
+                );
+            }
+        }
     }
 
     /// Sonde de performance (ignorée par défaut) : nœuds/s et profondeur en

@@ -19,18 +19,53 @@ use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, Position};
 use crate::bots::{echantillonne_scores_racine, Bot, NetBot};
 use crate::direct;
 use crate::features::{encode, N_FEATURES};
-use crate::nn::Mlp;
+use crate::features_roi;
+use crate::nn::{Mlp, SchemaFeatures};
 use crate::search;
 use crate::uci::UciEngine;
 
 pub struct GameRecord {
-    /// Positions encodées, concaténées (n_positions × N_FEATURES).
+    /// Positions encodées DENSES, concaténées (n_positions × N_FEATURES).
+    /// Remplies UNIQUEMENT quand le réseau joueur est au schéma `Classique773`
+    /// (vides pour `RoiZones8` : voir `actifs`).
     pub xs: Vec<f32>,
+    /// Positions encodées CREUSES : une liste d'indices actifs
+    /// (`features_roi::actifs`, perspective du trait) par position. Remplies
+    /// UNIQUEMENT quand le réseau joueur est au schéma `RoiZones8` (vides
+    /// pour `Classique773`). Entrée directe de `Mlp::train_batch_actifs`.
+    pub actifs: Vec<Vec<u16>>,
     /// Étiquettes : résultat final vu du trait de chaque position (-1, 0, 1).
     pub zs: Vec<f32>,
     pub plies: u32,
     /// Résultat côté blancs : 1.0 victoire blanche, -1.0 noire, 0.0 nulle.
     pub result: f32,
+}
+
+/// Enregistre `pos` dans le format du schéma du réseau joueur : encodage dense
+/// dans `xs` (via `buf`, redimensionné au besoin) pour `Classique773`, liste
+/// d'indices actifs poussée dans `actifs` pour `RoiZones8`. Les deux formats
+/// sont en perspective du TRAIT, comme les étiquettes zs.
+fn enregistre_position(
+    schema: SchemaFeatures,
+    pos: &Chess,
+    xs: &mut Vec<f32>,
+    actifs: &mut Vec<Vec<u16>>,
+    buf: &mut Vec<f32>,
+) {
+    match schema {
+        SchemaFeatures::Classique773 => {
+            buf.clear();
+            buf.resize(N_FEATURES, 0.0);
+            encode(pos, buf);
+            xs.extend_from_slice(buf);
+        }
+        SchemaFeatures::RoiZones8 => {
+            // ≤ 37 indices (32 pièces + 5 drapeaux).
+            let mut a: Vec<u16> = Vec::with_capacity(40);
+            features_roi::actifs(pos, &mut a);
+            actifs.push(a);
+        }
+    }
 }
 
 /// Hachage zobrist 64 bits de la position (pour la détection de répétition).
@@ -48,10 +83,14 @@ pub fn play_training_game(net: &Mlp, seed: u64, temperature: f32,
     let mut bot = NetBot::new(net, seed, temperature, 1);
     let mut pos = Chess::default();
 
+    // Format d'enregistrement des positions : celui du schéma du réseau
+    // (dense 773 dans xs, ou creux roi-zones dans actifs).
+    let schema = net.schema();
     let mut xs: Vec<f32> = Vec::new();
+    let mut actifs: Vec<Vec<u16>> = Vec::new();
     // Camp au trait de chaque position enregistrée (pour orienter z à la fin).
     let mut camps: Vec<Color> = Vec::new();
-    let mut buf = vec![0.0f32; N_FEATURES];
+    let mut buf: Vec<f32> = Vec::new();
 
     // Compteur d'occurrences des positions de la partie (position initiale incluse).
     let mut repetitions: HashMap<u64, u8> = HashMap::new();
@@ -78,8 +117,7 @@ pub fn play_training_game(net: &Mlp, seed: u64, temperature: f32,
         }
 
         // Enregistre la position AVANT le coup, du point de vue du trait.
-        encode(&pos, &mut buf);
-        xs.extend_from_slice(&buf);
+        enregistre_position(schema, &pos, &mut xs, &mut actifs, &mut buf);
         camps.push(pos.turn());
 
         let m = bot.choose(&pos).expect("coups légaux non vides");
@@ -102,7 +140,7 @@ pub fn play_training_game(net: &Mlp, seed: u64, temperature: f32,
         .map(|c| if *c == Color::White { result } else { -result })
         .collect();
 
-    GameRecord { xs, zs, plies, result }
+    GameRecord { xs, actifs, zs, plies, result }
 }
 
 /// Options du self-play piloté par la recherche (étage « Deep Blue »).
@@ -346,10 +384,16 @@ fn partie_recherche_interne(
     let mut dernier_v_eleve: Option<f32> = None;
     let mut dernier_v_prof: Option<f32> = None;
 
+    // Format d'enregistrement des positions : celui du schéma du réseau de
+    // l'ÉLÈVE (celui qui sera entraîné sur ces positions) — dense 773 dans xs
+    // ou creux roi-zones dans actifs. En mentorat, le prof peut être d'un
+    // autre schéma : il ne fournit que les étiquettes, jamais les entrées.
+    let schema = chercheur.net.schema();
     let mut xs: Vec<f32> = Vec::new();
+    let mut actifs: Vec<Vec<u16>> = Vec::new();
     let mut camps: Vec<Color> = Vec::new();
     let mut v_racines: Vec<f32> = Vec::new();
-    let mut buf = vec![0.0f32; N_FEATURES];
+    let mut buf: Vec<f32> = Vec::new();
 
     let mut repetitions: HashMap<u64, u8> = HashMap::new();
     repetitions.insert(zobrist(&pos), 1);
@@ -423,8 +467,7 @@ fn partie_recherche_interne(
         }
 
         // Enregistre la position AVANT le coup, du point de vue du trait.
-        encode(&pos, &mut buf);
-        xs.extend_from_slice(&buf);
+        enregistre_position(schema, &pos, &mut xs, &mut actifs, &mut buf);
         camps.push(pos.turn());
         v_racines.push(v_racine);
 
@@ -504,7 +547,7 @@ fn partie_recherche_interne(
     }
 
     let zs = cibles_td_leaf(&camps, &v_racines, result, opts.lambda);
-    GameRecord { xs, zs, plies, result }
+    GameRecord { xs, actifs, zs, plies, result }
 }
 
 #[cfg(test)]
@@ -544,6 +587,65 @@ mod tests {
         assert!(rec.result == 1.0 || rec.result == 0.0 || rec.result == -1.0);
         // Cibles bornées : |z| <= lambda + (1-lambda) = 1.
         assert!(rec.zs.iter().all(|z| z.abs() <= 1.0 + 1e-6));
+    }
+
+    /// BOUT EN BOUT JOUET, schéma ROI-ZONES, régime 1-PLI : un réseau
+    /// `RoiZones8` neuf joue une partie complète de self-play (NetBot →
+    /// `nn::evalue_position` → chemin creux), les positions sont enregistrées
+    /// en indices actifs (xs dense VIDE), les zs sont finis, et un pas de
+    /// `train_batch_actifs` sur ces données produit une loss finie.
+    #[test]
+    fn partie_1pli_roi_zones_bout_en_bout() {
+        use crate::features_roi::N_FEATURES_ROI;
+        // Petit réseau (couche cachée de 32) : le test reste rapide.
+        let mut net = Mlp::new_roi_zones(&[N_FEATURES_ROI, 32, 1], 42);
+        let rec = play_training_game(&net, 7, 0.5, 120);
+        assert!(rec.plies > 0 && rec.plies <= 120, "plies aberrant : {}", rec.plies);
+        // Schéma creux : les indices actifs remplacent l'encodage dense.
+        assert!(rec.xs.is_empty(), "xs dense doit rester vide en RoiZones8");
+        assert_eq!(rec.actifs.len(), rec.zs.len());
+        assert!(rec.zs.iter().all(|z| z.is_finite() && z.abs() <= 1.0 + 1e-6));
+        for a in &rec.actifs {
+            // Au moins les deux rois, au plus 32 pièces + 5 drapeaux.
+            assert!(a.len() >= 2 && a.len() <= 37, "position à {} indices", a.len());
+            assert!(a.iter().all(|&i| usize::from(i) < N_FEATURES_ROI));
+        }
+        // Un pas d'entraînement creux sur la partie entière : loss finie.
+        let lots: Vec<(Vec<u16>, f32)> = rec
+            .actifs
+            .iter()
+            .cloned()
+            .zip(rec.zs.iter().copied())
+            .collect();
+        let loss = net.train_batch_actifs(&lots, 1e-3);
+        assert!(loss.is_finite(), "loss non finie : {loss}");
+    }
+
+    /// BOUT EN BOUT JOUET, schéma ROI-ZONES, régime RECHERCHE (le test du
+    /// contrat) : réseau `RoiZones8` neuf → une partie de self-play recherche
+    /// à 200 nœuds/coup se termine et produit des zs finis.
+    ///
+    /// IGNORÉ tant que le dernier chantier amont n'est pas livré :
+    /// src/search.rs (GELÉ, autre escouade) : la parité debug de
+    /// `evaluer()` recalcule en `encode` 773 + `forward_one`, ce qui
+    /// paniquerait en mode test avec un réseau 6149. (src/nnue.rs est
+    /// livré : `EvalIncrementale` accepte les deux schémas, parité roi8
+    /// couverte par la batterie 7a-7f de nnue.rs.)
+    /// Dès que search.rs sera dégelé et sa parité debug routée par schéma,
+    /// retirer l'#[ignore] — le test est prêt.
+    #[test]
+    fn partie_recherche_roi_zones_se_termine() {
+        use crate::features_roi::N_FEATURES_ROI;
+        let net = Arc::new(Mlp::new_roi_zones(&[N_FEATURES_ROI, 32, 1], 42));
+        let mut recherche = search::Recherche::new(net, 16);
+        let mut opts = OptionsRecherche::default();
+        opts.nodes_par_coup = 200;
+        let rec = play_training_game_recherche(&mut recherche, 7, &opts);
+        assert!(rec.plies > 0 && rec.plies <= opts.max_plies,
+                "nombre de plis aberrant : {}", rec.plies);
+        assert!(rec.xs.is_empty(), "xs dense doit rester vide en RoiZones8");
+        assert_eq!(rec.actifs.len(), rec.zs.len());
+        assert!(rec.zs.iter().all(|z| z.is_finite() && z.abs() <= 1.0 + 1e-6));
     }
 
     /// L'arbitrage raccourcit significativement les parties à fort

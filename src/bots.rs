@@ -9,8 +9,7 @@ use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use shakmaty::{Board, Chess, Color, Move, Position};
 
-use crate::features::{encode, N_FEATURES};
-use crate::nn::Mlp;
+use crate::nn::{evalue_position, Mlp};
 use crate::search;
 
 pub trait Bot {
@@ -149,7 +148,10 @@ impl Bot for MaterialBot {
 
 /// Négamax avec le réseau aux feuilles (perspective du trait, [-1,1]).
 /// Mat/pat exacts (mêmes scores ±(1000-ply) qui dominent les valeurs réseau),
-/// prises triées d'abord pour l'élagage.
+/// prises triées d'abord pour l'élagage. Les feuilles passent par
+/// `nn::evalue_position` : le réseau peut être de N'IMPORTE quel schéma
+/// (dense 773 historique ou creux roi-zones), `buf` n'est utilisé que par le
+/// chemin dense (redimensionné au besoin).
 fn negamax_reseau(
     net: &Mlp,
     pos: &Chess,
@@ -157,7 +159,7 @@ fn negamax_reseau(
     ply: i32,
     mut alpha: f32,
     beta: f32,
-    buf: &mut [f32],
+    buf: &mut Vec<f32>,
 ) -> f32 {
     // Même ordre que negamax_materiel : mat/pat avant la règle des 50 coups.
     let mut coups = pos.legal_moves();
@@ -168,8 +170,7 @@ fn negamax_reseau(
         return 0.0;
     }
     if depth == 0 {
-        encode(pos, buf);
-        return net.forward_one(buf);
+        return evalue_position(net, pos, buf);
     }
     coups.sort_unstable_by_key(|m| !m.is_capture());
     let mut best = f32::NEG_INFINITY;
@@ -189,8 +190,9 @@ fn negamax_reseau(
     best
 }
 
-/// Bot piloté par le réseau de valeur.
-/// - `temperature > 0` (entraînement) : 1 pli — on encode chaque position fille,
+/// Bot piloté par le réseau de valeur (schéma dense 773 OU creux roi-zones,
+/// routé par `nn::evalue_position`).
+/// - `temperature > 0` (entraînement) : 1 pli — on évalue chaque position fille,
 ///   valeur = -V(fille) (perspective adverse), échantillonnage softmax(valeurs/T).
 /// - `temperature == 0` (jeu sérieux) : négamax profondeur `depth` avec le réseau
 ///   aux feuilles ; mat/pat détectés exactement ; les feuilles bruyantes (prise
@@ -214,7 +216,9 @@ impl<'a> Bot for NetBot<'a> {
         if coups.is_empty() {
             return None;
         }
-        let mut buf = vec![0.0f32; N_FEATURES];
+        // Tampon d'encodage du chemin dense (dimensionné par evalue_position ;
+        // inutilisé par le chemin creux roi-zones).
+        let mut buf: Vec<f32> = Vec::new();
         if self.temperature > 0.0 {
             // 1 pli : valeur de chaque fille vue de NOTRE camp = -V(fille),
             // car la fille est évaluée du point de vue du camp adverse.
@@ -229,8 +233,7 @@ impl<'a> Bot for NetBot<'a> {
                 {
                     0.0 // nulle certaine
                 } else {
-                    encode(&fille, &mut buf);
-                    -self.net.forward_one(&buf)
+                    -evalue_position(self.net, &fille, &mut buf)
                 };
                 vals.push(v);
             }

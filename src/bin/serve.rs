@@ -241,6 +241,13 @@ fn charger_modele(cache: &CacheModeles, chemin: &str) -> Result<Arc<Mlp>, String
     let net = Arc::new(
         Mlp::load(chemin).map_err(|e| format!("échec de chargement de {chemin} : {e}"))?,
     );
+    // Le schéma de features est SUIVI du fichier (aucune option) : journalisé
+    // à chaque (re)chargement — dense 773 historique ou creux roi-zones.
+    println!(
+        "modèle chargé : {chemin} (architecture {:?}, schéma {:?})",
+        net.sizes,
+        net.schema()
+    );
     cache.insert(chemin.to_string(), (mtime, net.clone()));
     Ok(net)
 }
@@ -722,6 +729,17 @@ fn main() {
         session: Mutex::new(Session::nouvelle("random", Color::White)),
         cache: Mutex::new(HashMap::new()),
     });
+
+    // Affiche dès le démarrage l'architecture ET le schéma de features du
+    // modèle « latest » réellement servi (chess_best.bin prioritaire) — le
+    // chargement passe par le cache, il resservira au premier coup de l'IA.
+    // Absence ou échec non fatals : le serveur démarre quand même (les
+    // adversaires random/material n'ont pas besoin de modèle).
+    if let Some(chemin) = chemin_modele("latest") {
+        if let Err(e) = charger_modele(&etat.cache, &chemin) {
+            println!("modèle « latest » indisponible au démarrage : {e}");
+        }
+    }
 
     // Listener IPv6 optionnel : échec silencieux si IPv6 indisponible.
     if let Ok(srv6) = Server::http(format!("[::1]:{PORT}")) {

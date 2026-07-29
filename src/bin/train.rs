@@ -121,7 +121,7 @@ use echec::bots::{Bot, BotRecherche, MaterialBot, NetBot, RandomBot};
 use echec::checkpoints::{self, TrainState};
 use echec::elo;
 use echec::features::N_FEATURES;
-use echec::nn::Mlp;
+use echec::nn::{Mlp, SchemaFeatures};
 use echec::search;
 use echec::selfplay::{self, GameRecord};
 use echec::uci::UciEngine;
@@ -174,7 +174,8 @@ struct Options {
     departs_finales: f32,
 }
 
-/// Tampon de rejeu : anneau de positions encodées à capacité fixe.
+/// Tampon de rejeu DENSE (schéma Classique773) : anneau de positions encodées
+/// à capacité fixe.
 /// L'écriture écrase les plus anciennes ; l'échantillonnage est uniforme.
 struct Rejeu {
     xs: Vec<f32>,
@@ -220,6 +221,48 @@ impl Rejeu {
             lot_xs.extend_from_slice(&self.xs[i * N_FEATURES..(i + 1) * N_FEATURES]);
             lot_zs.push(self.zs[i]);
         }
+    }
+}
+
+/// Tampon de rejeu CREUX (schéma RoiZones8) : même anneau à capacité fixe que
+/// `Rejeu`, mais chaque position est sa liste d'indices actifs (≤ 37 u16 —
+/// ~200 fois plus compact que les 773 f32 denses). L'échantillonnage produit
+/// directement les lots de `Mlp::train_batch_actifs`.
+struct RejeuCreux {
+    actifs: Vec<Vec<u16>>,
+    zs: Vec<f32>,
+    capacite: usize,
+    tete: usize,
+    len: usize,
+}
+
+impl RejeuCreux {
+    fn new(capacite: usize) -> Self {
+        // Croissance paresseuse, comme `Rejeu`.
+        RejeuCreux { actifs: Vec::new(), zs: Vec::new(), capacite, tete: 0, len: 0 }
+    }
+
+    fn push(&mut self, a: &[u16], z: f32) {
+        if self.len < self.capacite {
+            self.actifs.push(a.to_vec());
+            self.zs.push(z);
+            self.len += 1;
+        } else {
+            self.actifs[self.tete].clear();
+            self.actifs[self.tete].extend_from_slice(a);
+            self.zs[self.tete] = z;
+        }
+        self.tete = (self.tete + 1) % self.capacite;
+    }
+
+    /// Minibatch échantillonné uniformément, au format de `train_batch_actifs`.
+    fn echantillonne(&self, rng: &mut StdRng, n: usize) -> Vec<(Vec<u16>, f32)> {
+        (0..n)
+            .map(|_| {
+                let i = rng.gen_range(0..self.len);
+                (self.actifs[i].clone(), self.zs[i])
+            })
+            .collect()
     }
 }
 
@@ -579,18 +622,26 @@ fn main() {
         Mlp::new(opt.seed)
     };
     let mut net = Arc::new(net);
+    // Schéma de features SUIVI AUTOMATIQUEMENT du fichier chargé (aucun
+    // drapeau) : dense 773 historique ou creux roi-zones — tout le cycle
+    // (self-play, apprentissage, rejeu) s'y conforme.
+    let schema = net.schema();
     let mut etat = TrainState::load(&opt.out);
     if etat.cycles > 0 {
         println!(
-            "reprise : {} cycles, {:.3} h, {} parties, {} positions, architecture {:?}",
+            "reprise : {} cycles, {:.3} h, {} parties, {} positions, architecture {:?}, schema {:?}",
             etat.cycles,
             etat.trained_secs / 3600.0,
             etat.games,
             etat.positions,
-            net.sizes
+            net.sizes,
+            schema
         );
     } else {
-        println!("réseau neuf (graine {}, architecture {:?})", opt.seed, net.sizes);
+        println!(
+            "réseau neuf (graine {}, architecture {:?}, schema {:?})",
+            opt.seed, net.sizes, schema
+        );
     }
     // Mentor (régime recherche uniquement) : réseau FIGÉ chargé une fois au
     // démarrage, dont la recherche étiquette les positions du self-play
@@ -687,12 +738,25 @@ fn main() {
         }
     }
 
-    let mut rejeu = (opt.replay > 0).then(|| Rejeu::new(opt.replay));
+    // Tampon de rejeu au format du schéma : dense (f32 concaténés) pour
+    // Classique773, creux (listes d'indices) pour RoiZones8.
+    let mut rejeu = (opt.replay > 0 && schema == SchemaFeatures::Classique773)
+        .then(|| Rejeu::new(opt.replay));
+    let mut rejeu_creux = (opt.replay > 0 && schema == SchemaFeatures::RoiZones8)
+        .then(|| RejeuCreux::new(opt.replay));
     if let Some(r) = &rejeu {
         println!(
             "tampon de rejeu : {} positions max (~{:.1} Go)",
             r.capacite,
             (r.capacite * N_FEATURES * 4) as f64 / 1e9
+        );
+    }
+    if let Some(r) = &rejeu_creux {
+        // ~37 u16 + l'entête du Vec par position : ~100 octets.
+        println!(
+            "tampon de rejeu (creux) : {} positions max (~{:.2} Go)",
+            r.capacite,
+            (r.capacite * 100) as f64 / 1e9
         );
     }
     std::io::stdout().flush().ok();
@@ -863,18 +927,29 @@ fn main() {
                 .collect()
         };
 
-        // Concatène toutes les positions du cycle.
+        // Concatène toutes les positions du cycle : xs dense (Classique773)
+        // OU listes d'indices actifs (RoiZones8), selon le schéma du réseau —
+        // le self-play a rempli le bon champ de chaque GameRecord.
         let n_positions: usize = parties.iter().map(|p| p.zs.len()).sum();
-        let mut xs: Vec<f32> = Vec::with_capacity(n_positions * N_FEATURES);
+        let mut xs: Vec<f32> = Vec::new();
+        let mut actifs: Vec<Vec<u16>> = Vec::new();
         let mut zs: Vec<f32> = Vec::with_capacity(n_positions);
+        if schema == SchemaFeatures::Classique773 {
+            xs.reserve(n_positions * N_FEATURES);
+        } else {
+            actifs.reserve(n_positions);
+        }
         for p in parties {
             xs.extend(p.xs);
+            actifs.extend(p.actifs);
             zs.extend(p.zs);
         }
 
         // 3. Apprentissage : indices mélangés, minibatchs de 256, 1 époque,
         //    dernier lot partiel accepté. Loss = moyenne pondérée par la taille
         //    des lots. (Aucun Arc cloné à ce stade : get_mut réussit.)
+        //    Chemin DENSE (train_batch) ou CREUX (train_batch_actifs) selon le
+        //    schéma — mêmes minibatchs, même optimiseur, même comptage de loss.
         let net_mut = Arc::get_mut(&mut net).expect("réseau encore partagé à l'apprentissage");
         let mut indices: Vec<usize> = (0..n_positions).collect();
         let mut rng_melange =
@@ -882,38 +957,72 @@ fn main() {
         indices.shuffle(&mut rng_melange);
         let mut somme_loss = 0.0f64;
         let mut n_vus = 0usize;
-        let mut lot_xs: Vec<f32> = Vec::with_capacity(MINIBATCH * N_FEATURES);
-        let mut lot_zs: Vec<f32> = Vec::with_capacity(MINIBATCH);
-        for lot in indices.chunks(MINIBATCH) {
-            lot_xs.clear();
-            lot_zs.clear();
-            for &i in lot {
-                lot_xs.extend_from_slice(&xs[i * N_FEATURES..(i + 1) * N_FEATURES]);
-                lot_zs.push(zs[i]);
-            }
-            let loss_lot = net_mut.train_batch(&lot_xs, &lot_zs, opt.lr);
-            somme_loss += loss_lot as f64 * lot.len() as f64;
-            n_vus += lot.len();
-        }
-
-        // 3 bis. Rejeu : les positions fraîches entrent dans le tampon, puis on
-        // rejoue autant de minibatchs, tirés uniformément dans TOUT le tampon
-        // (frais + anciens). Chaque position finit donc revue plusieurs fois au
-        // fil des cycles avant d'être écrasée.
-        if let Some(r) = rejeu.as_mut() {
-            for i in 0..n_positions {
-                r.push(&xs[i * N_FEATURES..(i + 1) * N_FEATURES], zs[i]);
-            }
-            if r.len >= MINIBATCH {
-                let mut rng_rejeu = StdRng::seed_from_u64(derive_graine(
-                    opt.seed.wrapping_add(etat.cycles),
-                    0x8E3E0,
-                ));
-                for _ in 0..n_positions.div_ceil(MINIBATCH) {
-                    r.echantillonne(&mut rng_rejeu, MINIBATCH, &mut lot_xs, &mut lot_zs);
+        match schema {
+            SchemaFeatures::Classique773 => {
+                let mut lot_xs: Vec<f32> = Vec::with_capacity(MINIBATCH * N_FEATURES);
+                let mut lot_zs: Vec<f32> = Vec::with_capacity(MINIBATCH);
+                for lot in indices.chunks(MINIBATCH) {
+                    lot_xs.clear();
+                    lot_zs.clear();
+                    for &i in lot {
+                        lot_xs.extend_from_slice(&xs[i * N_FEATURES..(i + 1) * N_FEATURES]);
+                        lot_zs.push(zs[i]);
+                    }
                     let loss_lot = net_mut.train_batch(&lot_xs, &lot_zs, opt.lr);
-                    somme_loss += loss_lot as f64 * MINIBATCH as f64;
-                    n_vus += MINIBATCH;
+                    somme_loss += loss_lot as f64 * lot.len() as f64;
+                    n_vus += lot.len();
+                }
+
+                // 3 bis. Rejeu : les positions fraîches entrent dans le tampon,
+                // puis on rejoue autant de minibatchs, tirés uniformément dans
+                // TOUT le tampon (frais + anciens). Chaque position finit donc
+                // revue plusieurs fois au fil des cycles avant d'être écrasée.
+                if let Some(r) = rejeu.as_mut() {
+                    for i in 0..n_positions {
+                        r.push(&xs[i * N_FEATURES..(i + 1) * N_FEATURES], zs[i]);
+                    }
+                    if r.len >= MINIBATCH {
+                        let mut rng_rejeu = StdRng::seed_from_u64(derive_graine(
+                            opt.seed.wrapping_add(etat.cycles),
+                            0x8E3E0,
+                        ));
+                        for _ in 0..n_positions.div_ceil(MINIBATCH) {
+                            r.echantillonne(&mut rng_rejeu, MINIBATCH, &mut lot_xs, &mut lot_zs);
+                            let loss_lot = net_mut.train_batch(&lot_xs, &lot_zs, opt.lr);
+                            somme_loss += loss_lot as f64 * MINIBATCH as f64;
+                            n_vus += MINIBATCH;
+                        }
+                    }
+                }
+            }
+            SchemaFeatures::RoiZones8 => {
+                for lot in indices.chunks(MINIBATCH) {
+                    let lots: Vec<(Vec<u16>, f32)> = lot
+                        .iter()
+                        .map(|&i| (actifs[i].clone(), zs[i]))
+                        .collect();
+                    let loss_lot = net_mut.train_batch_actifs(&lots, opt.lr);
+                    somme_loss += loss_lot as f64 * lot.len() as f64;
+                    n_vus += lot.len();
+                }
+
+                // 3 bis. Rejeu creux : même politique que le rejeu dense.
+                if let Some(r) = rejeu_creux.as_mut() {
+                    for i in 0..n_positions {
+                        r.push(&actifs[i], zs[i]);
+                    }
+                    if r.len >= MINIBATCH {
+                        let mut rng_rejeu = StdRng::seed_from_u64(derive_graine(
+                            opt.seed.wrapping_add(etat.cycles),
+                            0x8E3E0,
+                        ));
+                        for _ in 0..n_positions.div_ceil(MINIBATCH) {
+                            let lots = r.echantillonne(&mut rng_rejeu, MINIBATCH);
+                            let loss_lot = net_mut.train_batch_actifs(&lots, opt.lr);
+                            somme_loss += loss_lot as f64 * MINIBATCH as f64;
+                            n_vus += MINIBATCH;
+                        }
+                    }
                 }
             }
         }

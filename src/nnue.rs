@@ -17,14 +17,31 @@
 //! incrémentales : elles dépendent du trait et changent de sens à chaque coup.
 //! Elles sont ajoutées au moment de l'évaluation (≤ 5 colonnes de 512,
 //! négligeable), lues directement de la position évaluée.
+//!
+//! DEUX SCHÉMAS de features sont servis par la même pile (`nn::SchemaFeatures`,
+//! dicté par le réseau) : le dense historique `Classique773` (ci-dessus,
+//! chemin inchangé) et le creux `RoiZones8` (`features_roi`, 6149 entrées) où
+//! chaque plan pièce-case est conditionné par la ZONE du roi du camp de la
+//! perspective. L'accumulateur de chaque perspective est alors conditionné par
+//! la zone de SON PROPRE roi : un coup ordinaire s'applique par deltas (les
+//! zones ne bougent pas), mais un coup de roi qui TRAVERSE une frontière de
+//! zone invalide toutes les features de pièces de SA perspective — cet
+//! accumulateur est RECONSTRUIT en entier (le standard NNUE), l'autre
+//! perspective gardant ses deltas. Les 5 scalaires de queue (6144..6149,
+//! mêmes définitions) sont ajoutés à l'évaluation comme les drapeaux du
+//! schéma classique.
 
 use shakmaty::{CastlingSide, Chess, Color, EnPassantMode, Move, Position, Role, Square};
 
 use crate::features::N_FEATURES;
-use crate::nn::Mlp;
+use crate::features_roi::{zone_roi, N_FEATURES_ROI, N_ZONES_ROI};
+use crate::nn::{Mlp, SchemaFeatures};
 
 /// Début des 5 features de drapeaux (après les 12 plans pièce×case).
 const BASE_DRAPEAUX: usize = 12 * 64;
+
+/// Début des 5 scalaires du schéma roi-zones (après les 8 zones × 768 plans).
+const BASE_DRAPEAUX_ROI8: usize = N_ZONES_ROI * 768;
 
 /// Une couche dense au-dessus de l'accumulateur (poids row-major sortie×entrée,
 /// même convention que `Mlp` pour reproduire exactement ses boucles).
@@ -40,6 +57,9 @@ struct CoucheSup {
 /// la couche 1 est stockée TRANSPOSÉE (une colonne de `h1` f32 contiguë par
 /// feature) pour que l'ajout/retrait d'une feature soit un parcours linéaire.
 pub struct EvalIncrementale {
+    /// Schéma de features du réseau source : dicte l'indexation des colonnes
+    /// (773 dense classique ou 6149 roi-zones) et le chemin de `pousse`.
+    schema: SchemaFeatures,
     /// Largeur de la couche 1 (`sizes[1]` : 512 pour le réseau par défaut).
     h1: usize,
     /// Colonnes de la couche 1, à plat : colonne de la feature f =
@@ -62,9 +82,17 @@ impl EvalIncrementale {
             net.sizes.len() >= 3,
             "EvalIncrementale: il faut au moins entrée → cachée → sortie"
         );
+        // Taille d'entrée dictée par le schéma du réseau : 773 (dense
+        // classique) ou 6149 (roi-zones). La disposition transposée des
+        // colonnes est identique dans les deux cas, seule leur QUANTITÉ change.
+        let schema = net.schema();
+        let n_in = match schema {
+            SchemaFeatures::Classique773 => N_FEATURES,
+            SchemaFeatures::RoiZones8 => N_FEATURES_ROI,
+        };
         assert_eq!(
-            net.sizes[0], N_FEATURES,
-            "EvalIncrementale: la couche d'entrée doit faire N_FEATURES"
+            net.sizes[0], n_in,
+            "EvalIncrementale: la couche d'entrée doit faire N_FEATURES ({N_FEATURES}) ou N_FEATURES_ROI ({N_FEATURES_ROI})"
         );
         // Même garde que `Mlp::new_avec_tailles` : `evalue` lit `courant[0]`
         // et suppose une sortie scalaire tanh — refus immédiat et lisible.
@@ -74,15 +102,15 @@ impl EvalIncrementale {
             net.sizes
         );
         let h1 = net.sizes[1];
-        assert_eq!(net.weights[0].len(), h1 * N_FEATURES);
+        assert_eq!(net.weights[0].len(), h1 * n_in);
 
-        // Transposition de la couche 1 : Mlp range w1[j*773 + f] (ligne par
+        // Transposition de la couche 1 : Mlp range w1[j*n_in + f] (ligne par
         // neurone j), on veut cols[f*h1 + j] (colonne par feature f).
         let w1 = &net.weights[0];
-        let mut cols = vec![0.0f32; N_FEATURES * h1];
+        let mut cols = vec![0.0f32; n_in * h1];
         for j in 0..h1 {
-            let ligne = &w1[j * N_FEATURES..(j + 1) * N_FEATURES];
-            for f in 0..N_FEATURES {
+            let ligne = &w1[j * n_in..(j + 1) * n_in];
+            for f in 0..n_in {
                 cols[f * h1 + j] = ligne[f];
             }
         }
@@ -97,7 +125,7 @@ impl EvalIncrementale {
             })
             .collect();
 
-        EvalIncrementale { h1, cols, biais1: net.biases[0].clone(), sup }
+        EvalIncrementale { schema, h1, cols, biais1: net.biases[0].clone(), sup }
     }
 
     /// Colonne de la couche 1 associée à la feature `f`.
@@ -108,7 +136,12 @@ impl EvalIncrementale {
 
     /// Encode complètement `pos` dans les DEUX perspectives : c'est la racine
     /// de la pile d'accumulateurs (biais de couche 1 + colonnes des pièces).
+    /// En schéma roi-zones, chaque perspective est indexée par la zone de SON
+    /// roi (conventions de `features_roi::actifs_perspective`).
     pub fn racine(&self, pos: &Chess) -> PileAccus {
+        if self.schema == SchemaFeatures::RoiZones8 {
+            return self.racine_roi8(pos);
+        }
         let h1 = self.h1;
         // Réserve pour ~128 plis de recherche sans réallocation.
         let mut donnees = Vec::with_capacity(2 * h1 * 128);
@@ -118,6 +151,27 @@ impl EvalIncrementale {
             let (blanc, noir) = donnees.split_at_mut(h1);
             for (case, piece) in pos.board().iter() {
                 let (ib, inoir) = indices_piece(piece.color, piece.role, case);
+                accumule(blanc, self.colonne(ib), 1.0);
+                accumule(noir, self.colonne(inoir), 1.0);
+            }
+        }
+        PileAccus { donnees, h1 }
+    }
+
+    /// `racine` du schéma roi-zones : mêmes biais + colonnes des pièces, mais
+    /// chaque perspective est conditionnée par la zone de SON PROPRE roi.
+    fn racine_roi8(&self, pos: &Chess) -> PileAccus {
+        let h1 = self.h1;
+        // Réserve pour ~128 plis de recherche sans réallocation.
+        let mut donnees = Vec::with_capacity(2 * h1 * 128);
+        donnees.extend_from_slice(&self.biais1);
+        donnees.extend_from_slice(&self.biais1);
+        {
+            let (blanc, noir) = donnees.split_at_mut(h1);
+            let (zone_blanche, zone_noire) = zones_rois(pos);
+            for (case, piece) in pos.board().iter() {
+                let ib = indice_piece_roi8(piece.color, piece.role, case, true, zone_blanche);
+                let inoir = indice_piece_roi8(piece.color, piece.role, case, false, zone_noire);
                 accumule(blanc, self.colonne(ib), 1.0);
                 accumule(noir, self.colonne(inoir), 1.0);
             }
@@ -138,6 +192,88 @@ fn indices_piece(couleur: Color, role: Role, case: Square) -> (usize, usize) {
     let plan_blanc = if couleur == Color::White { r } else { 6 + r };
     let plan_noir = if couleur == Color::Black { r } else { 6 + r };
     (plan_blanc * 64 + c, plan_noir * 64 + (c ^ 56))
+}
+
+/// Zones des rois pour le schéma roi-zones : (zone du roi BLANC vue de la
+/// perspective blanche, zone du roi NOIR vue de la perspective noire — donc
+/// après le miroir `case ^ 56`, comme dans `features_roi`).
+#[inline]
+fn zones_rois(pos: &Chess) -> (usize, usize) {
+    let blanc = pos
+        .board()
+        .king_of(Color::White)
+        .expect("position légale : roi blanc présent");
+    let noir = pos
+        .board()
+        .king_of(Color::Black)
+        .expect("position légale : roi noir présent");
+    (zone_roi(usize::from(blanc)), zone_roi(usize::from(noir) ^ 56))
+}
+
+/// Indice roi-zones de la feature d'une pièce pour UNE perspective, la zone du
+/// roi de CETTE perspective étant déjà connue. Convention EXACTE de
+/// `features_roi::actifs_perspective` : `zone·768 + plan·64 + case_vue`, avec
+/// miroir `case ^ 56` et échange des couleurs pour la perspective noire.
+#[inline]
+fn indice_piece_roi8(
+    couleur: Color,
+    role: Role,
+    case: Square,
+    perspective_blanche: bool,
+    zone: usize,
+) -> usize {
+    debug_assert!(zone < N_ZONES_ROI);
+    let r = usize::from(role) - 1;
+    let camp = if perspective_blanche { Color::White } else { Color::Black };
+    let plan = if couleur == camp { r } else { 6 + r };
+    let case_vue = if perspective_blanche {
+        usize::from(case)
+    } else {
+        usize::from(case) ^ 56
+    };
+    zone * 768 + plan * 64 + case_vue
+}
+
+/// Énumère les retraits (signe -1) puis ajouts (signe +1) de pièces induits
+/// par `m` joué par `nous`, dans l'ordre exact des deltas de `pousse`, et
+/// appelle `delta(couleur, role, case, signe)` pour chacun. Partagé par les
+/// deltas du schéma roi-zones (les deux perspectives, ou une seule quand
+/// l'autre est reconstruite).
+fn pour_chaque_delta(nous: Color, m: &Move, mut delta: impl FnMut(Color, Role, Square, f32)) {
+    match m {
+        Move::Normal { role, from, capture, to, promotion } => {
+            delta(nous, *role, *from, -1.0);
+            if let Some(prise) = capture {
+                // Capture normale : la victime est sur la case d'arrivée.
+                delta(nous.other(), *prise, *to, -1.0);
+            }
+            // Promotion : le pion disparaît de `from`, la pièce promue
+            // apparaît sur `to`.
+            delta(nous, promotion.unwrap_or(*role), *to, 1.0);
+        }
+        Move::EnPassant { from, to } => {
+            // ATTENTION : le pion pris n'est PAS sur la case d'arrivée,
+            // mais sur (colonne de `to`, rangée de `from`).
+            delta(nous, Role::Pawn, *from, -1.0);
+            delta(
+                nous.other(),
+                Role::Pawn,
+                Square::from_coords(to.file(), from.rank()),
+                -1.0,
+            );
+            delta(nous, Role::Pawn, *to, 1.0);
+        }
+        Move::Castle { king, rook } => {
+            // Convention shakmaty : `Move::to()` est la case de la TOUR ; les
+            // cases d'arrivée réelles viennent du côté de roque.
+            let cote = m.castling_side().expect("Move::Castle a toujours un côté");
+            delta(nous, Role::King, *king, -1.0);
+            delta(nous, Role::Rook, *rook, -1.0);
+            delta(nous, Role::King, cote.king_to(nous), 1.0);
+            delta(nous, Role::Rook, cote.rook_to(nous), 1.0);
+        }
+        Move::Put { .. } => unreachable!("Move::Put n'existe qu'en Crazyhouse"),
+    }
 }
 
 /// `dst += signe * col`, élément par élément (signe ∈ {+1, -1}, exact en f32).
@@ -169,8 +305,13 @@ impl PileAccus {
     /// Empile la position atteinte en jouant `m` depuis `pos_avant` (position
     /// AVANT le coup, dont le trait est le camp qui joue). Seules les colonnes
     /// des 2 à 4 features modifiées sont touchées, dans les DEUX perspectives.
+    /// En schéma roi-zones, un coup de roi qui change de zone déclenche la
+    /// RECONSTRUCTION de l'accumulateur de sa perspective (voir `pousse_roi8`).
     pub fn pousse(&mut self, eval: &EvalIncrementale, pos_avant: &Chess, m: &Move) {
         debug_assert_eq!(self.h1, eval.h1, "pousse: EvalIncrementale d'une autre taille");
+        if eval.schema == SchemaFeatures::RoiZones8 {
+            return self.pousse_roi8(eval, pos_avant, m);
+        }
         let h1 = self.h1;
         let base = self.base_sommet();
         // Duplique le sommet : le nouvel étage part de la position courante.
@@ -224,10 +365,90 @@ impl PileAccus {
         }
     }
 
+    /// `pousse` du schéma roi-zones. Tant que le roi d'une perspective reste
+    /// dans sa zone, cette perspective reçoit les mêmes deltas de colonnes
+    /// que le schéma classique (indexés par SA zone). Si le coup fait CHANGER
+    /// DE ZONE le roi du camp qui joue (coup de roi ordinaire — capture
+    /// comprise — ou roque, typiquement le grand roque e1→c1), toutes les
+    /// features de pièces de SA perspective changent de bloc de 768 :
+    /// l'accumulateur de cette perspective est RECONSTRUIT en entier depuis la
+    /// position après le coup (le standard NNUE), l'autre perspective gardant
+    /// ses deltas — le roi adverse n'ayant pas bougé, sa zone est inchangée.
+    fn pousse_roi8(&mut self, eval: &EvalIncrementale, pos_avant: &Chess, m: &Move) {
+        let h1 = self.h1;
+        let base = self.base_sommet();
+        // Duplique le sommet : le nouvel étage part de la position courante.
+        self.donnees.extend_from_within(base..);
+        let sommet = self.donnees.len() - 2 * h1;
+
+        let nous = pos_avant.turn();
+        let nous_blanc = nous == Color::White;
+        let (zone_blanche, zone_noire) = zones_rois(pos_avant);
+
+        // Case d'arrivée de NOTRE roi s'il bouge (coup ordinaire ou roque —
+        // convention shakmaty : la case d'arrivée d'un Move::Castle est celle
+        // de la TOUR, celle du roi vient du côté de roque).
+        let arrivee_roi = match m {
+            Move::Normal { role: Role::King, to, .. } => Some(*to),
+            Move::Castle { .. } => {
+                let cote = m.castling_side().expect("Move::Castle a toujours un côté");
+                Some(cote.king_to(nous))
+            }
+            _ => None,
+        };
+        // Nouvelle zone de NOTRE perspective, seulement si son roi en change.
+        let zone_apres = arrivee_roi.and_then(|case| {
+            let (avant, apres) = if nous_blanc {
+                (zone_blanche, zone_roi(usize::from(case)))
+            } else {
+                (zone_noire, zone_roi(usize::from(case) ^ 56))
+            };
+            (apres != avant).then_some(apres)
+        });
+
+        let (blanc, noir) = self.donnees[sommet..].split_at_mut(h1);
+        match zone_apres {
+            // Aucune frontière traversée : deltas dans les DEUX perspectives,
+            // chacune indexée par la zone (inchangée) de SON roi.
+            None => pour_chaque_delta(nous, m, |couleur, role, case, signe| {
+                let ib = indice_piece_roi8(couleur, role, case, true, zone_blanche);
+                let inoir = indice_piece_roi8(couleur, role, case, false, zone_noire);
+                accumule(blanc, eval.colonne(ib), signe);
+                accumule(noir, eval.colonne(inoir), signe);
+            }),
+            // NOTRE roi change de zone : reconstruction complète de NOTRE
+            // perspective, deltas ordinaires pour l'autre.
+            Some(zone) => {
+                // `pousse` ne reçoit pas la position d'arrivée : on la
+                // rejoue. `play_unchecked` suffit, la pile ne reçoit que des
+                // coups légaux (contrat de la recherche).
+                let mut apres = pos_avant.clone();
+                apres.play_unchecked(m);
+
+                let (reconstruit, garde, zone_gardee) = if nous_blanc {
+                    (blanc, noir, zone_noire)
+                } else {
+                    (noir, blanc, zone_blanche)
+                };
+                reconstruit.copy_from_slice(&eval.biais1);
+                for (case, piece) in apres.board().iter() {
+                    let idx =
+                        indice_piece_roi8(piece.color, piece.role, case, nous_blanc, zone);
+                    accumule(reconstruit, eval.colonne(idx), 1.0);
+                }
+                pour_chaque_delta(nous, m, |couleur, role, case, signe| {
+                    let idx = indice_piece_roi8(couleur, role, case, !nous_blanc, zone_gardee);
+                    accumule(garde, eval.colonne(idx), signe);
+                });
+            }
+        }
+    }
+
     /// Null-move : la position est inchangée, seul le trait s'inverse — les
     /// accumulateurs sont donc identiques (l'évaluation lira simplement
-    /// l'autre perspective). On duplique le sommet pour garder la symétrie
-    /// pousse/depousse de la recherche.
+    /// l'autre perspective), dans les DEUX schémas : les zones roi-zones
+    /// dépendent des cases des rois, pas du trait. On duplique le sommet pour
+    /// garder la symétrie pousse/depousse de la recherche.
     pub fn pousse_null(&mut self) {
         let base = self.base_sommet();
         self.donnees.extend_from_within(base..);
@@ -247,7 +468,8 @@ impl PileAccus {
     /// lit l'accumulateur de la perspective du trait, ajoute les colonnes des
     /// drapeaux roques/en passant actifs, applique ReLU puis les couches
     /// supérieures et tanh. Égal à `net.forward_one(encode(pos))` à ~1e-4
-    /// (seul l'ordre des sommations f32 de la couche 1 diffère).
+    /// (seul l'ordre des sommations f32 de la couche 1 diffère) ; en schéma
+    /// roi-zones, égal de même à `forward_actifs`/`evalue_position`.
     pub fn evalue(&self, eval: &EvalIncrementale, pos: &Chess) -> f32 {
         debug_assert_eq!(self.h1, eval.h1, "evalue: EvalIncrementale d'une autre taille");
         let h1 = self.h1;
@@ -259,24 +481,30 @@ impl PileAccus {
         // Copie de travail : le sommet de pile ne doit pas être modifié.
         let mut courant: Vec<f32> = accu.to_vec();
 
-        // Drapeaux non incrémentaux, mêmes conditions que `features::encode` :
-        // notre O-O, notre O-O-O, leur O-O, leur O-O-O, en passant légal.
+        // Drapeaux non incrémentaux, mêmes conditions que `features::encode`
+        // et `features_roi::actifs` : notre O-O, notre O-O-O, leur O-O, leur
+        // O-O-O, en passant légal. Seule la BASE des colonnes dépend du
+        // schéma (768 en classique, 6144 en roi-zones).
+        let base_drapeaux = match eval.schema {
+            SchemaFeatures::Classique773 => BASE_DRAPEAUX,
+            SchemaFeatures::RoiZones8 => BASE_DRAPEAUX_ROI8,
+        };
         let eux = nous.other();
         let roques = pos.castles();
         if roques.has(nous, CastlingSide::KingSide) {
-            accumule(&mut courant, eval.colonne(BASE_DRAPEAUX), 1.0);
+            accumule(&mut courant, eval.colonne(base_drapeaux), 1.0);
         }
         if roques.has(nous, CastlingSide::QueenSide) {
-            accumule(&mut courant, eval.colonne(BASE_DRAPEAUX + 1), 1.0);
+            accumule(&mut courant, eval.colonne(base_drapeaux + 1), 1.0);
         }
         if roques.has(eux, CastlingSide::KingSide) {
-            accumule(&mut courant, eval.colonne(BASE_DRAPEAUX + 2), 1.0);
+            accumule(&mut courant, eval.colonne(base_drapeaux + 2), 1.0);
         }
         if roques.has(eux, CastlingSide::QueenSide) {
-            accumule(&mut courant, eval.colonne(BASE_DRAPEAUX + 3), 1.0);
+            accumule(&mut courant, eval.colonne(base_drapeaux + 3), 1.0);
         }
         if pos.ep_square(EnPassantMode::Legal).is_some() {
-            accumule(&mut courant, eval.colonne(BASE_DRAPEAUX + 4), 1.0);
+            accumule(&mut courant, eval.colonne(base_drapeaux + 4), 1.0);
         }
 
         // ReLU de la couche 1 (les pré-activations deviennent des activations).
@@ -317,11 +545,12 @@ mod tests {
     use super::*;
     use crate::bots::{Bot, RandomBot};
     use crate::features::encode;
+    use crate::nn::evalue_position;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use shakmaty::fen::Fen;
     use shakmaty::uci::UciMove;
-    use shakmaty::{CastlingMode, FromSetup};
+    use shakmaty::{Board, CastlingMode, FromSetup, Piece, Setup};
 
     /// Tolérance de parité : seul l'ordre des sommations f32 diffère.
     const TOL: f32 = 1e-4;
@@ -921,6 +1150,432 @@ mod tests {
     #[test]
     fn parite_tete_profonde_256_64_32() {
         batterie_parite(&[N_FEATURES, 256, 64, 32, 1], 202, 120, 8, "réseau [773,256,64,32,1]");
+    }
+
+    // -----------------------------------------------------------------------
+    // 7. Schéma ROI-ZONES (RoiZones8) : batterie de parité complète contre la
+    // référence CREUSE `evalue_position` (features_roi::actifs +
+    // forward_actifs). Les coups de roi qui changent de zone — reconstruction
+    // de l'accumulateur d'UNE perspective, l'autre gardant ses deltas — sont
+    // LE cas critique : ils sont comptés dans les parties aléatoires et
+    // FORCÉS par des marches de roi scriptées.
+    // -----------------------------------------------------------------------
+
+    /// Référence du schéma roi-zones : le chemin creux de production
+    /// (`evalue_position` route vers `features_roi::actifs` puis
+    /// `Mlp::forward_actifs`).
+    fn reference_roi8(net: &Mlp, pos: &Chess) -> f32 {
+        assert_eq!(net.schema(), SchemaFeatures::RoiZones8);
+        let mut tampon = Vec::new();
+        evalue_position(net, pos, &mut tampon)
+    }
+
+    /// Petit réseau RoiZones8 [6149, h1, h2, 1] créé par le constructeur
+    /// PUBLIC `new_roi_zones`, biais rendus NON NULS (mêmes raisons que
+    /// `petit_reseau` : une perte des biais doit être détectée).
+    fn petit_reseau_roi8(graine: u64, h1: usize, h2: usize) -> Mlp {
+        let mut net = Mlp::new_roi_zones(&[N_FEATURES_ROI, h1, h2, 1], graine);
+        let mut rng = StdRng::seed_from_u64(graine ^ 0x0A11E5);
+        for biais in net.biases.iter_mut() {
+            for b in biais.iter_mut() {
+                *b = rng.gen::<f32>() * 0.2 - 0.1;
+            }
+        }
+        net
+    }
+
+    /// Zone du roi de `camp` dans SA perspective (miroir pour les noirs).
+    fn zone_du_camp(pos: &Chess, camp: Color) -> usize {
+        let roi = pos.board().king_of(camp).expect("roi présent");
+        let case = if camp == Color::White {
+            usize::from(roi)
+        } else {
+            usize::from(roi) ^ 56
+        };
+        zone_roi(case)
+    }
+
+    /// Nombre de coups de `partie` où le roi du camp QUI JOUE change de zone
+    /// dans SA perspective — chacun déclenche une reconstruction.
+    fn nb_changements_zone(partie: &[(Chess, Move)]) -> usize {
+        partie
+            .iter()
+            .filter(|(avant, m)| {
+                let nous = avant.turn();
+                let apres = avant.clone().play(m).expect("coup légal");
+                zone_du_camp(avant, nous) != zone_du_camp(&apres, nous)
+            })
+            .count()
+    }
+
+    /// Rejoue `partie` en maintenant la pile : parité roi-zones exigée APRÈS
+    /// CHAQUE coup (pendant de `verifie_partie` pour le schéma creux).
+    fn verifie_partie_roi8(
+        net: &Mlp,
+        eval: &EvalIncrementale,
+        partie: &[(Chess, Move)],
+        contexte: &str,
+    ) {
+        if partie.is_empty() {
+            return;
+        }
+        let mut pile = eval.racine(&partie[0].0);
+        for (i, (avant, m)) in partie.iter().enumerate() {
+            pile.pousse(eval, avant, m);
+            let apres = avant.clone().play(m).expect("coup légal");
+            let attendu = reference_roi8(net, &apres);
+            let obtenu = pile.evalue(eval, &apres);
+            assert!(
+                (attendu - obtenu).abs() <= TOL,
+                "{contexte}, coup {i} ({m:?}) : incrémental {obtenu} vs référence {attendu}"
+            );
+        }
+    }
+
+    /// 7a. Parité statique roi-zones : les 64 COMBINAISONS de zones des deux
+    /// rois (positions à deux rois construites — une case par zone et par
+    /// perspective —, les deux traits), puis 200 positions de parties
+    /// aléatoires (droits de roque et en passant réels).
+    #[test]
+    fn parite_statique_roi8_toutes_les_zones() {
+        let net = petit_reseau_roi8(71, 32, 12);
+        let eval = EvalIncrementale::new(&net);
+
+        // Une case par zone, pour chaque perspective (la liste noire est le
+        // miroir vertical de la blanche : mêmes zones après `case ^ 56`).
+        let cases_blanches = [
+            Square::A1, Square::B4, Square::G1, Square::F3,
+            Square::C5, Square::D7, Square::E6, Square::H8,
+        ];
+        let cases_noires = [
+            Square::A8, Square::B5, Square::G8, Square::F6,
+            Square::C4, Square::D2, Square::E3, Square::H1,
+        ];
+        for (z, (&cb, &cn)) in cases_blanches.iter().zip(&cases_noires).enumerate() {
+            assert_eq!(zone_roi(usize::from(cb)), z, "liste blanche mal ordonnée");
+            assert_eq!(zone_roi(usize::from(cn) ^ 56), z, "liste noire mal ordonnée");
+        }
+
+        let mut testes = 0;
+        for &roi_blanc in &cases_blanches {
+            for &roi_noir in &cases_noires {
+                // Rois adjacents : position illégale, combinaison sautée.
+                let (a, b) = (usize::from(roi_blanc), usize::from(roi_noir));
+                let (df, dr) = (
+                    ((a & 7) as i32 - (b & 7) as i32).abs(),
+                    ((a >> 3) as i32 - (b >> 3) as i32).abs(),
+                );
+                if df <= 1 && dr <= 1 {
+                    continue;
+                }
+                let mut plateau = Board::empty();
+                plateau.set_piece_at(roi_blanc, Piece { color: Color::White, role: Role::King });
+                plateau.set_piece_at(roi_noir, Piece { color: Color::Black, role: Role::King });
+                for trait_blanc in [true, false] {
+                    let mut setup = Setup::empty();
+                    setup.board = plateau.clone();
+                    setup.turn = if trait_blanc { Color::White } else { Color::Black };
+                    let pos = Chess::from_setup(setup, CastlingMode::Standard)
+                        .expect("deux rois non adjacents : position légale");
+                    let attendu = reference_roi8(&net, &pos);
+                    let obtenu = eval.racine(&pos).evalue(&eval, &pos);
+                    assert!(
+                        (attendu - obtenu).abs() <= TOL,
+                        "rois {roi_blanc}/{roi_noir}, trait blanc {trait_blanc} : {obtenu} vs {attendu}"
+                    );
+                    testes += 1;
+                }
+            }
+        }
+        // 64 combinaisons moins les paires adjacentes, deux traits chacune.
+        assert!(testes >= 100, "trop peu de combinaisons de zones testées ({testes})");
+
+        // Positions réelles issues de parties aléatoires (roques, e.p.).
+        let mut positions = vec![Chess::default()];
+        let mut graine = 0u64;
+        while positions.len() < 200 {
+            for (p, _) in partie_aleatoire(&Chess::default(), 71_000 + graine, 90) {
+                positions.push(p);
+                if positions.len() >= 200 {
+                    break;
+                }
+            }
+            graine += 1;
+        }
+        for (i, pos) in positions.iter().enumerate() {
+            let attendu = reference_roi8(&net, pos);
+            let obtenu = eval.racine(pos).evalue(&eval, pos);
+            assert!(
+                (attendu - obtenu).abs() <= TOL,
+                "position {i} : incrémental {obtenu} vs référence {attendu}"
+            );
+        }
+    }
+
+    /// 7b. Parité incrémentale roi-zones : 100 parties aléatoires rejouées
+    /// coup à coup contre la référence creuse. La couverture (roques,
+    /// promotions, prises en passant, coups de roi changeant de zone —
+    /// c'est-à-dire reconstructions) est comptée et exigée.
+    #[test]
+    fn parite_incrementale_roi8_100_parties() {
+        let net = petit_reseau_roi8(72, 32, 12);
+        let eval = EvalIncrementale::new(&net);
+        let (mut roques, mut promotions, mut en_passants) = (0usize, 0usize, 0usize);
+        let mut reconstructions = 0usize;
+        for g in 0..100u64 {
+            let partie = partie_aleatoire(&Chess::default(), 5000 + g, 140);
+            for (_, m) in &partie {
+                if m.is_castle() {
+                    roques += 1;
+                }
+                if m.promotion().is_some() {
+                    promotions += 1;
+                }
+                if m.is_en_passant() {
+                    en_passants += 1;
+                }
+            }
+            reconstructions += nb_changements_zone(&partie);
+            verifie_partie_roi8(&net, &eval, &partie, &format!("partie aléatoire roi8 {g}"));
+        }
+        println!(
+            "couverture roi8 : {roques} roques, {promotions} promotions, {en_passants} e.p., \
+             {reconstructions} changements de zone"
+        );
+        assert!(roques > 0, "aucun roque rencontré dans les parties aléatoires");
+        assert!(promotions > 0, "aucune promotion rencontrée dans les parties aléatoires");
+        assert!(en_passants > 0, "aucune prise en passant rencontrée");
+        assert!(
+            reconstructions > 50,
+            "trop peu de changements de zone ({reconstructions}) : le cas critique n'est pas exercé"
+        );
+    }
+
+    /// 7c. Parties scriptées sous roi-zones : les quatre roques — les DEUX
+    /// grands roques font CHANGER le roi de zone (e1→c1 et e8→c8 : zone 2 →
+    /// zone 0) quand les petits ne la changent pas, les chemins delta ET
+    /// reconstruction du roque sont donc exercés —, les promotions avec et
+    /// sans capture, les prises en passant des deux camps.
+    #[test]
+    fn parite_roi8_scripts_roques_promotions_en_passant() {
+        let net = petit_reseau_roi8(73, 24, 8);
+        let eval = EvalIncrementale::new(&net);
+        let parties: [(Vec<(Chess, Move)>, &str, usize); 5] = [
+            (
+                construit_partie(&Chess::default(), &[
+                    "e2e4", "d7d5", "g1f3", "b8c6", "f1c4", "c8f5", "e1g1", "d8d6", "d2d3", "e8c8",
+                ]),
+                "O-O blanc / O-O-O noir",
+                1, // seul e8c8 traverse une frontière
+            ),
+            (
+                construit_partie(&Chess::default(), &[
+                    "d2d4", "e7e5", "c1e3", "f8e7", "b1c3", "g8f6", "d1d2", "e8g8", "e1c1",
+                ]),
+                "O-O-O blanc / O-O noir",
+                1, // seul e1c1 traverse une frontière
+            ),
+            (
+                construit_partie(
+                    &pos_de_fen("rnbqkb1r/ppppppPp/8/8/8/8/PPPPPPpP/RNBQKB1R w KQkq - 0 1"),
+                    &["g7h8q", "g2h1n"],
+                ),
+                "promotions avec capture",
+                0,
+            ),
+            (
+                construit_partie(
+                    &pos_de_fen("8/4k1P1/8/8/8/8/6p1/4K3 w - - 0 1"),
+                    &["g7g8q", "g2g1n"],
+                ),
+                "promotions calmes",
+                0,
+            ),
+            (
+                construit_partie(&Chess::default(), &[
+                    "e2e4", "g8f6", "e4e5", "d7d5", "e5d6", "c7d6", "g1f3", "b7b5", "f3g1",
+                    "b5b4", "c2c4", "b4c3",
+                ]),
+                "prises en passant",
+                0,
+            ),
+        ];
+        for (partie, contexte, changements_attendus) in &parties {
+            assert_eq!(
+                nb_changements_zone(partie),
+                *changements_attendus,
+                "{contexte} : compte de changements de zone inattendu"
+            );
+            verifie_partie_roi8(&net, &eval, partie, contexte);
+        }
+    }
+
+    /// 7d. LE cas critique, forcé : marches de roi scriptées à travers les
+    /// frontières de zones. D'abord les deux rois seuls (12 traversées, dont
+    /// des retours en arrière et des coups de roi SANS changement de zone) ;
+    /// puis une marche où le roi PREND une pièce en changeant de zone (la
+    /// perspective du roi est reconstruite, l'autre retire la victime par
+    /// delta).
+    #[test]
+    fn parite_roi8_marches_de_roi_changements_de_zone() {
+        let net = petit_reseau_roi8(74, 24, 8);
+        let eval = EvalIncrementale::new(&net);
+
+        // Blanc : a1→b7 puis redescente par les files c-e (zones
+        // 0→1→4→5→4→6→3→1→0) ; noir : h8→a1 en écho (2→3→6→7→5).
+        let marche = construit_partie(&pos_de_fen("7k/8/8/8/8/8/8/K7 w - - 0 1"), &[
+            "a1a2", "h8h7", "a2a3", "h7h6", "a3a4", "h6h5", "a4a5", "h5h4",
+            "a5b5", "h4g4", "b5b6", "g4g3", "b6b7", "g3g2", "b7c7", "g2g1",
+            "c7c6", "g1f1", "c6d6", "f1e1", "d6e6", "e1d1", "e6e5", "d1c1",
+            "e5e4", "c1b1", "e4d4", "b1b2", "d4d3", "b2a2", "d3d2", "a2a1",
+        ]);
+        assert_eq!(
+            nb_changements_zone(&marche),
+            12,
+            "la marche des deux rois doit traverser 12 frontières"
+        );
+        verifie_partie_roi8(&net, &eval, &marche, "marche des deux rois");
+
+        // Kxa7 : capture PAR le roi en traversant une frontière (zone 4 → 5),
+        // puis chaque roi redescend en re-traversant plusieurs frontières.
+        let capture = construit_partie(&pos_de_fen("8/b4k2/K7/8/8/8/1P6/8 w - - 0 1"), &[
+            "a6a7", "f7e6", "a7b6", "e6d5", "b6b5", "d5e4", "b5b4", "e4f3",
+        ]);
+        assert!(
+            matches!(&capture[0].1, Move::Normal { role: Role::King, capture: Some(_), .. }),
+            "le premier coup doit être une capture par le roi"
+        );
+        assert_eq!(
+            nb_changements_zone(&capture),
+            6,
+            "compte de changements de zone de la marche avec capture"
+        );
+        verifie_partie_roi8(&net, &eval, &capture, "marche avec capture par le roi");
+    }
+
+    /// 7e. Null-move roi-zones : les accumulateurs sont inchangés (les zones
+    /// dépendent des rois, pas du trait), l'évaluation lit simplement l'autre
+    /// perspective. Parité sur des plateaux fixes — dont des rois dans des
+    /// zones DIFFÉRENTES — puis en cours de parties aléatoires, avec retour
+    /// EXACT après depousse.
+    #[test]
+    fn pousse_null_roi8_echange_les_perspectives() {
+        let net = petit_reseau_roi8(75, 24, 8);
+        let eval = EvalIncrementale::new(&net);
+
+        // Paires (trait blanc, trait noir) sur le même plateau, sans e.p. :
+        // départ, position roquable, rois excentrés en zones 2/0 puis 3/3.
+        let paires = [
+            (
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1",
+            ),
+            (
+                "r3k2r/pppq1ppp/2npbn2/2b1p3/2B1P3/2NPBN2/PPPQ1PPP/R3K2R w KQkq - 0 1",
+                "r3k2r/pppq1ppp/2npbn2/2b1p3/2B1P3/2NPBN2/PPPQ1PPP/R3K2R b KQkq - 0 1",
+            ),
+            ("8/2k5/8/8/8/8/5PPP/6K1 w - - 0 1", "8/2k5/8/8/8/8/5PPP/6K1 b - - 0 1"),
+            ("8/5p2/4k3/8/8/4K3/5P2/8 w - - 0 1", "8/5p2/4k3/8/8/4K3/5P2/8 b - - 0 1"),
+        ];
+        for (fen_blanc, fen_noir) in paires {
+            let pos = pos_de_fen(fen_blanc);
+            let pos_inverse = pos_de_fen(fen_noir);
+
+            let mut pile = eval.racine(&pos);
+            let origine = pile.evalue(&eval, &pos);
+            pile.pousse_null();
+            let obtenu = pile.evalue(&eval, &pos_inverse);
+            let attendu = reference_roi8(&net, &pos_inverse);
+            assert!(
+                (attendu - obtenu).abs() <= TOL,
+                "null-move roi8 sur {fen_blanc} : {obtenu} vs {attendu}"
+            );
+            // Dépiler le null-move restitue exactement l'évaluation d'origine.
+            pile.depousse();
+            assert_eq!(pile.evalue(&eval, &pos), origine);
+        }
+
+        // Null-move en cours de partie, et retour EXACT après depousse.
+        let mut testes = 0;
+        for g in 0..6u64 {
+            let partie = partie_aleatoire(&Chess::default(), 7500 + g, 60);
+            if partie.is_empty() {
+                continue;
+            }
+            let mut pile = eval.racine(&partie[0].0);
+            for (avant, m) in &partie {
+                pile.pousse(&eval, avant, m);
+                let apres = avant.clone().play(m).expect("coup légal");
+                if let Some(inverse) = inverse_trait(&apres) {
+                    let avant_null = pile.evalue(&eval, &apres);
+                    pile.pousse_null();
+                    let obtenu = pile.evalue(&eval, &inverse);
+                    let attendu = reference_roi8(&net, &inverse);
+                    assert!(
+                        (attendu - obtenu).abs() <= TOL,
+                        "null-move roi8 en partie {g} : {obtenu} vs {attendu}"
+                    );
+                    pile.depousse();
+                    assert_eq!(
+                        pile.evalue(&eval, &apres),
+                        avant_null,
+                        "depousse du null-move roi8 ne restitue pas l'évaluation"
+                    );
+                    testes += 1;
+                }
+            }
+        }
+        assert!(testes > 20, "trop peu de null-moves roi8 testés ({testes})");
+    }
+
+    /// 7f. Marche aléatoire pousse/depousse (60 % / 40 %) sur une finale rois
+    /// et pions — la plupart des coups sont des coups de roi : des
+    /// reconstructions de zone sont poussées PUIS dépilées en permanence
+    /// (celles dépilées doivent disparaître sans trace). Parité avec la
+    /// référence creuse après CHAQUE pas.
+    #[test]
+    fn depousse_roi8_rejoint_la_reference() {
+        let net = petit_reseau_roi8(76, 24, 8);
+        let eval = EvalIncrementale::new(&net);
+        let mut rng = StdRng::seed_from_u64(770);
+
+        let depart = pos_de_fen("7k/5p2/8/8/8/8/2P5/K7 w - - 0 1");
+        let mut pile = eval.racine(&depart);
+        let mut positions = vec![depart];
+        let mut changements = 0usize;
+        for pas in 0..900 {
+            let sommet = positions.last().unwrap().clone();
+            let coups = sommet.legal_moves();
+            let pousser = !coups.is_empty() && (positions.len() == 1 || rng.gen_bool(0.6));
+            if pousser {
+                let m = coups[rng.gen_range(0..coups.len())].clone();
+                let nous = sommet.turn();
+                let zone_avant = zone_du_camp(&sommet, nous);
+                pile.pousse(&eval, &sommet, &m);
+                let apres = sommet.play(&m).expect("coup légal");
+                if zone_du_camp(&apres, nous) != zone_avant {
+                    changements += 1;
+                }
+                positions.push(apres);
+            } else if positions.len() > 1 {
+                pile.depousse();
+                positions.pop();
+            } else {
+                break; // partie terminée à la racine
+            }
+            let pos = positions.last().unwrap();
+            let attendu = reference_roi8(&net, pos);
+            let obtenu = pile.evalue(&eval, pos);
+            assert!(
+                (attendu - obtenu).abs() <= TOL,
+                "pas {pas} (profondeur {}) : {obtenu} vs {attendu}",
+                positions.len()
+            );
+        }
+        assert!(
+            changements > 30,
+            "trop peu de changements de zone poussés dans la marche ({changements})"
+        );
     }
 
     /// 5. Bench (ignoré par défaut) : évals/s de evalue() contre forward_one()

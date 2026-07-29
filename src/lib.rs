@@ -42,6 +42,7 @@ pub mod departs;
 pub mod direct;
 pub mod elo;
 pub mod features;
+pub mod features_roi;
 pub mod nn;
 pub mod nnue;
 pub mod search;
