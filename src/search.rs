@@ -18,7 +18,7 @@
 //! récursion, depousse au retour, pousse_null pour le null-move), et seule la
 //! tête 512→64→1 est recalculée. Mêmes scores (à l'ordre des sommations f32
 //! près), mêmes coups : la recherche est inchangée, seulement plus rapide.
-//! Chemin de secours : USE_NNUE (ci-dessous).
+//! Chemin de secours : champ `Recherche::utilise_nnue` (défaut true).
 //!
 //! C'est l'étage 1 de la fusée « battre Deep Blue » : il sert à la fois à
 //! JOUER (serveur, arène) et à FABRIQUER les étiquettes TD-leaf du self-play
@@ -34,18 +34,16 @@ use std::time::{Duration, Instant};
 use shakmaty::zobrist::{Zobrist64, ZobristHash};
 use shakmaty::{Bitboard, Board, Chess, Color, EnPassantMode, Move, Piece, Position, Role, Square};
 
-use crate::features::{encode, N_FEATURES};
+use crate::features::N_FEATURES;
 use crate::nn::Mlp;
 use crate::nnue::{EvalIncrementale, PileAccus};
 
 pub const SCORE_MAT: f32 = 1000.0;
 
-/// Interrupteur de secours de l'évaluation incrémentale. Si une divergence est
-/// suspectée (le debug_assert de parité échantillonnée d'`evaluer` se déclenche
-/// en mode debug), basculer cette constante à `false` : la recherche revient au
-/// forward complet (encode + forward_one) — comportement identique, seulement
-/// plus lent — le temps de corriger src/nnue.rs.
-pub const USE_NNUE: bool = true;
+// L'interrupteur de secours de l'évaluation incrémentale (ex-constante
+// USE_NNUE) est devenu le champ d'instance `Recherche::utilise_nnue`
+// (défaut : true). Le passer à false rend le forward complet — comportement
+// identique, seulement plus lent — utile pour isoler un bug de src/nnue.rs.
 
 /// Au-delà de ce seuil (en valeur absolue) un score est un score de MAT :
 /// les valeurs réseau vivent dans [-1, 1] et les mats dans
@@ -347,10 +345,15 @@ pub struct Recherche {
     /// mêmes nœuds. C'est la base de comparaison des tests A/B. Défaut : false
     /// (raffinements actifs).
     pub mode_classique: bool,
-    /// Poids réorganisés pour l'évaluation incrémentale. `None` = chemin de
-    /// secours forward complet : USE_NNUE à false, ou réseau sans couche
-    /// cachée (les réseaux linéaires [773,1] de certains tests, où il n'y a
-    /// de toute façon rien à accélérer).
+    /// À `false`, DÉBRAYE l'évaluation incrémentale : chaque feuille repasse
+    /// par encode + forward complet (comportement d'avant l'intégration NNUE,
+    /// mêmes scores à l'ordre des sommations f32 près, seulement plus lent).
+    /// Défaut : true. Sert d'échappatoire et de bras de comparaison au
+    /// harnais forensique (src/bin/forensic.rs).
+    pub utilise_nnue: bool,
+    /// Poids réorganisés pour l'évaluation incrémentale. `None` = réseau sans
+    /// couche cachée (les réseaux linéaires [773,1] de certains tests, où il
+    /// n'y a de toute façon rien à accélérer) → forward complet d'office.
     eval: Option<EvalIncrementale>,
     /// Pile d'accumulateurs de la ligne en cours d'exploration, recréée à
     /// chaque appel de cherche() (racine posée sur la position de départ).
@@ -390,10 +393,11 @@ impl Recherche {
         // Évaluation incrémentale construite UNE FOIS depuis le réseau (copie
         // des poids en colonnes) : voir le commentaire de la struct pour le
         // rechargement du réseau. Réseau sans couche cachée → forward complet.
-        let eval = (USE_NNUE && net.sizes.len() >= 3).then(|| EvalIncrementale::new(&net));
+        let eval = (net.sizes.len() >= 3).then(|| EvalIncrementale::new(&net));
         Recherche {
             net,
             mode_classique: false,
+            utilise_nnue: true,
             eval,
             pile: None,
             tt: vec![ENTREE_VIDE; n],
@@ -454,7 +458,14 @@ impl Recherche {
         // Pile d'accumulateurs posée sur la position de départ : une par appel
         // (la racine change à chaque coup joué). Encodage complet des deux
         // perspectives ici, puis uniquement des deltas dans l'arbre.
-        self.pile = self.eval.as_ref().map(|e| e.racine(pos));
+        self.pile = if self.utilise_nnue {
+            self.eval.as_ref().map(|e| e.racine(pos))
+        } else {
+            // Incrémental débrayé : pile absente → evaluer() et les
+            // pile_pousse/depousse retombent d'eux-mêmes sur le forward
+            // complet (no-ops côté pile).
+            None
+        };
 
         // Ordre racine initial : coup TT de la recherche précédente (grosse
         // source de gain entre coups successifs d'une même partie), puis
@@ -938,8 +949,9 @@ impl Recherche {
     /// Chemin normal : lecture du sommet de la pile d'accumulateurs (`pos`
     /// DOIT être la position du sommet — garanti par la discipline
     /// pousse/depousse de negamax et quiesce) + tête 512→64→1.
-    /// Chemin de secours (eval None) : encode + forward complet, identique au
-    /// comportement d'avant l'intégration NNUE.
+    /// Chemin de secours (eval None, ou pile None quand utilise_nnue est à
+    /// false) : encode + forward complet, identique au comportement d'avant
+    /// l'intégration NNUE.
     fn evaluer(&mut self, pos: &Chess) -> f32 {
         if let (Some(eval), Some(pile)) = (self.eval.as_ref(), self.pile.as_ref()) {
             let v = pile.evalue(eval, pos);
@@ -947,7 +959,7 @@ impl Recherche {
             // (dont le tout premier de chaque recherche) est recalculé par le
             // forward complet. Si l'assertion se déclenche, la pile a divergé
             // (delta de coup faux, pousse/depousse déséquilibrés...) :
-            // basculer USE_NNUE à false (en tête de ce fichier) pour revenir
+            // basculer utilise_nnue à false (champ de Recherche) pour revenir
             // au forward complet le temps de corriger src/nnue.rs. Tolérance
             // 1e-3 : la dérive légitime (ordre des sommations f32 accumulées
             // le long d'une partie) reste ~1e-5, un vrai bug de delta décale
@@ -966,8 +978,10 @@ impl Recherche {
             }
             return v;
         }
-        encode(pos, &mut self.tampon);
-        self.net.forward_one(&self.tampon)
+        // Répartiteur de schéma (et non encode + forward_one en dur, qui ne
+        // vaut que pour Classique773 et paniquerait avec un réseau RoiZones8
+        // 6149) : bit-à-bit identique au chemin historique pour Classique773.
+        crate::nn::evalue_position(&self.net, pos, &mut self.tampon)
     }
 
     // --- Pile d'accumulateurs (no-ops en chemin de secours) ------------------

@@ -1636,4 +1636,447 @@ mod tests {
         println!("pousse+evalue+depousse: {par_s_cycle:>10.0} évals/s  (×{:.1} vs encode+forward)", par_s_cycle / par_s_enc_fwd);
         assert!(somme.is_finite());
     }
+
+    // -----------------------------------------------------------------------
+    // 8. STRESS DE PARITÉ EXHAUSTIF roi8 (chantier forensique) — tests
+    // #[ignore], pensés pour le release. La pile est pilotée DIRECTEMENT sur
+    // des séquences profondes ; à CHAQUE pli (après pousse, sous pousse_null
+    // ET après chaque depousse) l'évaluation incrémentale est comparée à la
+    // référence creuse recalculée de zéro. Deux réseaux systématiquement :
+    // un roi8 aléatoire aux tailles réelles [6149,1024,128,1] et le réseau
+    // RÉEL models/chess_latest.bin (s'il est présent et au schéma roi8).
+    //
+    // Lancement complet (release, quelques minutes) :
+    //   cargo test --release --lib nnue::tests::stress_roi8 -- --ignored --nocapture
+    // Fumé (debug, volume réduit) — PowerShell :
+    //   $env:NNUE_STRESS_PARTIES='2'
+    //   cargo test --lib nnue::tests::stress_roi8 -- --ignored --nocapture
+    // -----------------------------------------------------------------------
+
+    /// Tolérance du stress. La sortie est un tanh dans (-1,1) : une tolérance
+    /// purement RELATIVE n'a pas de sens près de 0, on borne donc l'écart
+    /// ABSOLU. 1e-3 équivaut à ~1e-4 relatif ramené à la dynamique utile de
+    /// la sortie (|v| jusqu'à ~1) — c'est le critère « 1e-4 relatif » du
+    /// cahier des charges exprimé en absolu. Le seul écart légitime est la
+    /// dérive f32 des accumulateurs (ordre des sommations différent + des
+    /// centaines de deltas cumulés sur >120 plis), attendue sous ~2e-4 sur
+    /// [6149,1024,128,1] ; un bug d'indexation déplace au moins une colonne
+    /// entière et produit des écarts d'ordre 1e-2 à 1. 1e-3 sépare les deux
+    /// populations avec une marge d'au moins ×5 de chaque côté.
+    const TOL_STRESS: f32 = 1e-3;
+
+    /// Volume du stress : nombre de parties aléatoires (défaut 2000), réglable
+    /// par la variable d'environnement NNUE_STRESS_PARTIES pour un fumé rapide
+    /// en debug. Les autres tests de stress se mettent à l'échelle.
+    fn nb_parties_stress() -> u64 {
+        std::env::var("NNUE_STRESS_PARTIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2000)
+    }
+
+    /// Réseaux soumis au stress : un roi8 aléatoire AUX TAILLES RÉELLES
+    /// [6149,1024,128,1] (biais rendus non nuls), puis le réseau réel
+    /// models/chess_latest.bin s'il se charge ET est au schéma roi8 (train.exe
+    /// peut être en train de le réécrire : un chargement raté est signalé
+    /// et toléré, le réseau aléatoire couvre alors seul la logique).
+    fn reseaux_stress() -> Vec<(Mlp, String)> {
+        let mut nets = vec![(
+            petit_reseau_roi8(0xACE, 1024, 128),
+            "roi8 aléatoire [6149,1024,128,1]".to_string(),
+        )];
+        let chemin = concat!(env!("CARGO_MANIFEST_DIR"), "/models/chess_latest.bin");
+        match Mlp::load(chemin) {
+            Ok(net) if net.schema() == SchemaFeatures::RoiZones8 => {
+                println!("STRESS : réseau réel chargé ({chemin}, tailles {:?})", net.sizes);
+                nets.push((net, "réseau réel chess_latest.bin".to_string()));
+            }
+            Ok(net) => println!(
+                "STRESS : {chemin} au schéma {:?} (pas roi8), réseau réel non testé",
+                net.schema()
+            ),
+            Err(e) => println!("STRESS : {chemin} illisible ({e}), réseau réel non testé"),
+        }
+        nets
+    }
+
+    /// Bilan d'une séquence de stress : la couverture RÉELLEMENT exercée.
+    #[derive(Default)]
+    struct StatsStress {
+        plis: usize,
+        changements_zone: usize,
+        roques: usize,
+        promotions: usize,
+        en_passants: usize,
+        nulls_testes: usize,
+    }
+
+    impl StatsStress {
+        fn cumule(&mut self, autre: &StatsStress) {
+            self.plis += autre.plis;
+            self.changements_zone += autre.changements_zone;
+            self.roques += autre.roques;
+            self.promotions += autre.promotions;
+            self.en_passants += autre.en_passants;
+            self.nulls_testes += autre.nulls_testes;
+        }
+
+        fn affiche(&self, contexte: &str) {
+            println!(
+                "{contexte} : {} plis, {} changements de zone, {} roques, {} promotions, \
+                 {} e.p., {} null-moves vérifiés",
+                self.plis, self.changements_zone, self.roques, self.promotions,
+                self.en_passants, self.nulls_testes
+            );
+        }
+    }
+
+    /// Compare l'évaluation incrémentale du sommet de pile à la référence
+    /// creuse recalculée de zéro ; au-delà de TOL_STRESS (ou si l'une des
+    /// valeurs est NaN), imprime le rapport complet — FEN de départ, séquence
+    /// UCI, pli, valeurs — puis panique. C'est la matière première du
+    /// diagnostic : la séquence rejouée telle quelle reproduit la divergence.
+    #[allow(clippy::too_many_arguments)]
+    fn exige_parite_roi8(
+        net: &Mlp,
+        eval: &EvalIncrementale,
+        pile: &PileAccus,
+        pos: &Chess,
+        fen_depart: &str,
+        ucis: &[String],
+        pli: usize,
+        etape: &str,
+    ) {
+        let attendu = reference_roi8(net, pos);
+        let obtenu = pile.evalue(eval, pos);
+        let ecart = (attendu - obtenu).abs();
+        // `!(ecart <= TOL)` plutôt que `ecart > TOL` : attrape aussi les NaN.
+        if !(ecart <= TOL_STRESS) {
+            let fen_sommet = Fen::from_position(pos.clone(), EnPassantMode::Legal).to_string();
+            panic!(
+                "\n=== DIVERGENCE NNUE roi8 ===\n\
+                 étape        : {etape}\n\
+                 pli          : {pli}\n\
+                 FEN départ   : {fen_depart}\n\
+                 FEN sommet   : {fen_sommet}\n\
+                 séquence UCI : {}\n\
+                 incrémental  : {obtenu:.8}\n\
+                 exact        : {attendu:.8}\n\
+                 écart        : {ecart:.3e} (tolérance {TOL_STRESS:.0e})\n",
+                if ucis.is_empty() { "(aucun coup)".to_string() } else { ucis.join(" ") }
+            );
+        }
+    }
+
+    /// Cœur du stress : déroule `coups` (légaux, dans l'ordre) depuis `depart`
+    /// en pilotant la pile roi8.
+    /// - Parité exigée après CHAQUE pousse ;
+    /// - un pousse_null intercalé UN COUP SUR HUIT : parité au trait inversé
+    ///   (quand la position inversée est légale) puis depousse et parité de
+    ///   retour — le null dépilé ne doit laisser aucune trace ;
+    /// - à la fin, dépilage INTÉGRAL de la séquence, parité exigée après
+    ///   CHAQUE depousse (l'état restauré doit être parfait même quand les
+    ///   étages dépilés contenaient des reconstructions de zone).
+    fn stress_deroule_roi8(
+        net: &Mlp,
+        eval: &EvalIncrementale,
+        depart: &Chess,
+        coups: &[Move],
+        contexte: &str,
+    ) -> StatsStress {
+        let fen_depart = Fen::from_position(depart.clone(), EnPassantMode::Legal).to_string();
+        let mut stats = StatsStress::default();
+        let mut pile = eval.racine(depart);
+        let mut positions = vec![depart.clone()];
+        let mut ucis: Vec<String> = Vec::new();
+        for (pli, m) in coups.iter().enumerate() {
+            let sommet = positions.last().unwrap().clone();
+            let nous = sommet.turn();
+            let zone_avant = zone_du_camp(&sommet, nous);
+            pile.pousse(eval, &sommet, m);
+            let apres = sommet.play(m).expect("coup légal");
+            ucis.push(m.to_uci(CastlingMode::Standard).to_string());
+            stats.plis += 1;
+            if zone_du_camp(&apres, nous) != zone_avant {
+                stats.changements_zone += 1;
+            }
+            if m.is_castle() {
+                stats.roques += 1;
+            }
+            if m.promotion().is_some() {
+                stats.promotions += 1;
+            }
+            if m.is_en_passant() {
+                stats.en_passants += 1;
+            }
+            positions.push(apres.clone());
+            exige_parite_roi8(
+                net, eval, &pile, &apres, &fen_depart, &ucis, ucis.len(),
+                &format!("{contexte} — après pousse"),
+            );
+            // Null-move intercalé un coup sur huit, comme en recherche.
+            if pli % 8 == 3 {
+                pile.pousse_null();
+                if let Some(inverse) = inverse_trait(&apres) {
+                    exige_parite_roi8(
+                        net, eval, &pile, &inverse, &fen_depart, &ucis, ucis.len(),
+                        &format!("{contexte} — sous pousse_null (trait inversé)"),
+                    );
+                    stats.nulls_testes += 1;
+                }
+                pile.depousse();
+                exige_parite_roi8(
+                    net, eval, &pile, &apres, &fen_depart, &ucis, ucis.len(),
+                    &format!("{contexte} — après depousse du null-move"),
+                );
+            }
+        }
+        // Redescente : dépilage intégral, parité après CHAQUE depousse.
+        while positions.len() > 1 {
+            pile.depousse();
+            positions.pop();
+            let pos = positions.last().unwrap();
+            exige_parite_roi8(
+                net, eval, &pile, pos, &fen_depart, &ucis, positions.len() - 1,
+                &format!("{contexte} — redescente, après depousse (retour au pli {})", positions.len() - 1),
+            );
+        }
+        stats
+    }
+
+    /// Les coups d'une partie RandomBot depuis `depart` (mêmes conditions
+    /// d'arrêt que `partie_aleatoire`, dont elle est un simple habillage).
+    fn coups_aleatoires(depart: &Chess, graine: u64, max_plis: usize) -> Vec<Move> {
+        partie_aleatoire(depart, graine, max_plis)
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect()
+    }
+
+    /// 8a. Des MILLIERS de parties aléatoires longues (graines fixes, jusqu'à
+    /// 200 plis) depuis la position initiale, null-move intercalé un coup sur
+    /// huit, dépilage intégral vérifié — sur le réseau aléatoire ET le réseau
+    /// réel. La couverture naturelle (roques, promotions, prises en passant,
+    /// changements de zone) est comptée et exigée au volume nominal.
+    #[test]
+    #[ignore]
+    fn stress_roi8_parties_aleatoires_null_move() {
+        let n_parties = nb_parties_stress();
+        for (net, nom) in &reseaux_stress() {
+            let eval = EvalIncrementale::new(net);
+            let mut total = StatsStress::default();
+            for g in 0..n_parties {
+                let coups = coups_aleatoires(&Chess::default(), 0x57E5_0000 + g, 200);
+                total.cumule(&stress_deroule_roi8(
+                    net, &eval, &Chess::default(), &coups,
+                    &format!("[{nom}] partie aléatoire {g}"),
+                ));
+            }
+            total.affiche(&format!("[{nom}] {n_parties} parties aléatoires"));
+            // Planchers de couverture au volume nominal seulement : un fumé
+            // à 2 parties ne peut pas garantir une promotion.
+            if n_parties >= 100 {
+                assert!(total.roques > 0, "[{nom}] aucun roque exercé");
+                assert!(total.promotions > 0, "[{nom}] aucune promotion exercée");
+                assert!(total.en_passants > 0, "[{nom}] aucune prise en passant exercée");
+                assert!(
+                    total.changements_zone > n_parties as usize,
+                    "[{nom}] trop peu de changements de zone ({})",
+                    total.changements_zone
+                );
+                assert!(total.nulls_testes > 100, "[{nom}] trop peu de null-moves vérifiés");
+            }
+        }
+    }
+
+    /// 8b. Scripts déterministes : les QUATRE roques (les deux grands font
+    /// changer le roi de zone, les deux petits non — chemins delta ET
+    /// reconstruction), les promotions vers les QUATRE pièces avec puis sans
+    /// capture (deux camps à chaque fois), les prises en passant des deux
+    /// camps. Chaque script passe par le déroulé complet (null-moves
+    /// intercalés, dépilage intégral vérifié).
+    #[test]
+    #[ignore]
+    fn stress_roi8_scripts_roques_promotions_en_passant() {
+        // (FEN ou None = position initiale, coups UCI, contexte)
+        let mut scripts: Vec<(Option<&str>, Vec<String>, String)> = vec![
+            (
+                None,
+                ["e2e4", "d7d5", "g1f3", "b8c6", "f1c4", "c8f5", "e1g1", "d8d6", "d2d3", "e8c8"]
+                    .iter().map(|s| s.to_string()).collect(),
+                "O-O blanc / O-O-O noir (e8c8 change de zone)".to_string(),
+            ),
+            (
+                None,
+                ["d2d4", "e7e5", "c1e3", "f8e7", "b1c3", "g8f6", "d1d2", "e8g8", "e1c1"]
+                    .iter().map(|s| s.to_string()).collect(),
+                "O-O-O blanc / O-O noir (e1c1 change de zone)".to_string(),
+            ),
+            (
+                None,
+                ["e2e4", "g8f6", "e4e5", "d7d5", "e5d6", "c7d6", "g1f3", "b7b5", "f3g1",
+                 "b5b4", "c2c4", "b4c3"]
+                    .iter().map(|s| s.to_string()).collect(),
+                "prises en passant des deux camps".to_string(),
+            ),
+        ];
+        // Promotions : les 4 pièces, avec capture (g7xh8 / g2xh1) puis
+        // calmes (g7g8 / g2g1), un camp puis l'autre à chaque script.
+        // Roi noir en b7 : hors de portée des QUATRE promotions blanches en
+        // g8 (en e7, la sous-promotion cavalier g8=N donnerait échec et
+        // rendrait la réponse noire illégale).
+        for piece in ["q", "r", "b", "n"] {
+            scripts.push((
+                Some("rnbqkb1r/ppppppPp/8/8/8/8/PPPPPPpP/RNBQKB1R w KQkq - 0 1"),
+                vec![format!("g7h8{piece}"), format!("g2h1{piece}")],
+                format!("promotions {piece} avec capture"),
+            ));
+            scripts.push((
+                Some("8/1k4P1/8/8/8/8/6p1/4K3 w - - 0 1"),
+                vec![format!("g7g8{piece}"), format!("g2g1{piece}")],
+                format!("promotions {piece} calmes"),
+            ));
+        }
+
+        for (net, nom) in &reseaux_stress() {
+            let eval = EvalIncrementale::new(net);
+            let mut total = StatsStress::default();
+            for (fen, ucis, contexte) in &scripts {
+                let depart = match fen {
+                    Some(f) => pos_de_fen(f),
+                    None => Chess::default(),
+                };
+                let refs: Vec<&str> = ucis.iter().map(|s| s.as_str()).collect();
+                let coups: Vec<Move> = construit_partie(&depart, &refs)
+                    .into_iter()
+                    .map(|(_, m)| m)
+                    .collect();
+                total.cumule(&stress_deroule_roi8(
+                    net, &eval, &depart, &coups,
+                    &format!("[{nom}] script {contexte}"),
+                ));
+            }
+            total.affiche(&format!("[{nom}] scripts"));
+            // Couverture garantie par construction : 4 roques (dont 2 avec
+            // changement de zone), 16 promotions, 2 prises en passant.
+            assert_eq!(total.roques, 4, "[{nom}] les quatre roques doivent être exercés");
+            assert_eq!(total.promotions, 16, "[{nom}] 4 pièces × capture/calme × 2 camps");
+            assert_eq!(total.en_passants, 2, "[{nom}] une prise en passant par camp");
+            assert!(
+                total.changements_zone >= 2,
+                "[{nom}] les grands roques doivent changer la zone du roi"
+            );
+        }
+    }
+
+    /// 8c. Finales générées par `departs` (rois + pions et petites finales :
+    /// trafic maximal de changements de zone par marches de roi), parties
+    /// aléatoires longues avec null-moves et dépilage intégral vérifié.
+    #[test]
+    #[ignore]
+    fn stress_roi8_finales_marches_de_roi() {
+        let n_parties = (nb_parties_stress() / 4).max(1);
+        // Départs tirés UNE fois (graine fixe) : mêmes finales pour tous les
+        // réseaux, comparaisons reproductibles.
+        let mut rng = StdRng::seed_from_u64(0xF1A1E5);
+        let departs: Vec<(Chess, String)> = (0..n_parties)
+            .map(|i| {
+                let d = crate::departs::tirage(&mut rng, 0.0, 1.0);
+                (d.pos, format!("finale {i} ({})", d.etiquette))
+            })
+            .collect();
+        for (net, nom) in &reseaux_stress() {
+            let eval = EvalIncrementale::new(net);
+            let mut total = StatsStress::default();
+            for (i, (depart, etiquette)) in departs.iter().enumerate() {
+                let coups = coups_aleatoires(depart, 0xF00_0000 + i as u64, 240);
+                total.cumule(&stress_deroule_roi8(
+                    net, &eval, depart, &coups,
+                    &format!("[{nom}] {etiquette}"),
+                ));
+            }
+            total.affiche(&format!("[{nom}] {n_parties} finales"));
+            if n_parties >= 50 {
+                assert!(
+                    total.changements_zone > 2 * n_parties as usize,
+                    "[{nom}] les finales doivent produire un trafic massif de zones ({})",
+                    total.changements_zone
+                );
+            }
+        }
+    }
+
+    /// 8d. Montagnes pousse/depousse : marche aléatoire profonde (60 % pousse
+    /// / 40 % depousse, coups de roi favorisés à 70 %) sur des finales de rois
+    /// et une position roquable — la pile traverse des reconstructions de zone
+    /// en montée PUIS les dépile ; parité exigée après CHAQUE pas, montée
+    /// comme descente.
+    #[test]
+    #[ignore]
+    fn stress_roi8_montagnes_pousse_depousse() {
+        let pas_total = (nb_parties_stress().saturating_mul(4).max(50)) as usize;
+        let departs = [
+            ("7k/5p2/8/8/8/8/2P5/K7 w - - 0 1", "roi+pion contre roi+pion"),
+            ("8/1k6/8/4p3/3P4/8/6K1/8 w - - 0 1", "pions bloqués, rois libres"),
+            (
+                "r3k2r/pppq1ppp/2npbn2/2b1p3/2B1P3/2NPBN2/PPPQ1PPP/R3K2R w KQkq - 0 1",
+                "milieu roquable",
+            ),
+        ];
+        for (net, nom) in &reseaux_stress() {
+            let eval = EvalIncrementale::new(net);
+            for (graine, (fen, etiquette)) in departs.iter().enumerate() {
+                let depart = pos_de_fen(fen);
+                let mut rng = StdRng::seed_from_u64(0xA10_000 + graine as u64);
+                let mut pile = eval.racine(&depart);
+                let mut positions = vec![depart.clone()];
+                let mut ucis: Vec<String> = Vec::new();
+                let mut changements = 0usize;
+                let contexte = format!("[{nom}] montagne {etiquette}");
+                for pas in 0..pas_total {
+                    let sommet = positions.last().unwrap().clone();
+                    let coups = sommet.legal_moves();
+                    let pousser =
+                        !coups.is_empty() && (positions.len() == 1 || rng.gen_bool(0.6));
+                    if pousser {
+                        // Coups de roi favorisés : trafic maximal de zones.
+                        let de_roi: Vec<&Move> =
+                            coups.iter().filter(|m| m.role() == Role::King).collect();
+                        let m = if !de_roi.is_empty() && rng.gen_bool(0.7) {
+                            de_roi[rng.gen_range(0..de_roi.len())].clone()
+                        } else {
+                            coups[rng.gen_range(0..coups.len())].clone()
+                        };
+                        let nous = sommet.turn();
+                        let zone_avant = zone_du_camp(&sommet, nous);
+                        pile.pousse(&eval, &sommet, &m);
+                        let apres = sommet.play(&m).expect("coup légal");
+                        if zone_du_camp(&apres, nous) != zone_avant {
+                            changements += 1;
+                        }
+                        ucis.push(m.to_uci(CastlingMode::Standard).to_string());
+                        positions.push(apres);
+                    } else if positions.len() > 1 {
+                        pile.depousse();
+                        positions.pop();
+                        ucis.pop();
+                    } else {
+                        break; // mat ou pat à la racine
+                    }
+                    let pos = positions.last().unwrap();
+                    exige_parite_roi8(
+                        net, &eval, &pile, pos, fen, &ucis, ucis.len(),
+                        &format!("{contexte}, pas {pas}"),
+                    );
+                }
+                println!("{contexte} : {pas_total} pas, {changements} changements de zone");
+                if pas_total >= 2000 {
+                    assert!(
+                        changements > pas_total / 40,
+                        "{contexte} : trop peu de changements de zone ({changements})"
+                    );
+                }
+            }
+        }
+    }
 }
