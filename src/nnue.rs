@@ -590,6 +590,7 @@ mod tests {
         }
         let zw: Vec<Vec<f32>> = weights.iter().map(|w| vec![0.0; w.len()]).collect();
         let zb: Vec<Vec<f32>> = biases.iter().map(|b| vec![0.0; b.len()]).collect();
+        let pas_colonnes = vec![0u64; sizes[0]];
         Mlp {
             sizes,
             weights,
@@ -599,6 +600,7 @@ mod tests {
             adam_mb: zb.clone(),
             adam_vb: zb,
             steps: 0,
+            pas_colonnes,
         }
     }
 
@@ -949,6 +951,7 @@ mod tests {
         let zw: Vec<Vec<f32>> = weights.iter().map(|w| vec![0.0; w.len()]).collect();
         let zb: Vec<Vec<f32>> = biases.iter().map(|b| vec![0.0; b.len()]).collect();
         let net = Mlp {
+            pas_colonnes: vec![0u64; sizes[0]],
             sizes,
             weights,
             biases,

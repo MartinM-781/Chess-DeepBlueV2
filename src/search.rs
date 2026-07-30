@@ -1173,6 +1173,7 @@ mod tests {
             adam_mb: formes_b.iter().map(|&n| vec![0.0; n]).collect(),
             adam_vb: formes_b.iter().map(|&n| vec![0.0; n]).collect(),
             steps: 0,
+            pas_colonnes: vec![0u64; n_in],
         })
     }
 
@@ -1202,6 +1203,7 @@ mod tests {
             adam_mb: vec![vec![0.0]],
             adam_vb: vec![vec![0.0]],
             steps: 0,
+            pas_colonnes: vec![0u64; N_FEATURES],
         })
     }
 
