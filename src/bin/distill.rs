@@ -18,7 +18,19 @@
 //!                                     773, défaut) ou "roi8" (creux roi-zones,
 //!                                     6149) ; avec roi8, --sizes absent vaut
 //!                                     6149,1024,128,1 et sizes[0] DOIT être 6149
+//!   --student <chemin>                RE-distillation à chaud : repartir de cet
+//!                                     élève EXISTANT (Mlp::load — moments Adam
+//!                                     et pas_colonnes conservés tels quels) au
+//!                                     lieu d'un réseau neuf ; son schéma doit
+//!                                     correspondre à --schema et, si --sizes
+//!                                     est fourni, aux tailles du fichier ; son
+//!                                     MSE de validation est imprimé AVANT tout
+//!                                     entraînement (ligne de base, mêmes
+//!                                     20 000 positions que la validation
+//!                                     finale)
 //!   --positions 600000                taille du corpus de distillation
+//!   --epoques-max 6                   plafond d'époques d'apprentissage (≥ 1 ;
+//!                                     0 est refusé)
 //!   --lr 0.001                        taux d'apprentissage Adam
 //!   --seed 0
 //!   --out models/distill_student.bin  destination de l'élève
@@ -28,8 +40,9 @@
 //!      entrecoupées de coups aléatoires (~1 sur 6) pour couvrir large ; mêmes
 //!      règles de nulle qu'en arène (pat, matériel, 50 coups, 3 répétitions,
 //!      300 plis max) ; génération parallèle rayon (with_max_len(1)) ;
-//!   2. apprentissage : mélange, minibatchs 256, jusqu'à 6 époques, arrêt
-//!      anticipé si la loss moyenne d'une époque passe sous 0.0004 ;
+//!   2. apprentissage : mélange, minibatchs 256, jusqu'à --epoques-max époques
+//!      (6 par défaut), arrêt anticipé si la loss moyenne d'une époque passe
+//!      sous 0.0004 ;
 //!   3. validation sur 20 000 positions FRAÎCHES (autres graines) : MSE
 //!      élève-vs-prof et % de positions où |élève - prof| > 0.1 ;
 //!   4. sauvegarde vers --out ; code de sortie 0 seulement si MSE < 0.002.
@@ -58,7 +71,7 @@ const TEMPERATURE_DIVERSIFICATION: f32 = 0.6;
 const RATIO_ALEA: u64 = 6;
 /// Taille des minibatchs d'apprentissage.
 const MINIBATCH: usize = 256;
-/// Nombre maximal d'époques sur le corpus.
+/// Nombre maximal d'époques sur le corpus (défaut de --epoques-max).
 const MAX_EPOQUES: usize = 6;
 /// Arrêt anticipé : loss moyenne d'époque sous ce seuil.
 const SEUIL_LOSS_EPOQUE: f32 = 0.0004;
@@ -83,6 +96,13 @@ struct Options {
     out: String,
     /// Schéma de features de l'ÉLÈVE (le prof garde le sien, lu du fichier).
     schema: SchemaFeatures,
+    /// Élève existant à recharger (re-distillation à chaud) ; None = neuf.
+    student: Option<String>,
+    /// Plafond d'époques d'apprentissage (--epoques-max).
+    epoques_max: usize,
+    /// --sizes a été fourni explicitement (permet de le confronter au fichier
+    /// --student, et à --schema roi8 d'imposer son défaut sinon).
+    sizes_explicites: bool,
 }
 
 /// Valeur suivant l'option `nom`, ou sortie propre si elle manque.
@@ -115,9 +135,10 @@ fn parse_options() -> Options {
         seed: 0,
         out: "models/distill_student.bin".to_string(),
         schema: SchemaFeatures::Classique773,
+        student: None,
+        epoques_max: MAX_EPOQUES,
+        sizes_explicites: false,
     };
-    // --sizes explicitement fourni ? (sinon, --schema roi8 impose son défaut)
-    let mut sizes_explicites = false;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -126,7 +147,7 @@ fn parse_options() -> Options {
             "--teacher" => opt.teacher = valeur(&args, i, &nom),
             "--sizes" => {
                 opt.sizes = parse_tailles(&valeur(&args, i, &nom), &nom);
-                sizes_explicites = true;
+                opt.sizes_explicites = true;
             }
             "--schema" => {
                 opt.schema = match valeur(&args, i, &nom).as_str() {
@@ -140,7 +161,17 @@ fn parse_options() -> Options {
                     }
                 }
             }
+            "--student" => opt.student = Some(valeur(&args, i, &nom)),
             "--positions" => opt.positions = parse_valeur(&valeur(&args, i, &nom), &nom),
+            "--epoques-max" => {
+                opt.epoques_max = parse_valeur(&valeur(&args, i, &nom), &nom);
+                // 0 sauterait tout l'apprentissage mais validerait et
+                // sauvegarderait quand même : refusé, sûrement involontaire.
+                if opt.epoques_max == 0 {
+                    eprintln!("option --epoques-max : 0 refuse (au moins une epoque)");
+                    std::process::exit(2);
+                }
+            }
             "--lr" => opt.lr = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--seed" => opt.seed = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--out" => opt.out = valeur(&args, i, &nom),
@@ -153,7 +184,7 @@ fn parse_options() -> Options {
     }
     // Élève roi-zones sans --sizes : même tête que le défaut historique, mais
     // couche d'entrée au format creux (6149).
-    if opt.schema == SchemaFeatures::RoiZones8 && !sizes_explicites {
+    if opt.schema == SchemaFeatures::RoiZones8 && !opt.sizes_explicites {
         opt.sizes = vec![N_FEATURES_ROI, 1024, 128, 1];
     }
     opt
@@ -300,6 +331,36 @@ fn genere_corpus(
     corpus
 }
 
+/// Passe avant de l'élève sur un corpus de validation (parallèle, lecture
+/// seule ; chemin dense ou creux selon le schéma) : renvoie (MSE
+/// élève-vs-prof, % de positions à |écart| > 0.1, nombre de ces positions).
+fn mesure_validation(eleve: &Mlp, schema: SchemaFeatures, val: &Corpus) -> (f32, f32, usize) {
+    let sorties: Vec<f32> = match schema {
+        SchemaFeatures::Classique773 => val
+            .xs
+            .par_chunks(N_FEATURES)
+            .map(|x| eleve.forward_one(x))
+            .collect(),
+        SchemaFeatures::RoiZones8 => val
+            .actifs
+            .par_iter()
+            .map(|a| eleve.forward_actifs(a))
+            .collect(),
+    };
+    let mut somme_carres = 0.0f64;
+    let mut n_gros_ecarts = 0usize;
+    for (s, t) in sorties.iter().zip(&val.ys) {
+        let e = (s - t) as f64;
+        somme_carres += e * e;
+        if (s - t).abs() > 0.1 {
+            n_gros_ecarts += 1;
+        }
+    }
+    let mse = (somme_carres / val.ys.len() as f64) as f32;
+    let pct_gros_ecarts = 100.0 * n_gros_ecarts as f32 / val.ys.len() as f32;
+    (mse, pct_gros_ecarts, n_gros_ecarts)
+}
+
 fn main() {
     echec::pleine_puissance();
     let debut = Instant::now();
@@ -334,9 +395,35 @@ fn main() {
         eprintln!("chargement du prof {} : {e}", opt.teacher);
         std::process::exit(2);
     });
-    let mut eleve = match opt.schema {
-        SchemaFeatures::Classique773 => Mlp::new_avec_tailles(&opt.sizes, opt.seed),
-        SchemaFeatures::RoiZones8 => Mlp::new_roi_zones(&opt.sizes, opt.seed),
+    // Élève : soit rechargé tel quel (re-distillation à chaud, --student —
+    // poids, moments Adam et pas_colonnes du fichier), soit créé neuf.
+    let mut eleve = match &opt.student {
+        Some(chemin) => {
+            let charge = Mlp::load(chemin).unwrap_or_else(|e| {
+                eprintln!("chargement de l'eleve {chemin} : {e}");
+                std::process::exit(2);
+            });
+            if charge.schema() != opt.schema {
+                eprintln!(
+                    "option --student : {chemin} est au schema {:?}, mais --schema demande {:?}",
+                    charge.schema(),
+                    opt.schema
+                );
+                std::process::exit(2);
+            }
+            if opt.sizes_explicites && charge.sizes != opt.sizes {
+                eprintln!(
+                    "option --student : {chemin} a les tailles {:?}, mais --sizes demande {:?}",
+                    charge.sizes, opt.sizes
+                );
+                std::process::exit(2);
+            }
+            charge
+        }
+        None => match opt.schema {
+            SchemaFeatures::Classique773 => Mlp::new_avec_tailles(&opt.sizes, opt.seed),
+            SchemaFeatures::RoiZones8 => Mlp::new_roi_zones(&opt.sizes, opt.seed),
+        },
     };
     println!(
         "distillation : prof {} {:?} (schema {:?}) -> eleve {:?} (schema {:?}) | {} positions | lr {} | graine {}",
@@ -344,11 +431,33 @@ fn main() {
         opt.positions, opt.lr, opt.seed
     );
 
+    // Ligne de base (--student) : MSE de validation de l'élève chargé, AVANT
+    // tout entraînement, sur les MÊMES 20 000 positions fraîches que la
+    // validation finale (graines identiques → corpus identique, conservé pour
+    // l'étape 4 plutôt que régénéré).
+    let mut val_precalculee: Option<Corpus> = None;
+    if opt.student.is_some() {
+        let val = genere_corpus(
+            &prof,
+            opt.schema,
+            N_VALIDATION,
+            opt.seed.wrapping_add(DECALAGE_GRAINES_VALIDATION),
+            "validation",
+        );
+        let (mse0, pct0, n0) = mesure_validation(&eleve, opt.schema, &val);
+        println!(
+            "ligne de base (eleve charge) : MSE eleve-vs-prof {mse0:.6} | |ecart| > 0.1 : {pct0:.2} % ({n0} / {})",
+            val.ys.len()
+        );
+        val_precalculee = Some(val);
+    }
+
     // 2. Corpus d'apprentissage (au schéma de l'élève).
     let corpus = genere_corpus(&prof, opt.schema, opt.positions, opt.seed, "corpus");
 
     // 3. Apprentissage : mélange des indices, minibatchs de 256, jusqu'à
-    //    6 époques, arrêt anticipé si la loss moyenne d'époque < 0.0004.
+    //    --epoques-max époques (6 par défaut), arrêt anticipé si la loss
+    //    moyenne d'époque < 0.0004.
     //    Chemin DENSE (train_batch) pour Classique773, chemin CREUX
     //    (train_batch_actifs) pour RoiZones8 — mêmes hyperparamètres.
     let n = corpus.ys.len();
@@ -358,7 +467,7 @@ fn main() {
     let mut lot_xs: Vec<f32> = Vec::with_capacity(MINIBATCH * N_FEATURES);
     let mut lot_ys: Vec<f32> = Vec::with_capacity(MINIBATCH);
     let mut epoques_faites = 0usize;
-    for epoque in 1..=MAX_EPOQUES {
+    for epoque in 1..=opt.epoques_max {
         indices.shuffle(&mut rng);
         let mut somme_loss = 0.0f64;
         let mut n_batchs = 0usize;
@@ -404,39 +513,18 @@ fn main() {
     drop(corpus);
 
     // 4. Validation : positions FRAÎCHES (graines décalées, jamais utilisées
-    //    par le corpus d'apprentissage).
-    let val = genere_corpus(
-        &prof,
-        opt.schema,
-        N_VALIDATION,
-        opt.seed.wrapping_add(DECALAGE_GRAINES_VALIDATION),
-        "validation",
-    );
-    // Passe avant de l'élève en parallèle (lecture seule, &self) : chemin
-    // dense ou creux selon son schéma.
-    let sorties: Vec<f32> = match opt.schema {
-        SchemaFeatures::Classique773 => val
-            .xs
-            .par_chunks(N_FEATURES)
-            .map(|x| eleve.forward_one(x))
-            .collect(),
-        SchemaFeatures::RoiZones8 => val
-            .actifs
-            .par_iter()
-            .map(|a| eleve.forward_actifs(a))
-            .collect(),
-    };
-    let mut somme_carres = 0.0f64;
-    let mut n_gros_ecarts = 0usize;
-    for (s, t) in sorties.iter().zip(&val.ys) {
-        let e = (s - t) as f64;
-        somme_carres += e * e;
-        if (s - t).abs() > 0.1 {
-            n_gros_ecarts += 1;
-        }
-    }
-    let mse = (somme_carres / val.ys.len() as f64) as f32;
-    let pct_gros_ecarts = 100.0 * n_gros_ecarts as f32 / val.ys.len() as f32;
+    //    par le corpus d'apprentissage) — celles de la ligne de base si elle a
+    //    eu lieu (mêmes graines), générées maintenant sinon.
+    let val = val_precalculee.take().unwrap_or_else(|| {
+        genere_corpus(
+            &prof,
+            opt.schema,
+            N_VALIDATION,
+            opt.seed.wrapping_add(DECALAGE_GRAINES_VALIDATION),
+            "validation",
+        )
+    });
+    let (mse, pct_gros_ecarts, n_gros_ecarts) = mesure_validation(&eleve, opt.schema, &val);
     println!(
         "validation : MSE eleve-vs-prof {mse:.6} | |ecart| > 0.1 : {pct_gros_ecarts:.2} % ({n_gros_ecarts} / {})",
         val.ys.len()
