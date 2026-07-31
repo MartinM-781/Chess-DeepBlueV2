@@ -31,6 +31,10 @@ path = "src/bin/distill.rs"
 name = "forensic"
 path = "src/bin/forensic.rs"
 
+[[bin]]
+name = "greffe"
+path = "src/bin/greffe.rs"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
