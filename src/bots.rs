@@ -266,7 +266,9 @@ impl<'a> Bot for NetBot<'a> {
 /// Les scores sont clampés à [-2, 2] AVANT le softmax : un score de mat
 /// (±SCORE_MAT) ne doit pas écraser la distribution — un mat « vaut » 2.
 /// Softmax stabilisé par soustraction du max. None si `scores` est vide.
-pub(crate) fn echantillonne_scores_racine(
+/// (`pub` : réutilisé par src/bin/calibration.rs pour reproduire le tirage de
+/// coups du self-play d'entraînement.)
+pub fn echantillonne_scores_racine(
     scores: &[(Move, f32)],
     temperature: f32,
     rng: &mut StdRng,

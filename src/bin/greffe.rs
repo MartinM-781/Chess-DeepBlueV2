@@ -6,15 +6,33 @@
 //! verbatim donne un réseau roi8 fonctionnellement IDENTIQUE au prof sur toute
 //! position — identité mathématique, PROUVÉE ici par une parité intégrée.
 //!
-//! Deux modes :
+//! Cinq modes :
 //!   greffe --teacher <773.bin> --out <roi8.bin>      transplantation + parité
 //!   greffe --diagnose <roi8.bin> --teacher <773.bin> MSE net-vs-prof PAR ZONE
 //!                                                    du roi du trait (autopsie
 //!                                                    des « zones-poubelle »)
+//!                                                    + moyenne/écart-type des
+//!                                                    sorties et pente de
+//!                                                    régression net ~ prof
+//!   greffe --compare <a.bin> <b.bin>                 RMS et max|a-b| par couche
+//!                                                    (poids et biais séparés)
+//!                                                    + RMS global pondéré
+//!   greffe --bruit <sigma> --depuis <src.bin> --out <dst.bin>
+//!                                                    clone de src, bruit
+//!                                                    gaussien N(0, sigma²) sur
+//!                                                    TOUS poids et biais
+//!   greffe --echelle <c> --depuis <src.bin> --out <dst.bin>
+//!                                                    clone de src, poids ET
+//!                                                    biais de la DERNIÈRE
+//!                                                    couche multipliés par c :
+//!                                                    la sortie devient
+//!                                                    tanh(c·z), monotone en la
+//!                                                    sortie d'origine (ordres
+//!                                                    rigoureusement préservés)
 //! Options communes : --positions 50000 (taille du mélange), --seed 0.
 
 use rand::rngs::StdRng;
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use shakmaty::fen::Fen;
 use shakmaty::{Chess, Color, EnPassantMode, Position};
@@ -42,6 +60,14 @@ struct Options {
     out: Option<String>,
     /// Mode diagnostic : réseau roi8 à autopsier.
     diagnose: Option<String>,
+    /// Mode comparaison : les deux réseaux à mesurer.
+    compare: Option<(String, String)>,
+    /// Mode bruit : écart-type du bruit gaussien.
+    bruit: Option<f32>,
+    /// Mode échelle : facteur multiplicatif de la dernière couche.
+    echelle: Option<f32>,
+    /// Modes bruit et échelle : réseau source à cloner.
+    depuis: Option<String>,
     positions: usize,
     seed: u64,
 }
@@ -67,6 +93,10 @@ fn parse_options() -> Options {
         teacher: "models/chess_best.bin".to_string(),
         out: None,
         diagnose: None,
+        compare: None,
+        bruit: None,
+        echelle: None,
+        depuis: None,
         positions: N_POSITIONS_DEFAUT,
         seed: 0,
     };
@@ -78,6 +108,16 @@ fn parse_options() -> Options {
             "--teacher" => opt.teacher = valeur(&args, i, &nom),
             "--out" => opt.out = Some(valeur(&args, i, &nom)),
             "--diagnose" => opt.diagnose = Some(valeur(&args, i, &nom)),
+            "--compare" => {
+                // Deux valeurs consécutives : les deux réseaux à comparer.
+                let a = valeur(&args, i, &nom);
+                let b = valeur(&args, i + 1, &nom);
+                opt.compare = Some((a, b));
+                i += 1;
+            }
+            "--bruit" => opt.bruit = Some(parse_valeur(&valeur(&args, i, &nom), &nom)),
+            "--echelle" => opt.echelle = Some(parse_valeur(&valeur(&args, i, &nom), &nom)),
+            "--depuis" => opt.depuis = Some(valeur(&args, i, &nom)),
             "--positions" => opt.positions = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--seed" => opt.seed = parse_valeur(&valeur(&args, i, &nom), &nom),
             autre => {
@@ -87,10 +127,47 @@ fn parse_options() -> Options {
         }
         i += 2;
     }
-    if opt.out.is_some() == opt.diagnose.is_some() {
+    // Exactement UN mode : greffe (--out seul), diagnostic, comparaison,
+    // bruit, échelle.
+    let n_modes = [
+        opt.out.is_some() && opt.bruit.is_none() && opt.echelle.is_none(),
+        opt.diagnose.is_some(),
+        opt.compare.is_some(),
+        opt.bruit.is_some(),
+        opt.echelle.is_some(),
+    ]
+    .iter()
+    .filter(|&&m| m)
+    .count();
+    if n_modes != 1 {
         eprintln!("usage : greffe --teacher <773.bin> --out <roi8.bin>");
         eprintln!("        greffe --diagnose <roi8.bin> --teacher <773.bin>");
-        eprintln!("(exactement UN des deux modes --out / --diagnose)");
+        eprintln!("        greffe --compare <a.bin> <b.bin>");
+        eprintln!("        greffe --bruit <sigma> --depuis <src.bin> --out <dst.bin>");
+        eprintln!("        greffe --echelle <c> --depuis <src.bin> --out <dst.bin>");
+        eprintln!("(exactement UN mode)");
+        std::process::exit(2);
+    }
+    if let Some(sigma) = opt.bruit {
+        if !(sigma > 0.0) || !sigma.is_finite() {
+            eprintln!("option --bruit : sigma doit etre fini et > 0 (recu {sigma})");
+            std::process::exit(2);
+        }
+        if opt.depuis.is_none() || opt.out.is_none() {
+            eprintln!("mode --bruit : --depuis <src.bin> et --out <dst.bin> obligatoires");
+            std::process::exit(2);
+        }
+    } else if let Some(c) = opt.echelle {
+        if !(c > 0.0) || !c.is_finite() {
+            eprintln!("option --echelle : c doit etre fini et > 0 (recu {c})");
+            std::process::exit(2);
+        }
+        if opt.depuis.is_none() || opt.out.is_none() {
+            eprintln!("mode --echelle : --depuis <src.bin> et --out <dst.bin> obligatoires");
+            std::process::exit(2);
+        }
+    } else if opt.depuis.is_some() {
+        eprintln!("option --depuis : reservee aux modes --bruit et --echelle");
         std::process::exit(2);
     }
     if opt.positions == 0 {
@@ -354,6 +431,23 @@ fn mode_diagnose(opt: &Options, prof: &Mlp, chemin_net: &str) -> i32 {
     let positions = positions_melange(opt.positions, opt.seed);
     let (y_prof, y_net) = evaluations(prof, &net, &positions);
 
+    // Statistiques d'échelle : moyenne et écart-type des sorties des deux
+    // réseaux, puis pente de régression linéaire y_net ~ y_prof (la « dérive
+    // d'échelle » mesurée : cov(prof, net) / var(prof)).
+    let (m_prof, s_prof) = moyenne_ecart_type(&y_prof);
+    let (m_net, s_net) = moyenne_ecart_type(&y_net);
+    let mut cov = 0.0f64;
+    let mut var = 0.0f64;
+    for (p, n) in y_prof.iter().zip(&y_net) {
+        let dp = *p as f64 - m_prof;
+        cov += dp * (*n as f64 - m_net);
+        var += dp * dp;
+    }
+    let pente = cov / var;
+    println!("sorties prof : moyenne = {m_prof:+.6} | ecart-type = {s_prof:.6}");
+    println!("sorties net  : moyenne = {m_net:+.6} | ecart-type = {s_net:.6}");
+    println!("pente de regression net ~ prof (derive d'echelle) : {pente:.6}");
+
     // Ventilation par zone du roi du trait : n, somme des carrés, gros écarts.
     let mut n_zone = [0usize; N_ZONES_ROI];
     let mut somme_carres = [0.0f64; N_ZONES_ROI];
@@ -391,9 +485,186 @@ fn mode_diagnose(opt: &Options, prof: &Mlp, chemin_net: &str) -> i32 {
     0
 }
 
+/// Moyenne et écart-type (population) d'un vecteur de sorties.
+fn moyenne_ecart_type(y: &[f32]) -> (f64, f64) {
+    let n = y.len() as f64;
+    let moyenne = y.iter().map(|&v| v as f64).sum::<f64>() / n;
+    let variance = y.iter().map(|&v| (v as f64 - moyenne).powi(2)).sum::<f64>() / n;
+    (moyenne, variance.sqrt())
+}
+
+/// RMS et max|d| d'un vecteur de différences a-b.
+fn rms_max(a: &[f32], b: &[f32]) -> (f64, f64) {
+    let mut somme_carres = 0.0f64;
+    let mut max = 0.0f64;
+    for (x, y) in a.iter().zip(b) {
+        let d = (*x as f64) - (*y as f64);
+        somme_carres += d * d;
+        max = max.max(d.abs());
+    }
+    (somme_carres / a.len() as f64, max) // somme/n : la racine est prise par l'appelant
+}
+
+/// Comparaison paramètre à paramètre de deux réseaux : RMS(a-b) et max|a-b|
+/// par couche (poids et biais séparés), puis RMS global pondéré par le nombre
+/// de paramètres. L'outil de mesure du déplacement infligé par l'entraînement.
+fn mode_compare(chemin_a: &str, chemin_b: &str) -> i32 {
+    let a = match Mlp::load(chemin_a) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("chargement de {chemin_a} : {e}");
+            return 2;
+        }
+    };
+    let b = match Mlp::load(chemin_b) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("chargement de {chemin_b} : {e}");
+            return 2;
+        }
+    };
+    if a.sizes != b.sizes {
+        eprintln!(
+            "--compare : architectures incompatibles ({:?} vs {:?}), comparaison refusee",
+            a.sizes, b.sizes
+        );
+        return 2;
+    }
+    println!("compare : {chemin_a} vs {chemin_b} | architecture {:?}", a.sizes);
+
+    let mut somme_carres_glob = 0.0f64;
+    let mut n_glob = 0usize;
+    let mut max_glob = 0.0f64;
+    for l in 0..a.weights.len() {
+        let (mc_w, max_w) = rms_max(&a.weights[l], &b.weights[l]);
+        let (mc_b, max_b) = rms_max(&a.biases[l], &b.biases[l]);
+        println!(
+            "couche {l} poids ({:>9} params) : RMS = {:.6e} | max|diff| = {:.6e}",
+            a.weights[l].len(),
+            mc_w.sqrt(),
+            max_w
+        );
+        println!(
+            "couche {l} biais ({:>9} params) : RMS = {:.6e} | max|diff| = {:.6e}",
+            a.biases[l].len(),
+            mc_b.sqrt(),
+            max_b
+        );
+        somme_carres_glob += mc_w * a.weights[l].len() as f64 + mc_b * a.biases[l].len() as f64;
+        n_glob += a.weights[l].len() + a.biases[l].len();
+        max_glob = max_glob.max(max_w).max(max_b);
+    }
+    println!(
+        "global ({n_glob} params) : RMS pondere = {:.6e} | max|diff| = {max_glob:.6e}",
+        (somme_carres_glob / n_glob as f64).sqrt()
+    );
+    0
+}
+
+/// Tirage gaussien N(0, 1) par Box-Muller (rand 0.8 n'embarque pas de normale).
+fn gaussien(rng: &mut StdRng) -> f64 {
+    let u1: f64 = 1.0 - rng.gen::<f64>(); // dans (0, 1] : ln(u1) est fini
+    let u2: f64 = rng.gen();
+    (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+}
+
+/// Clone de src avec bruit gaussien N(0, sigma²) ajouté à TOUS les poids et
+/// biais — zéro entraînement, zéro direction : le perturbateur pur de la
+/// théorie de l'aiguille. Moments Adam, steps et pas_colonnes copiés tels
+/// quels. Refuse d'écraser un fichier existant.
+fn mode_bruit(sigma: f32, chemin_src: &str, chemin_dst: &str, graine: u64) -> i32 {
+    if std::path::Path::new(chemin_dst).exists() {
+        eprintln!("--out {chemin_dst} : le fichier existe deja, bruit refuse (jamais d'ecrasement)");
+        return 2;
+    }
+    let mut net = match Mlp::load(chemin_src) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("chargement de {chemin_src} : {e}");
+            return 2;
+        }
+    };
+
+    let mut rng = StdRng::seed_from_u64(graine);
+    let mut n_perturbes = 0usize;
+    for w in net.weights.iter_mut().chain(net.biases.iter_mut()) {
+        for x in w.iter_mut() {
+            *x += (sigma as f64 * gaussien(&mut rng)) as f32;
+            n_perturbes += 1;
+        }
+    }
+
+    if let Err(e) = net.save(chemin_dst) {
+        eprintln!("sauvegarde de {chemin_dst} : {e}");
+        return 2;
+    }
+    println!(
+        "bruit : {chemin_src} + N(0, {sigma}^2) sur {n_perturbes} parametres \
+         (graine {graine}) -> {chemin_dst}"
+    );
+    0
+}
+
+/// Clone de src dont la DERNIÈRE couche (poids ET biais) est multipliée par c :
+/// la pré-activation de sortie devient c·z, la sortie tanh(c·z) — strictement
+/// monotone en la sortie d'origine, l'ordre des évaluations est rigoureusement
+/// préservé. Seule l'ÉCHELLE change : le testeur de la théorie des marges
+/// fixes de la recherche. Moments Adam, steps et pas_colonnes copiés tels
+/// quels. Refuse d'écraser un fichier existant.
+fn mode_echelle(c: f32, chemin_src: &str, chemin_dst: &str) -> i32 {
+    if std::path::Path::new(chemin_dst).exists() {
+        eprintln!(
+            "--out {chemin_dst} : le fichier existe deja, echelle refusee (jamais d'ecrasement)"
+        );
+        return 2;
+    }
+    let mut net = match Mlp::load(chemin_src) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("chargement de {chemin_src} : {e}");
+            return 2;
+        }
+    };
+
+    let w_dernier = net.weights.last_mut().expect("reseau non vide");
+    for x in w_dernier.iter_mut() {
+        *x *= c;
+    }
+    let b_dernier = net.biases.last_mut().expect("reseau non vide");
+    for x in b_dernier.iter_mut() {
+        *x *= c;
+    }
+    let n_modifies = w_dernier.len() + b_dernier.len();
+
+    if let Err(e) = net.save(chemin_dst) {
+        eprintln!("sauvegarde de {chemin_dst} : {e}");
+        return 2;
+    }
+    println!(
+        "echelle : {chemin_src} x {c} sur la derniere couche ({n_modifies} parametres) \
+         -> {chemin_dst}"
+    );
+    0
+}
+
 fn main() {
     echec::pleine_puissance();
     let opt = parse_options();
+
+    // Modes autonomes (sans prof) : comparaison et bruit.
+    if let Some((a, b)) = &opt.compare {
+        std::process::exit(mode_compare(a, b));
+    }
+    if let Some(sigma) = opt.bruit {
+        let src = opt.depuis.as_ref().expect("mode bruit : --depuis verifie au parse");
+        let dst = opt.out.as_ref().expect("mode bruit : --out verifie au parse");
+        std::process::exit(mode_bruit(sigma, src, dst, opt.seed));
+    }
+    if let Some(c) = opt.echelle {
+        let src = opt.depuis.as_ref().expect("mode echelle : --depuis verifie au parse");
+        let dst = opt.out.as_ref().expect("mode echelle : --out verifie au parse");
+        std::process::exit(mode_echelle(c, src, dst));
+    }
 
     let prof = Mlp::load(&opt.teacher).unwrap_or_else(|e| {
         eprintln!("chargement du prof {} : {e}", opt.teacher);

@@ -189,6 +189,102 @@ impl Default for OptionsRecherche {
     }
 }
 
+/// Table de recalibrage FIGÉE label → sortie du réseau (produite par
+/// calibration.exe --fit) : g monotone croissante, appliquée par interpolation
+/// linéaire UNIQUEMENT à l'étiquette oracle au moment de fabriquer la CIBLE
+/// d'entraînement. Point de contrat : l'ARBITRAGE des parties et toute logique
+/// de décision continuent d'utiliser l'étiquette BRUTE — g ne touche que les
+/// cibles d'apprentissage. Vertu d'une table figée : l'échelle du réseau reste
+/// stable pour toujours, le gradient ne transporte plus que de l'information
+/// d'ordre.
+pub struct Recalibrage {
+    /// Nœuds (label, v), les DEUX colonnes strictement croissantes.
+    noeuds: Vec<(f32, f32)>,
+}
+
+impl Recalibrage {
+    /// Construit la table depuis des nœuds déjà en mémoire, en vérifiant la
+    /// monotonie croissante STRICTE des deux colonnes (message clair sinon).
+    pub fn depuis_noeuds(noeuds: Vec<(f32, f32)>) -> Result<Recalibrage, String> {
+        if noeuds.len() < 2 {
+            return Err(format!("au moins 2 noeuds attendus ({} lus)", noeuds.len()));
+        }
+        for k in 1..noeuds.len() {
+            let (l0, v0) = noeuds[k - 1];
+            let (l1, v1) = noeuds[k];
+            if !(l1 > l0 && v1 > v0) {
+                return Err(format!(
+                    "monotonie croissante stricte violee au noeud {} : \
+                     label {l0} -> {l1}, v {v0} -> {v1}",
+                    k + 1
+                ));
+            }
+            if !(l1.is_finite() && v1.is_finite() && l0.is_finite() && v0.is_finite()) {
+                return Err(format!("valeur non finie au noeud {}", k + 1));
+            }
+        }
+        Ok(Recalibrage { noeuds })
+    }
+
+    /// Charge un TSV « label<TAB>v » (une ligne par nœud, lignes vides et
+    /// commentaires « # » ignorés), puis vérifie la monotonie stricte.
+    pub fn charge(chemin: &str) -> Result<Recalibrage, String> {
+        let texte = std::fs::read_to_string(chemin)
+            .map_err(|e| format!("lecture impossible : {e}"))?;
+        let mut noeuds: Vec<(f32, f32)> = Vec::new();
+        for (i, ligne) in texte.lines().enumerate() {
+            let l = ligne.trim();
+            if l.is_empty() || l.starts_with('#') {
+                continue;
+            }
+            let mut champs = l.split('\t');
+            let (a, b) = match (champs.next(), champs.next()) {
+                (Some(a), Some(b)) => (a, b),
+                _ => {
+                    return Err(format!(
+                        "ligne {} : deux colonnes label<TAB>v attendues",
+                        i + 1
+                    ))
+                }
+            };
+            let label: f32 = a.trim().parse().map_err(|_| {
+                format!("ligne {} : label invalide « {a} »", i + 1)
+            })?;
+            let v: f32 = b.trim().parse().map_err(|_| {
+                format!("ligne {} : v invalide « {b} »", i + 1)
+            })?;
+            noeuds.push((label, v));
+        }
+        Recalibrage::depuis_noeuds(noeuds)
+    }
+
+    /// g(label) par interpolation linéaire entre les nœuds (constante au-delà
+    /// des bornes — la table couvre [-1, 1] en pratique).
+    pub fn applique(&self, label: f32) -> f32 {
+        let n = &self.noeuds;
+        if label <= n[0].0 {
+            return n[0].1;
+        }
+        if label >= n[n.len() - 1].0 {
+            return n[n.len() - 1].1;
+        }
+        let i = n.partition_point(|&(x, _)| x <= label);
+        let (x0, y0) = n[i - 1];
+        let (x1, y1) = n[i];
+        y0 + (y1 - y0) * (label - x0) / (x1 - x0)
+    }
+
+    /// Nombre de nœuds de la table.
+    pub fn len(&self) -> usize {
+        self.noeuds.len()
+    }
+
+    /// Premier et dernier nœud ((label, v) chacun), pour l'annonce d'en-tête.
+    pub fn bornes(&self) -> ((f32, f32), (f32, f32)) {
+        (self.noeuds[0], self.noeuds[self.noeuds.len() - 1])
+    }
+}
+
 /// Cibles TD-leaf : zs[i] = lambda·z_final_i + (1-lambda)·v_racine_i, où
 /// z_final_i est le résultat final vu du TRAIT de la position i (comme avant)
 /// et v_racine_i le score racine de la recherche depuis cette position
@@ -222,7 +318,7 @@ pub fn play_training_game_recherche(
     opts: &OptionsRecherche,
 ) -> GameRecord {
     partie_recherche_interne(recherche, Etiqueteur::Aucun, Chess::default(),
-                             opts.plis_ouverture, None, seed, opts)
+                             opts.plis_ouverture, None, seed, opts, None)
 }
 
 /// Comme `play_training_game_recherche`, mais la partie démarre de
@@ -238,7 +334,7 @@ pub fn play_training_game_recherche_depuis(
     opts: &OptionsRecherche,
 ) -> GameRecord {
     partie_recherche_interne(recherche, Etiqueteur::Aucun, depart.pos.clone(),
-                             depart.plis_chauds, Some(depart.etiquette), seed, opts)
+                             depart.plis_chauds, Some(depart.etiquette), seed, opts, None)
 }
 
 /// Partie de self-play MENTORÉE — remède à la chambre d'écho du TD
@@ -258,7 +354,7 @@ pub fn play_training_game_mentor(
     opts: &OptionsRecherche,
 ) -> GameRecord {
     partie_recherche_interne(eleve, Etiqueteur::Prof(prof), Chess::default(),
-                             opts.plis_ouverture, None, seed, opts)
+                             opts.plis_ouverture, None, seed, opts, None)
 }
 
 /// Comme `play_training_game_mentor`, mais depuis `depart.pos` avec
@@ -271,7 +367,7 @@ pub fn play_training_game_mentor_depuis(
     opts: &OptionsRecherche,
 ) -> GameRecord {
     partie_recherche_interne(eleve, Etiqueteur::Prof(prof), depart.pos.clone(),
-                             depart.plis_chauds, Some(depart.etiquette), seed, opts)
+                             depart.plis_chauds, Some(depart.etiquette), seed, opts, None)
 }
 
 /// Partie de self-play ORACLE — même déroulé que le mentorat (l'élève choisit
@@ -286,14 +382,18 @@ pub fn play_training_game_mentor_depuis(
 /// mort ou FIGÉ au-delà de l'échéance de lecture — voir uci.rs —, ligne
 /// imparsable) : repli silencieux sur le score de l'élève pour
 /// CETTE position — la partie continue, jamais de panique.
+/// `recalibrage` (Some = table g de calibration.exe --fit) ne transforme que
+/// l'étiquette oracle ENTRANT DANS LES CIBLES d'entraînement — l'arbitrage
+/// reste sur l'étiquette brute ; None = strictement aucun changement.
 pub fn play_training_game_oracle(
     chercheur: &mut search::Recherche,
     oracle: &mut UciEngine,
     seed: u64,
     opts: &OptionsRecherche,
+    recalibrage: Option<&Recalibrage>,
 ) -> GameRecord {
     partie_recherche_interne(chercheur, Etiqueteur::Oracle(oracle), Chess::default(),
-                             opts.plis_ouverture, None, seed, opts)
+                             opts.plis_ouverture, None, seed, opts, recalibrage)
 }
 
 /// Comme `play_training_game_oracle`, mais depuis `depart.pos` avec
@@ -304,9 +404,10 @@ pub fn play_training_game_oracle_depuis(
     depart: &crate::departs::Depart,
     seed: u64,
     opts: &OptionsRecherche,
+    recalibrage: Option<&Recalibrage>,
 ) -> GameRecord {
     partie_recherche_interne(chercheur, Etiqueteur::Oracle(oracle), depart.pos.clone(),
-                             depart.plis_chauds, Some(depart.etiquette), seed, opts)
+                             depart.plis_chauds, Some(depart.etiquette), seed, opts, recalibrage)
 }
 
 /// « Qui étiquette » les positions du self-play piloté par la recherche : la
@@ -344,6 +445,7 @@ fn partie_recherche_interne(
     etiquette_depart: Option<&str>,
     seed: u64,
     opts: &OptionsRecherche,
+    recalibrage: Option<&Recalibrage>,
 ) -> GameRecord {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut pos = pos_depart;
@@ -424,9 +526,14 @@ fn partie_recherche_interne(
         let res = chercheur.cherche(&pos, limites);
         // v_racine mémorisé : valeur de l'ÉTIQUETEUR sur la position COURANTE
         // (aucun décalage : v_racines[i] ↔ position i AVANT le coup i), du
-        // chercheur lui-même sans étiqueteur.
-        let v_racine = match &mut etiqueteur {
-            Etiqueteur::Aucun => res.score.clamp(-1.0, 1.0),
+        // chercheur lui-même sans étiqueteur. v_cible = valeur qui entre dans
+        // les CIBLES d'entraînement : identique à v_racine, sauf recalibrage
+        // actif en branche oracle (g appliquée à l'étiquette seule).
+        let (v_racine, v_cible) = match &mut etiqueteur {
+            Etiqueteur::Aucun => {
+                let v = res.score.clamp(-1.0, 1.0);
+                (v, v)
+            }
             // Mentorat : mélange prof/élève selon poids_prof (1.0 = prof pur,
             // comportement historique). Les deux scores sont du point de vue
             // du MÊME trait sur la MÊME position : le mélange est légitime.
@@ -434,7 +541,8 @@ fn partie_recherche_interne(
             Etiqueteur::Prof(p) => {
                 let v_prof = p.cherche(&pos, limites).score.clamp(-1.0, 1.0);
                 let v_eleve = res.score.clamp(-1.0, 1.0);
-                opts.poids_prof * v_prof + (1.0 - opts.poids_prof) * v_eleve
+                let v = opts.poids_prof * v_prof + (1.0 - opts.poids_prof) * v_eleve;
+                (v, v)
             }
             // Oracle : évaluation du moteur externe sur la MÊME position (FEN
             // mode Legal, comme partout). Convention UCI = score du point de
@@ -443,14 +551,25 @@ fn partie_recherche_interne(
             // (tanh(cp/300) ou ±1 sur les mats) ; poids_prof mélange
             // oracle/élève comme en mentorat. Moteur muet/mort → repli sur le
             // score de l'élève pour CETTE position, la partie CONTINUE.
+            // Recalibrage : g ne transforme l'étiquette oracle QUE dans la
+            // valeur destinée aux cibles — l'arbitrage (et le direct) restent
+            // sur l'étiquette brute, c'est un point de contrat.
             Etiqueteur::Oracle(o) => {
                 let fen = Fen::from_position(pos.clone(), EnPassantMode::Legal).to_string();
                 let v_eleve = res.score.clamp(-1.0, 1.0);
                 match o.evalue_fen(&fen) {
                     Some(v_oracle) => {
-                        opts.poids_prof * v_oracle + (1.0 - opts.poids_prof) * v_eleve
+                        let brut = opts.poids_prof * v_oracle + (1.0 - opts.poids_prof) * v_eleve;
+                        let cible = match recalibrage {
+                            Some(g) => {
+                                opts.poids_prof * g.applique(v_oracle)
+                                    + (1.0 - opts.poids_prof) * v_eleve
+                            }
+                            None => brut,
+                        };
+                        (brut, cible)
                     }
-                    None => v_eleve,
+                    None => (v_eleve, v_eleve),
                 }
             }
         };
@@ -469,7 +588,8 @@ fn partie_recherche_interne(
         // Enregistre la position AVANT le coup, du point de vue du trait.
         enregistre_position(schema, &pos, &mut xs, &mut actifs, &mut buf);
         camps.push(pos.turn());
-        v_racines.push(v_racine);
+        // C'est v_cible (recalibrée le cas échéant) qui entre dans les zs.
+        v_racines.push(v_cible);
 
         // Arbitrage : v_racine est du point de vue du trait, qui ALTERNE —
         // converti en « avantage blancs » avant de compter les plis consécutifs.
@@ -648,6 +768,29 @@ mod tests {
         assert!(rec.zs.iter().all(|z| z.is_finite() && z.abs() <= 1.0 + 1e-6));
     }
 
+    /// Recalibrage : monotonie stricte exigée, interpolation linéaire exacte
+    /// entre les nœuds, prolongement constant hors bornes.
+    #[test]
+    fn recalibrage_interpolation_et_monotonie() {
+        // Table valide : g(-1)=-1, g(0)=-0.1, g(1)=0.9.
+        let g = Recalibrage::depuis_noeuds(vec![(-1.0, -1.0), (0.0, -0.1), (1.0, 0.9)])
+            .expect("table valide");
+        assert_eq!(g.len(), 3);
+        assert!((g.applique(0.0) + 0.1).abs() < 1e-6);
+        // Milieu du premier segment : (-1 + -0.1)/2 = -0.55.
+        assert!((g.applique(-0.5) + 0.55).abs() < 1e-6);
+        // Milieu du second : (-0.1 + 0.9)/2 = 0.4.
+        assert!((g.applique(0.5) - 0.4).abs() < 1e-6);
+        // Hors bornes : prolongement constant.
+        assert_eq!(g.applique(-2.0), -1.0);
+        assert_eq!(g.applique(2.0), 0.9);
+        // Monotonie violée (v égaux) : refusée avec un message clair.
+        let err = Recalibrage::depuis_noeuds(vec![(-1.0, 0.0), (0.0, 0.0)]);
+        assert!(err.is_err());
+        // Moins de 2 nœuds : refusé.
+        assert!(Recalibrage::depuis_noeuds(vec![(0.0, 0.0)]).is_err());
+    }
+
     /// L'arbitrage raccourcit significativement les parties à fort
     /// déséquilibre : longueur moyenne avec/sans arbitrage sur 5 parties,
     /// graine fixe (seuil abaissé pour déclencher avec un réseau non entraîné).
@@ -705,7 +848,7 @@ mod tests {
         .expect("lancement de l'oracle");
         let mut opts = OptionsRecherche::default();
         opts.nodes_par_coup = 300;
-        let rec = play_training_game_oracle(&mut eleve, &mut oracle, 7, &opts);
+        let rec = play_training_game_oracle(&mut eleve, &mut oracle, 7, &opts, None);
         assert!(rec.plies > 0 && rec.plies <= opts.max_plies,
                 "nombre de plis aberrant : {}", rec.plies);
         assert_eq!(rec.xs.len(), rec.zs.len() * N_FEATURES);

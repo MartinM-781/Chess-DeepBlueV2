@@ -35,6 +35,10 @@ path = "src/bin/forensic.rs"
 name = "greffe"
 path = "src/bin/greffe.rs"
 
+[[bin]]
+name = "calibration"
+path = "src/bin/calibration.rs"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

@@ -718,6 +718,45 @@ impl Mlp {
         loss
     }
 
+    /// Rappel élastique DÉCOUPLÉ (style AdamW) vers un réseau de référence :
+    /// pour chaque poids et biais, theta -= taux * (theta - theta_ref).
+    ///
+    /// À appeler APRÈS le pas Adam, JAMAIS via les gradients : passé dans les
+    /// gradients, Adam normaliserait le rappel (division par sqrt(v)) et le
+    /// dénaturerait. Ici le rappel s'applique directement aux poids, comme la
+    /// weight decay découplée d'AdamW. Les moments Adam, `steps` et
+    /// `pas_colonnes` ne sont PAS touchés.
+    pub fn rappel_vers(&mut self, reference: &Mlp, taux: f32) {
+        assert_eq!(
+            self.sizes, reference.sizes,
+            "rappel_vers: architectures incompatibles ({:?} vs référence {:?})",
+            self.sizes, reference.sizes
+        );
+        // Redondance volontaire : schema() étant dérivé de sizes[0], cet
+        // assert est aujourd'hui inatteignable après celui des tailles — il
+        // documente le contrat et survivrait à un schéma devenu indépendant.
+        assert_eq!(
+            self.schema(),
+            reference.schema(),
+            "rappel_vers: schémas incompatibles ({:?} vs référence {:?})",
+            self.schema(),
+            reference.schema()
+        );
+        // ~7M d'éléments sur le réseau nominal : rayon sur chaque couche de
+        // poids (la première concentre l'essentiel), biais en séquentiel
+        // (négligeable). Coût très inférieur à un minibatch.
+        for (w, w_ref) in self.weights.iter_mut().zip(&reference.weights) {
+            w.par_iter_mut()
+                .zip(w_ref.par_iter())
+                .for_each(|(t, &r)| *t -= taux * (*t - r));
+        }
+        for (b, b_ref) in self.biases.iter_mut().zip(&reference.biases) {
+            for (t, &r) in b.iter_mut().zip(b_ref) {
+                *t -= taux * (*t - r);
+            }
+        }
+    }
+
     /// Sérialisation binaire, format v3 : magic "ECHECNN3", puis le layout v2
     /// À L'IDENTIQUE (sizes, octet de schéma, steps, poids, biais, moments),
     /// SUIVI des compteurs `pas_colonnes` (u64 LE × sizes[0]) en fin de
@@ -991,6 +1030,71 @@ mod tests {
         assert_eq!(relu.adam_mb, net.adam_mb);
         assert_eq!(relu.adam_vb, net.adam_vb);
         assert_eq!(relu.pas_colonnes, net.pas_colonnes);
+    }
+
+    #[test]
+    fn rappel_vers_interpole_sans_toucher_l_optimiseur() {
+        // Deux réseaux distincts de même architecture ; un pas dense puis un
+        // pas creux rendent moments, steps ET pas_colonnes non triviaux avant
+        // le rappel (train_batch seul laisserait pas_colonnes à zéro et
+        // l'invariance serait vérifiée à vide).
+        let reference = Mlp::avec_tailles(vec![4, 6, 1], 9);
+        let mut net = Mlp::avec_tailles(vec![4, 6, 1], 3);
+        let xs: Vec<f32> = (0..2 * 4).map(|i| (i as f32 * 0.31).cos()).collect();
+        net.train_batch(&xs, &[0.3, -0.3], 1e-3);
+        net.train_batch_actifs(&[(vec![0u16, 2], 0.4), (vec![1u16, 3], -0.4)], 1e-3);
+        assert!(
+            net.pas_colonnes.iter().any(|&t| t > 0),
+            "précondition : pas_colonnes doit être non trivial pour tester son invariance"
+        );
+
+        let poids_avant = net.weights.clone();
+        let biais_avant = net.biases.clone();
+        let mw = net.adam_mw.clone();
+        let vw = net.adam_vw.clone();
+        let mb = net.adam_mb.clone();
+        let vb = net.adam_vb.clone();
+        let steps = net.steps;
+        let pas = net.pas_colonnes.clone();
+
+        // Taux 0 : strictement rien ne bouge.
+        net.rappel_vers(&reference, 0.0);
+        assert_eq!(net.weights, poids_avant);
+        assert_eq!(net.biases, biais_avant);
+
+        // Taux 0,5 : point milieu entre le réseau et la référence.
+        net.rappel_vers(&reference, 0.5);
+        for l in 0..net.weights.len() {
+            for (i, &t) in net.weights[l].iter().enumerate() {
+                let milieu = 0.5 * (poids_avant[l][i] + reference.weights[l][i]);
+                assert!((t - milieu).abs() < 1e-6, "poids[{l}][{i}] : {t} vs {milieu}");
+            }
+            for (i, &t) in net.biases[l].iter().enumerate() {
+                let milieu = 0.5 * (biais_avant[l][i] + reference.biases[l][i]);
+                assert!((t - milieu).abs() < 1e-6, "biais[{l}][{i}] : {t} vs {milieu}");
+            }
+        }
+
+        // Taux 1 : le réseau devient la référence (à l'arrondi f32 près).
+        net.rappel_vers(&reference, 1.0);
+        for l in 0..net.weights.len() {
+            for (i, &t) in net.weights[l].iter().enumerate() {
+                let r = reference.weights[l][i];
+                assert!((t - r).abs() < 1e-6, "poids[{l}][{i}] : {t} vs {r}");
+            }
+            for (i, &t) in net.biases[l].iter().enumerate() {
+                let r = reference.biases[l][i];
+                assert!((t - r).abs() < 1e-6, "biais[{l}][{i}] : {t} vs {r}");
+            }
+        }
+
+        // L'état de l'optimiseur n'a jamais bougé.
+        assert_eq!(net.adam_mw, mw);
+        assert_eq!(net.adam_vw, vw);
+        assert_eq!(net.adam_mb, mb);
+        assert_eq!(net.adam_vb, vb);
+        assert_eq!(net.steps, steps);
+        assert_eq!(net.pas_colonnes, pas);
     }
 
     #[test]

@@ -54,6 +54,24 @@
 //!                         identique à avant ; l'activation des départs variés
 //!                         est un opt-in EXPLICITE par flags (valeurs
 //!                         conseillées : 0.6 et 0.2)
+//!   --ancre ""            chemin d'un réseau de RÉFÉRENCE figé : rappel
+//!                         élastique DÉCOUPLÉ (style AdamW) appliqué APRÈS
+//!                         chaque minibatch (frais ET rejeu) —
+//!                         theta -= lr·lambda·(theta - theta_ref). Contient la
+//!                         dérive le long des directions plates de l'objectif
+//!                         (vide = désactivé, strictement aucun changement)
+//!   --ancre-lambda 5.0    intensité du rappel (taux effectif = lr × lambda) ;
+//!                         demi-vie d'une dérive non soutenue :
+//!                         ln2/(lr·lambda) minibatchs
+//!   --recalibrage ""      chemin d'une table FIGÉE label<TAB>v (TSV produit
+//!                         par calibration.exe --fit, deux colonnes strictement
+//!                         croissantes) : en branche ORACLE, la cible
+//!                         d'entraînement vise g(étiquette) au lieu de
+//!                         l'étiquette (interpolation linéaire) — le gradient
+//!                         cesse de recalibrer l'échelle du réseau et ne
+//!                         transporte plus que de l'information d'ordre.
+//!                         L'ARBITRAGE reste sur l'étiquette BRUTE (point de
+//!                         contrat). Vide = strictement aucun changement
 //!
 //! Régime « recherche » (search_nodes > 0) :
 //!   - self-play via selfplay::play_training_game_recherche (un chercheur par
@@ -172,6 +190,9 @@ struct Options {
     oracle_movetime: u32,
     departs_ouvertures: f32,
     departs_finales: f32,
+    ancre: String,
+    ancre_lambda: f32,
+    recalibrage: String,
 }
 
 /// Tampon de rejeu DENSE (schéma Classique773) : anneau de positions encodées
@@ -304,6 +325,9 @@ fn parse_options() -> Options {
         oracle_movetime: 15,
         departs_ouvertures: 0.0,
         departs_finales: 0.0,
+        ancre: String::new(),
+        ancre_lambda: 5.0,
+        recalibrage: String::new(),
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -340,6 +364,11 @@ fn parse_options() -> Options {
             "--departs-finales" => {
                 opt.departs_finales = parse_valeur(&valeur(&args, i, &nom), &nom)
             }
+            "--ancre" => opt.ancre = valeur(&args, i, &nom),
+            "--ancre-lambda" => {
+                opt.ancre_lambda = parse_valeur(&valeur(&args, i, &nom), &nom)
+            }
+            "--recalibrage" => opt.recalibrage = valeur(&args, i, &nom),
             _ => {
                 eprintln!("option inconnue : {nom}");
                 eprintln!(
@@ -347,7 +376,8 @@ fn parse_options() -> Options {
                      --eval-games --replay --elo-every --elo-games --seed \
                      --search-nodes --td-lambda --gate-every --gate-games --mentor \
                      --mentor-poids --oracle --oracle-movetime \
-                     --departs-ouvertures --departs-finales"
+                     --departs-ouvertures --departs-finales --ancre --ancre-lambda \
+                     --recalibrage"
                 );
                 std::process::exit(2);
             }
@@ -643,6 +673,39 @@ fn main() {
             opt.seed, net.sizes, schema
         );
     }
+    // Ancre élastique : réseau de RÉFÉRENCE figé, chargé une fois et jamais
+    // modifié. Après CHAQUE minibatch (frais et rejeu), rappel découplé
+    // net.rappel_vers(ancre, lr × lambda) — voir Mlp::rappel_vers. Sans
+    // --ancre : strictement aucun changement de comportement.
+    let ancre: Option<Mlp> = if !opt.ancre.is_empty() {
+        match Mlp::load(&opt.ancre) {
+            Ok(a) => {
+                if a.sizes != net.sizes || a.schema() != schema {
+                    eprintln!(
+                        "--ancre {} : architecture {:?} / schema {:?} incompatibles \
+                         avec le reseau d'entrainement ({:?} / {:?})",
+                        opt.ancre,
+                        a.sizes,
+                        a.schema(),
+                        net.sizes,
+                        schema
+                    );
+                    std::process::exit(2);
+                }
+                println!(
+                    "ancre elastique : {} (lambda {}, rappel lr*lambda apres chaque minibatch)",
+                    opt.ancre, opt.ancre_lambda
+                );
+                Some(a)
+            }
+            Err(e) => {
+                eprintln!("--ancre {} : chargement impossible ({e})", opt.ancre);
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
     // Mentor (régime recherche uniquement) : réseau FIGÉ chargé une fois au
     // démarrage, dont la recherche étiquette les positions du self-play
     // pendant que l'élève choisit les coups (anti chambre d'écho). Arc
@@ -695,6 +758,38 @@ fn main() {
             }
             None
         };
+    // Recalibrage des étiquettes oracle : table FIGÉE label → v (TSV de
+    // calibration.exe --fit), chargée UNE FOIS au démarrage et jamais
+    // modifiée. En branche oracle, la cible d'entraînement vise g(étiquette)
+    // au lieu de l'étiquette — l'arbitrage reste sur l'étiquette brute (voir
+    // selfplay::Recalibrage). Sans --recalibrage : strictement aucun
+    // changement.
+    let recalibrage: Option<selfplay::Recalibrage> = if !opt.recalibrage.is_empty() {
+        match selfplay::Recalibrage::charge(&opt.recalibrage) {
+            Ok(table) => {
+                let ((l_min, v_min), (l_max, v_max)) = table.bornes();
+                println!(
+                    "recalibrage : {} ({} noeuds, label [{l_min:.3}, {l_max:.3}] -> \
+                     v [{v_min:.4}, {v_max:.4}]) — cibles oracle seulement, arbitrage brut",
+                    opt.recalibrage,
+                    table.len()
+                );
+                if oracle_pool.is_none() {
+                    println!(
+                        "attention : --recalibrage sans --oracle actif — table chargee \
+                         mais sans effet"
+                    );
+                }
+                Some(table)
+            }
+            Err(e) => {
+                eprintln!("--recalibrage {} : {e}", opt.recalibrage);
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
     // Départs variés (régime recherche uniquement) : proportion des parties
     // qui démarrent d'une ouverture du livre / d'une finale générée.
     // « 0 0 » = comportement historique STRICT (aucun tirage).
@@ -851,12 +946,14 @@ fn main() {
                                 d,
                                 g,
                                 &opts_recherche,
+                                recalibrage.as_ref(),
                             ),
                             (Some(o), None) => selfplay::play_training_game_oracle(
                                 &mut eleve,
                                 o,
                                 g,
                                 &opts_recherche,
+                                recalibrage.as_ref(),
                             ),
                             (None, Some(d)) => selfplay::play_training_game_recherche_depuis(
                                 &mut eleve,
@@ -969,6 +1066,10 @@ fn main() {
                         lot_zs.push(zs[i]);
                     }
                     let loss_lot = net_mut.train_batch(&lot_xs, &lot_zs, opt.lr);
+                    // Rappel élastique découplé, APRÈS le pas Adam.
+                    if let Some(a) = &ancre {
+                        net_mut.rappel_vers(a, opt.lr * opt.ancre_lambda);
+                    }
                     somme_loss += loss_lot as f64 * lot.len() as f64;
                     n_vus += lot.len();
                 }
@@ -989,6 +1090,9 @@ fn main() {
                         for _ in 0..n_positions.div_ceil(MINIBATCH) {
                             r.echantillonne(&mut rng_rejeu, MINIBATCH, &mut lot_xs, &mut lot_zs);
                             let loss_lot = net_mut.train_batch(&lot_xs, &lot_zs, opt.lr);
+                            if let Some(a) = &ancre {
+                                net_mut.rappel_vers(a, opt.lr * opt.ancre_lambda);
+                            }
                             somme_loss += loss_lot as f64 * MINIBATCH as f64;
                             n_vus += MINIBATCH;
                         }
@@ -1002,6 +1106,10 @@ fn main() {
                         .map(|&i| (actifs[i].clone(), zs[i]))
                         .collect();
                     let loss_lot = net_mut.train_batch_actifs(&lots, opt.lr);
+                    // Rappel élastique découplé, APRÈS le pas Adam.
+                    if let Some(a) = &ancre {
+                        net_mut.rappel_vers(a, opt.lr * opt.ancre_lambda);
+                    }
                     somme_loss += loss_lot as f64 * lot.len() as f64;
                     n_vus += lot.len();
                 }
@@ -1019,6 +1127,9 @@ fn main() {
                         for _ in 0..n_positions.div_ceil(MINIBATCH) {
                             let lots = r.echantillonne(&mut rng_rejeu, MINIBATCH);
                             let loss_lot = net_mut.train_batch_actifs(&lots, opt.lr);
+                            if let Some(a) = &ancre {
+                                net_mut.rappel_vers(a, opt.lr * opt.ancre_lambda);
+                            }
                             somme_loss += loss_lot as f64 * MINIBATCH as f64;
                             n_vus += MINIBATCH;
                         }

@@ -5,7 +5,7 @@
 if (-not (Get-Process train -ErrorAction SilentlyContinue)) {
     Start-Process -WindowStyle Hidden -FilePath "C:\dev\Echec\target\release\train.exe" `
         -ArgumentList "--out","models","--threads","18","--search-nodes","8000",`
-        "--lr","0.0003","--td-lambda","0.2",`
+        "--lr","0.0001","--td-lambda","0.2",`
         "--oracle","engines/stockfish/stockfish-windows-x86-64-avx2.exe",`
         "--oracle-movetime","40","--mentor-poids","1.0",`
         "--replay","1200000","--games-per-cycle","60","--eval-games","64",`

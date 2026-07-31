@@ -19,6 +19,14 @@
 //! Sortie : lignes CSV `net,partie,couleur_nnue,resultat` (résultat du point
 //! de vue du camp NNUE : 1, 0.5, 0) en APPEND dans --out, et récapitulatif
 //! final sur stdout.
+//!
+//! Mode duel A/B (`--net-b <chemin>`) : au lieu de NNUE-vs-exact sur un même
+//! réseau, le réseau A (--net) affronte le réseau B (--net-b), TOUS DEUX par
+//! le chemin NNUE normal (`utilise_nnue = true`), mêmes budgets --nodes, TT
+//! fraîche et de même taille de chaque côté, mêmes paires d'ouvertures jouées
+//! une fois de chaque couleur. Les schémas de A et B peuvent différer (chaque
+//! moteur porte son propre réseau, aucune vérification croisée). CSV :
+//! `net_a,net_b,partie,couleur_a,resultat` (du point de vue de A).
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -63,6 +71,8 @@ fn derive_graine(base: u64, sel: u64) -> u64 {
 
 struct Opt {
     net: String,
+    /// Réseau B du duel A/B ; None = mode historique NNUE-vs-exact.
+    net_b: Option<String>,
     games: usize,
     nodes: u64,
     threads: usize,
@@ -87,6 +97,7 @@ fn parse_valeur<T: std::str::FromStr>(v: &str, nom: &str) -> T {
 fn parse_args() -> Opt {
     let mut opt = Opt {
         net: "models/chess_latest.bin".to_string(),
+        net_b: None,
         games: 200,
         nodes: 8000,
         threads: 4,
@@ -99,6 +110,7 @@ fn parse_args() -> Opt {
         let nom = args[i].clone();
         match nom.as_str() {
             "--net" => opt.net = valeur(&args, i, &nom),
+            "--net-b" => opt.net_b = Some(valeur(&args, i, &nom)),
             "--games" => opt.games = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--nodes" => opt.nodes = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--threads" => opt.threads = parse_valeur(&valeur(&args, i, &nom), &nom),
@@ -122,14 +134,20 @@ fn chercheur(net: &Arc<Mlp>, incremental: bool) -> Recherche {
     r
 }
 
-/// Une partie : camp NNUE (incrémental) contre camp exact (forward complet),
-/// même réseau, `nodes` nœuds par coup, température 0 (coup du chercheur tel
-/// quel, déterministe). Chercheurs FRAIS (TT vierges, équité). Arbitrage
-/// identique à partie_gating de train.rs. Renvoie les points du camp NNUE
-/// (1.0 victoire, 0.5 nulle, 0.0 défaite).
+/// Une partie : camp A contre camp B, chacun avec SON réseau et SA voie
+/// d'évaluation, `nodes` nœuds par coup, température 0 (coup du chercheur tel
+/// quel, déterministe). Chercheurs FRAIS (TT vierges de même taille, équité).
+/// Arbitrage identique à partie_gating de train.rs. Renvoie les points du
+/// camp A (1.0 victoire, 0.5 nulle, 0.0 défaite).
+///
+/// Mode historique : A = (net, incrémental), B = (même net, forward exact).
+/// Mode duel A/B : A = (net_a, incrémental), B = (net_b, incrémental).
 fn partie(
-    net: &Arc<Mlp>,
-    nnue_blanc: bool,
+    net_a: &Arc<Mlp>,
+    incr_a: bool,
+    net_b: &Arc<Mlp>,
+    incr_b: bool,
+    a_blanc: bool,
     ouverture: &[Move],
     nodes: u64,
 ) -> f32 {
@@ -141,8 +159,8 @@ fn partie(
         *repetitions.entry(zobrist(&pos)).or_insert(0) += 1;
     }
     let limites = Limites { max_noeuds: nodes, max_profondeur: 0, movetime_ms: 0 };
-    let mut camp_nnue = chercheur(net, true);
-    let mut camp_exact = chercheur(net, false);
+    let mut camp_a = chercheur(net_a, incr_a);
+    let mut camp_b = chercheur(net_b, incr_b);
     let mut plies = ouverture.len() as u32;
 
     let resultat_blancs = loop {
@@ -158,11 +176,11 @@ fn partie(
         if pos.is_insufficient_material() || pos.halfmoves() >= 100 || plies >= MAX_PLIES {
             break 0.0;
         }
-        let tour_nnue = (pos.turn() == Color::White) == nnue_blanc;
-        let res = if tour_nnue {
-            camp_nnue.cherche(&pos, limites)
+        let tour_a = (pos.turn() == Color::White) == a_blanc;
+        let res = if tour_a {
+            camp_a.cherche(&pos, limites)
         } else {
-            camp_exact.cherche(&pos, limites)
+            camp_b.cherche(&pos, limites)
         };
         let m = res.coup.expect("coups légaux non vides");
         pos = pos.play(&m).expect("coup légal");
@@ -173,7 +191,7 @@ fn partie(
             break 0.0;
         }
     };
-    let cote = if nnue_blanc { resultat_blancs } else { -resultat_blancs };
+    let cote = if a_blanc { resultat_blancs } else { -resultat_blancs };
     (cote + 1.0) / 2.0
 }
 
@@ -188,10 +206,33 @@ fn main() {
         eprintln!("--net {} : chargement impossible ({e})", opt.net);
         std::process::exit(1);
     }));
-    println!(
-        "forensic : net={} sizes={:?} games={} nodes={} threads={} out={} seed={}",
-        opt.net, net.sizes, opt.games, opt.nodes, opt.threads, opt.out, opt.seed
-    );
+    // Mode duel A/B : B porte son propre réseau (schéma éventuellement
+    // différent de A, aucune vérification croisée) et joue par le chemin NNUE
+    // normal, comme A. Mode historique : B est le même réseau que A, évalué
+    // par le forward exact.
+    let duel_ab = opt.net_b.is_some();
+    let (net_b, incr_b) = match &opt.net_b {
+        Some(chemin) => (
+            Arc::new(Mlp::load(chemin).unwrap_or_else(|e| {
+                eprintln!("--net-b {chemin} : chargement impossible ({e})");
+                std::process::exit(1);
+            })),
+            true,
+        ),
+        None => (net.clone(), false),
+    };
+    match &opt.net_b {
+        Some(chemin) => println!(
+            "forensic duel A/B : net_a={} sizes_a={:?} net_b={} sizes_b={:?} games={} \
+             nodes={} threads={} out={} seed={}",
+            opt.net, net.sizes, chemin, net_b.sizes, opt.games, opt.nodes, opt.threads,
+            opt.out, opt.seed
+        ),
+        None => println!(
+            "forensic : net={} sizes={:?} games={} nodes={} threads={} out={} seed={}",
+            opt.net, net.sizes, opt.games, opt.nodes, opt.threads, opt.out, opt.seed
+        ),
+    }
 
     let paires = opt.games / 2;
     if paires == 0 {
@@ -202,13 +243,15 @@ fn main() {
     // Paires en parallèle, une par tâche rayon (même remarque que le gating :
     // sans with_max_len(1), les paquets séquentiels sous-occupent le pool).
     let faites = AtomicUsize::new(0);
-    // (indice de partie, couleur du camp NNUE, points NNUE) pour le CSV.
+    // (indice de partie, couleur du camp A, points du camp A) pour le CSV.
     let resultats: Vec<(usize, &'static str, f32)> = (0..paires)
         .into_par_iter()
         .with_max_len(1)
         .flat_map(|p| {
             // Ouverture aléatoire partagée par la paire, jouée des deux
-            // couleurs. Jamais à court de coups en 4 plis.
+            // couleurs (A blancs puis A noirs : symétrie exacte, l'outil
+            // mesure une asymétrie et ne doit pas en introduire une).
+            // Jamais à court de coups en 4 plis.
             let mut rng = StdRng::seed_from_u64(derive_graine(opt.seed, p as u64));
             let mut pos = Chess::default();
             let mut ouverture: Vec<Move> = Vec::new();
@@ -219,8 +262,8 @@ fn main() {
                 pos = pos.play(&m).expect("coup légal");
                 ouverture.push(m);
             }
-            let pts_blanc = partie(&net, true, &ouverture, opt.nodes);
-            let pts_noir = partie(&net, false, &ouverture, opt.nodes);
+            let pts_blanc = partie(&net, true, &net_b, incr_b, true, &ouverture, opt.nodes);
+            let pts_noir = partie(&net, true, &net_b, incr_b, false, &ouverture, opt.nodes);
             let n = faites.fetch_add(1, Ordering::Relaxed) + 1;
             if n % 4 == 0 || n == paires {
                 println!("  forensic : {n}/{paires} paires jouees");
@@ -241,15 +284,25 @@ fn main() {
             std::process::exit(1);
         });
     if entete {
-        writeln!(f, "net,partie,couleur_nnue,resultat").expect("écriture CSV");
+        if duel_ab {
+            writeln!(f, "net_a,net_b,partie,couleur_a,resultat").expect("écriture CSV");
+        } else {
+            writeln!(f, "net,partie,couleur_nnue,resultat").expect("écriture CSV");
+        }
     }
     for (idx, couleur, pts) in &resultats {
-        writeln!(f, "{},{},{},{}", opt.net, idx, couleur, pts).expect("écriture CSV");
+        if let Some(chemin_b) = &opt.net_b {
+            writeln!(f, "{},{},{},{},{}", opt.net, chemin_b, idx, couleur, pts)
+                .expect("écriture CSV");
+        } else {
+            writeln!(f, "{},{},{},{}", opt.net, idx, couleur, pts).expect("écriture CSV");
+        }
     }
 
-    // Récapitulatif : points du camp NNUE (incrémental) vs camp exact.
+    // Récapitulatif : points du camp A (NNUE incrémental en mode historique,
+    // réseau --net en mode duel A/B).
     let total = resultats.len() as f32;
-    let pts_nnue: f32 = resultats.iter().map(|(_, _, p)| p).sum();
+    let pts_a: f32 = resultats.iter().map(|(_, _, p)| p).sum();
     let (mut v, mut n, mut d) = (0u32, 0u32, 0u32);
     for (_, _, p) in &resultats {
         if *p > 0.75 {
@@ -260,15 +313,29 @@ fn main() {
             n += 1;
         }
     }
-    println!(
-        "forensic : NNUE {pts_nnue:.1} / {total:.0} ({:.1} %) — V {v} / N {n} / D {d} \
-         (exact : {:.1} pts, {:.1} %)",
-        100.0 * pts_nnue / total,
-        total - pts_nnue,
-        100.0 * (total - pts_nnue) / total,
-    );
-    println!(
-        "interpretation : ~50 % attendu si l'incremental est fidele ; un ecart \
-         significatif a nombre de noeuds fixe prouve des evaluations faussees."
-    );
+    if duel_ab {
+        println!(
+            "forensic duel A/B : A {pts_a:.1} / {total:.0} ({:.1} %) — V {v} / N {n} / D {d} \
+             (B : {:.1} pts, {:.1} %)",
+            100.0 * pts_a / total,
+            total - pts_a,
+            100.0 * (total - pts_a) / total,
+        );
+        println!(
+            "interpretation : harnais neutre, ouvertures appariees jouees des deux \
+             couleurs ; l'ecart a 50 % mesure la difference de force reelle entre A et B."
+        );
+    } else {
+        println!(
+            "forensic : NNUE {pts_a:.1} / {total:.0} ({:.1} %) — V {v} / N {n} / D {d} \
+             (exact : {:.1} pts, {:.1} %)",
+            100.0 * pts_a / total,
+            total - pts_a,
+            100.0 * (total - pts_a) / total,
+        );
+        println!(
+            "interpretation : ~50 % attendu si l'incremental est fidele ; un ecart \
+             significatif a nombre de noeuds fixe prouve des evaluations faussees."
+        );
+    }
 }
