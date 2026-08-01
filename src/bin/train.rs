@@ -405,7 +405,7 @@ fn copie_atomique(src: &str, dst: &str) -> std::io::Result<()> {
 }
 
 /// Append une ligne dans un CSV du dossier modèles (entête à la création).
-/// Sert aux journaux lus par le dashboard : gating.csv, events.csv.
+/// Sert aux journaux lus par le dashboard : gating.csv, events.csv, ancres.csv.
 fn append_csv(chemin: &str, entete: &str, ligne: &str) {
     let neuf = !Path::new(chemin).exists();
     if let Ok(mut fichier) = fs::OpenOptions::new().create(true).append(true).open(chemin) {
@@ -1278,6 +1278,15 @@ fn main() {
             }
             writeln!(fichier_elo, "{:.3},{:.0}", apres_h, estimation)
                 .expect("append dans elo.csv");
+            // Journal par ancre lu par la page /training (courbe des ancres) :
+            // une ligne par ancre effectivement jouée à cette mesure.
+            for m in &mesures {
+                append_csv(
+                    &format!("{}/ancres.csv", opt.out),
+                    "heures,ancre,score_pct,parties",
+                    &format!("{:.3},{},{:.1},{}", apres_h, m.nom, m.score * 100.0, m.parties),
+                );
+            }
             let detail: Vec<String> = mesures
                 .iter()
                 .map(|m| format!("{} {:.0} %", m.nom, m.score * 100.0))

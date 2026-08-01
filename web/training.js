@@ -188,6 +188,26 @@ function render(data) {
     { color: css("--series-4"), pts: ptsElo, dots: true },
   ], { yFmt: (v) => fr(Math.round(v)), events });
 
+  // Progression contre les ancres fortes : une série par ancre, points [h, %].
+  // data.ancres (models/ancres.csv) : [{h, ancre, score_pct}, ...] — vide ou
+  // absent tant que l'entraîneur n'a rien journalisé.
+  const ancres = data.ancres || [];
+  const parAncre = (nom) => ancres
+    .filter((a) => a.ancre === nom && Number.isFinite(a.h) && Number.isFinite(a.score_pct))
+    .map((a) => [a.h, a.score_pct]);
+  const ptsMat4 = parAncre("materiel d4");
+  const ptsSf17 = parAncre("stockfish 1700");
+  const ptsSf20 = parAncre("stockfish 2000");
+  const dern = (pts) => (pts.length ? fr(pts[pts.length - 1][1], 1) + " %" : "—");
+  $("ancres-last").textContent = !ptsMat4.length && !ptsSf17.length && !ptsSf20.length ? "" :
+    `Dernière mesure : ${dern(ptsMat4)} vs Matériel d4 · ` +
+    `${dern(ptsSf17)} vs Stockfish 1700 · ${dern(ptsSf20)} vs Stockfish 2000`;
+  drawChart("chart-ancres", "empty-ancres", [
+    { color: css("--series-1"), pts: ptsMat4, dots: true },
+    { color: css("--series-2"), pts: ptsSf17, dots: true },
+    { color: css("--series-4"), pts: ptsSf20, dots: true },
+  ], { yMin: 0, yMax: 100, baseline: 50, yFmt: (v) => `${Math.round(v)} %`, events });
+
   // Gating : synthèse des duels candidat vs champion (régime recherche).
   const g = data.gating || {};
   const nDuels = (g.score_pct || []).length;

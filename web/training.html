@@ -96,6 +96,27 @@
     </div>
   </div>
 
+  <!-- Progression contre les ancres fortes -->
+  <div class="tr-chart-card">
+    <div class="tr-chart-head">
+      <div class="tr-chart-title">Progression contre les ancres fortes — % de points</div>
+      <div class="tr-legend">
+        <span><i style="background:var(--series-1)"></i>vs Matériel d4</span>
+        <span><i style="background:var(--series-2)"></i>vs Stockfish 1700</span>
+        <span><i style="background:var(--series-4)"></i>vs Stockfish 2000</span>
+      </div>
+    </div>
+    <div class="tr-lastvals" id="ancres-last"></div>
+    <div class="tr-chart-wrap"><canvas id="chart-ancres"></canvas>
+      <div class="tr-empty" id="empty-ancres" hidden>Pas encore de mesure par ancre — elles tombent avec chaque estimation d'Elo.</div>
+    </div>
+    <div class="tr-note">
+      Scores bruts contre les ancres hautes de l'échelle d'Elo (les mêmes duels que la courbe
+      ci-dessus, sans l'ajustement logistique). 50&nbsp;% (ligne pointillée) = égalité : c'est là que
+      se lit la marge de progression restante contre Stockfish bridé.
+    </div>
+  </div>
+
   <!-- Perte du réseau -->
   <div class="tr-chart-card">
     <div class="tr-chart-head">

@@ -479,6 +479,28 @@ fn progress_json() -> serde_json::Value {
             }
         }
     }
+    // Scores par ancre à chaque mesure Elo (fichier écrit par l'entraîneur,
+    // absent avant la première mesure : tableau vide, la page gère).
+    let mut ancres: Vec<serde_json::Value> = Vec::new();
+    if let Ok(contenu) = std::fs::read_to_string(format!("{MODELS_DIR}/ancres.csv")) {
+        // Entête : heures,ancre,score_pct,parties
+        for ligne in contenu.lines().skip(1) {
+            let cols: Vec<&str> = ligne.split(',').collect();
+            if cols.len() < 4 {
+                continue;
+            }
+            if let (Ok(h), Ok(s)) = (
+                cols[0].trim().parse::<f64>(),
+                cols[2].trim().parse::<f64>(),
+            ) {
+                ancres.push(serde_json::json!({
+                    "h": h,
+                    "ancre": cols[1].trim(),
+                    "score_pct": s,
+                }));
+            }
+        }
+    }
     let mut events: Vec<serde_json::Value> = Vec::new();
     if let Ok(contenu) = std::fs::read_to_string(format!("{MODELS_DIR}/events.csv")) {
         // Entête : elapsed_hours,label
@@ -522,6 +544,7 @@ fn progress_json() -> serde_json::Value {
             "score_pct": gat_score,
             "promu": gat_promu,
         },
+        "ancres": ancres,
         "events": events,
         "state": {
             "trained_secs": champ("trained_secs"),
