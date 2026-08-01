@@ -462,13 +462,20 @@ fn limites_duel(n: u64) -> search::Limites {
 /// BotRecherche (limites NOEUDS_DUEL nœuds, température 0) — elo.rs reste
 /// intact, seul l'agent mesuré change ; même ajuste_elo ensuite. L'échelle
 /// d'ancres et le mélange de graines sont IDENTIQUES à elo::mesure pour que
-/// seul le bot mesuré diffère entre les deux régimes.
+/// seul le bot mesuré diffère entre les deux régimes. Les ancres UCI hautes
+/// (stockfish 1700/2000) sont jouées via elo::mesure_uci avec le moteur de
+/// `chemin_moteur` (--oracle) ; chemin vide ou moteur injouable → sautées avec
+/// message, le fit retombe sur les 5 ancres maison (jamais de panique).
 fn mesure_elo_recherche(net: &Arc<Mlp>, parties_par_ancre: usize,
-                        graine: u64) -> Vec<elo::MesureAncre> {
-    elo::ANCRES
+                        graine: u64, chemin_moteur: &str) -> Vec<elo::MesureAncre> {
+    let mut mesures: Vec<elo::MesureAncre> = elo::ANCRES
         .iter()
+        .filter_map(|a| match a.genre {
+            elo::GenreAncre::Maison { profondeur } => Some((a, profondeur)),
+            elo::GenreAncre::Uci { .. } => None,
+        })
         .enumerate()
-        .map(|(k, a)| {
+        .map(|(k, (a, profondeur))| {
             let net_a = net.clone();
             let score = arena::score(
                 move |g: u64| -> Box<dyn Bot> {
@@ -480,7 +487,7 @@ fn mesure_elo_recherche(net: &Arc<Mlp>, parties_par_ancre: usize,
                     ))
                 },
                 |g: u64| -> Box<dyn Bot> {
-                    match a.profondeur {
+                    match profondeur {
                         None => Box::new(RandomBot::new(g)),
                         Some(d) => Box::new(MaterialBot::new(g, d)),
                     }
@@ -499,7 +506,19 @@ fn mesure_elo_recherche(net: &Arc<Mlp>, parties_par_ancre: usize,
                 parties: parties_par_ancre,
             }
         })
-        .collect()
+        .collect();
+    // Ancres UCI : même agent mesuré (BotRecherche, mêmes limites), moteur
+    // bridé en face — mesure_uci imprime sa propre progression et ses sauts.
+    let net_u = net.clone();
+    mesures.extend(elo::mesure_uci(
+        move |g: u64| -> Box<dyn Bot> {
+            Box::new(BotRecherche::new(net_u.clone(), g, limites_duel(NOEUDS_DUEL), 0.0))
+        },
+        chemin_moteur,
+        parties_par_ancre,
+        graine,
+    ));
+    mesures
 }
 
 /// Une partie du duel de gating : l'ouverture est rejouée depuis la position
@@ -1240,7 +1259,9 @@ fn main() {
             // recherche). Sinon, mesure historique NetBot d2.
             let graine_elo = derive_graine(opt.seed.wrapping_add(etat.cycles), 0xE10);
             let mesures = if opt.search_nodes > 0 {
-                mesure_elo_recherche(&net, opt.elo_games, graine_elo)
+                // Le moteur des ancres UCI est celui de --oracle (réutilisé) ;
+                // absent → mesure_elo_recherche saute proprement ces ancres.
+                mesure_elo_recherche(&net, opt.elo_games, graine_elo, &opt.oracle)
             } else {
                 elo::mesure(&net, PROFONDEUR_ELO, opt.elo_games, graine_elo)
             };
@@ -1262,7 +1283,7 @@ fn main() {
                 .map(|m| format!("{} {:.0} %", m.nom, m.score * 100.0))
                 .collect();
             println!(
-                "  Elo estime ~{:.0} (echelle maison ; {})",
+                "  Elo estime ~{:.0} (echelle d'ancres ; {})",
                 estimation,
                 detail.join(", ")
             );
