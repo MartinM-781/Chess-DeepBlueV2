@@ -38,10 +38,11 @@ use crate::features_roi::{zone_roi, N_FEATURES_ROI, N_ZONES_ROI};
 use crate::nn::{Mlp, SchemaFeatures};
 
 /// Début des 5 features de drapeaux (après les 12 plans pièce×case).
-const BASE_DRAPEAUX: usize = 12 * 64;
+/// (`pub(crate)` : partagé avec le chemin quantizé de `quant.rs`.)
+pub(crate) const BASE_DRAPEAUX: usize = 12 * 64;
 
 /// Début des 5 scalaires du schéma roi-zones (après les 8 zones × 768 plans).
-const BASE_DRAPEAUX_ROI8: usize = N_ZONES_ROI * 768;
+pub(crate) const BASE_DRAPEAUX_ROI8: usize = N_ZONES_ROI * 768;
 
 /// Une couche dense au-dessus de l'accumulateur (poids row-major sortie×entrée,
 /// même convention que `Mlp` pour reproduire exactement ses boucles).
@@ -186,7 +187,7 @@ impl EvalIncrementale {
 /// plan = role-1 si la pièce est du camp P, sinon 6 + role-1, et la case est
 /// vue par P (miroir `case ^ 56` pour la perspective noire).
 #[inline]
-fn indices_piece(couleur: Color, role: Role, case: Square) -> (usize, usize) {
+pub(crate) fn indices_piece(couleur: Color, role: Role, case: Square) -> (usize, usize) {
     let r = usize::from(role) - 1;
     let c = usize::from(case);
     let plan_blanc = if couleur == Color::White { r } else { 6 + r };
@@ -198,7 +199,7 @@ fn indices_piece(couleur: Color, role: Role, case: Square) -> (usize, usize) {
 /// perspective blanche, zone du roi NOIR vue de la perspective noire — donc
 /// après le miroir `case ^ 56`, comme dans `features_roi`).
 #[inline]
-fn zones_rois(pos: &Chess) -> (usize, usize) {
+pub(crate) fn zones_rois(pos: &Chess) -> (usize, usize) {
     let blanc = pos
         .board()
         .king_of(Color::White)
@@ -215,7 +216,7 @@ fn zones_rois(pos: &Chess) -> (usize, usize) {
 /// `features_roi::actifs_perspective` : `zone·768 + plan·64 + case_vue`, avec
 /// miroir `case ^ 56` et échange des couleurs pour la perspective noire.
 #[inline]
-fn indice_piece_roi8(
+pub(crate) fn indice_piece_roi8(
     couleur: Color,
     role: Role,
     case: Square,
@@ -239,7 +240,11 @@ fn indice_piece_roi8(
 /// appelle `delta(couleur, role, case, signe)` pour chacun. Partagé par les
 /// deltas du schéma roi-zones (les deux perspectives, ou une seule quand
 /// l'autre est reconstruite).
-fn pour_chaque_delta(nous: Color, m: &Move, mut delta: impl FnMut(Color, Role, Square, f32)) {
+pub(crate) fn pour_chaque_delta(
+    nous: Color,
+    m: &Move,
+    mut delta: impl FnMut(Color, Role, Square, f32),
+) {
     match m {
         Move::Normal { role, from, capture, to, promotion } => {
             delta(nous, *role, *from, -1.0);

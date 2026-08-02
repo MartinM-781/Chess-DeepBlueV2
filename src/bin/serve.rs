@@ -89,6 +89,11 @@ const LIMITES_SERVEUR: Limites = Limites {
 /// (departs::coup_du_livre garantit l'exactitude — aucun coup hors ligne).
 const PLIS_LIVRE_MAX: usize = 12;
 
+/// `--int8` sur la ligne de commande : les bots de recherche du plateau
+/// évaluent par le chemin quantizé (src/quant.rs). Serve n'a pas d'autre
+/// option : un simple drapeau global posé au démarrage suffit.
+static INT8: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 // ---------------------------------------------------------------------------
 // Session de jeu
 // ---------------------------------------------------------------------------
@@ -297,7 +302,8 @@ fn coup_ia(session: &mut Session, cache: &CacheModeles) -> Result<(), String> {
                         // Température 0 : meilleur coup de la recherche (la
                         // force est l'objectif) ; la variété vient de la
                         // graine de la partie.
-                        BotRecherche::new(net, graine, LIMITES_SERVEUR, 0.0),
+                        BotRecherche::new(net, graine, LIMITES_SERVEUR, 0.0)
+                            .avec_int8(INT8.load(std::sync::atomic::Ordering::Relaxed)),
                     ));
                 }
             }
@@ -747,6 +753,10 @@ fn boucle(serveur: Server, etat: Arc<Etat>) {
 
 fn main() {
     echec::pleine_puissance(); // la réflexion de l'IA jamais bridée par l'EcoQoS
+    if std::env::args().skip(1).any(|a| a == "--int8") {
+        INT8.store(true, std::sync::atomic::Ordering::Relaxed);
+        println!("évaluation quantizée int8 active (--int8)");
+    }
     let etat = Arc::new(Etat {
         // Session par défaut : humain (blancs) contre le bot aléatoire.
         session: Mutex::new(Session::nouvelle("random", Color::White)),

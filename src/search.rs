@@ -37,6 +37,7 @@ use shakmaty::{Bitboard, Board, Chess, Color, EnPassantMode, Move, Piece, Positi
 use crate::features::N_FEATURES;
 use crate::nn::Mlp;
 use crate::nnue::{EvalIncrementale, PileAccus};
+use crate::quant::{PileQuant, QuantNet};
 
 pub const SCORE_MAT: f32 = 1000.0;
 
@@ -351,6 +352,14 @@ pub struct Recherche {
     /// Défaut : true. Sert d'échappatoire et de bras de comparaison au
     /// harnais forensique (src/bin/forensic.rs).
     pub utilise_nnue: bool,
+    /// À `true`, active le chemin d'évaluation QUANTIZÉ (src/quant.rs :
+    /// accumulateurs i32, têtes i8, AVX2) — PRIORITAIRE sur `utilise_nnue`.
+    /// Défaut : false — drapeau off, comportement STRICTEMENT identique à
+    /// avant ce chantier. L'erreur de quantization est bornée par la batterie
+    /// de parité de quant.rs (max ≤ 0.05, moyenne ≤ 0.01 sur la sortie tanh).
+    /// Réseau non quantizable (linéaire, poids hors domaine) : repli f32
+    /// silencieux, jamais de panique.
+    pub utilise_int8: bool,
     /// Poids réorganisés pour l'évaluation incrémentale. `None` = réseau sans
     /// couche cachée (les réseaux linéaires [773,1] de certains tests, où il
     /// n'y a de toute façon rien à accélérer) → forward complet d'office.
@@ -359,6 +368,17 @@ pub struct Recherche {
     /// chaque appel de cherche() (racine posée sur la position de départ).
     /// Poussée/dépoussée par negamax et quiesce, en miroir de leur récursion.
     pile: Option<PileAccus>,
+    /// Réseau quantizé (chemin int8), dérivé PARESSEUSEMENT du Mlp au premier
+    /// cherche() avec `utilise_int8` actif — le drapeau off ne coûte rien.
+    /// `None` tant que non construit OU si le réseau est hors domaine de
+    /// quantization (voir QuantNet::depuis_mlp).
+    quant: Option<QuantNet>,
+    /// Vrai après la première tentative de dérivation (évite de retenter à
+    /// chaque cherche() quand le réseau n'est pas quantizable).
+    quant_tente: bool,
+    /// Pile d'accumulateurs ENTIERS (chemin int8), pendante de `pile` —
+    /// au plus une des deux est active pendant un cherche().
+    pile_quant: Option<PileQuant>,
     /// Table de transposition : 2^taille_tt_log2 entrées, index = cle & masque.
     tt: Vec<EntreeTT>,
     masque: u64,
@@ -398,8 +418,12 @@ impl Recherche {
             net,
             mode_classique: false,
             utilise_nnue: true,
+            utilise_int8: false,
             eval,
             pile: None,
+            quant: None,
+            quant_tente: false,
+            pile_quant: None,
             tt: vec![ENTREE_VIDE; n],
             masque: (n - 1) as u64,
             killers: vec![[COUP_AUCUN; 2]; MAX_PLY],
@@ -458,12 +482,25 @@ impl Recherche {
         // Pile d'accumulateurs posée sur la position de départ : une par appel
         // (la racine change à chaque coup joué). Encodage complet des deux
         // perspectives ici, puis uniquement des deltas dans l'arbre.
-        self.pile = if self.utilise_nnue {
+        // Chemin int8 prioritaire quand `utilise_int8` est actif : le réseau
+        // quantizé est dérivé du Mlp au PREMIER appel (une fois), puis la
+        // pile entière remplace la pile f32. Réseau non quantizable →
+        // `quant` reste None et on retombe sur les chemins f32 ci-dessous.
+        if self.utilise_int8 && !self.quant_tente {
+            self.quant_tente = true;
+            self.quant = QuantNet::depuis_mlp(&self.net);
+        }
+        self.pile_quant = if self.utilise_int8 {
+            self.quant.as_ref().map(|q| q.racine(pos))
+        } else {
+            None
+        };
+        self.pile = if self.utilise_nnue && self.pile_quant.is_none() {
             self.eval.as_ref().map(|e| e.racine(pos))
         } else {
-            // Incrémental débrayé : pile absente → evaluer() et les
-            // pile_pousse/depousse retombent d'eux-mêmes sur le forward
-            // complet (no-ops côté pile).
+            // Incrémental débrayé (ou chemin int8 actif) : pile f32 absente →
+            // evaluer() et les pile_pousse/depousse retombent d'eux-mêmes sur
+            // l'autre chemin (no-ops côté pile f32).
             None
         };
 
@@ -953,6 +990,26 @@ impl Recherche {
     /// false) : encode + forward complet, identique au comportement d'avant
     /// l'intégration NNUE.
     fn evaluer(&mut self, pos: &Chess) -> f32 {
+        // Chemin int8 (prioritaire, actif seulement si cherche() a posé la
+        // pile quantizée) : lecture du sommet entier + têtes i8.
+        if let (Some(quant), Some(pile_q)) = (self.quant.as_ref(), self.pile_quant.as_ref()) {
+            let v = pile_q.evalue(quant, pos);
+            // Garde débug échantillonnée (même cadence que le chemin f32) :
+            // l'écart LÉGITIME de quantization reste ≤ ~0.05 (batterie de
+            // parité de quant.rs) ; un bug d'indexation ou de pile décale
+            // d'un ordre de grandeur. Tolérance 0.15 = 3× le seuil de la
+            // batterie : ne se déclenche jamais sur le bruit de quantization.
+            #[cfg(debug_assertions)]
+            if self.noeuds % 4096 == 1 {
+                let reference = crate::nn::evalue_position(&self.net, pos, &mut self.tampon);
+                debug_assert!(
+                    (v - reference).abs() <= 0.15,
+                    "divergence int8 au nœud {} : quantizé {v} vs forward complet {reference}",
+                    self.noeuds
+                );
+            }
+            return v;
+        }
         if let (Some(eval), Some(pile)) = (self.eval.as_ref(), self.pile.as_ref()) {
             let v = pile.evalue(eval, pos);
             // Parité échantillonnée, MODE DEBUG UNIQUEMENT : 1 nœud sur 4096
@@ -993,6 +1050,9 @@ impl Recherche {
         if let (Some(pile), Some(eval)) = (self.pile.as_mut(), self.eval.as_ref()) {
             pile.pousse(eval, pos_avant, m);
         }
+        if let (Some(pile_q), Some(quant)) = (self.pile_quant.as_mut(), self.quant.as_ref()) {
+            pile_q.pousse(quant, pos_avant, m);
+        }
     }
 
     /// Empile un null-move (sommet dupliqué, perspectives échangées à la
@@ -1001,6 +1061,9 @@ impl Recherche {
     fn pile_pousse_null(&mut self) {
         if let Some(pile) = self.pile.as_mut() {
             pile.pousse_null();
+        }
+        if let Some(pile_q) = self.pile_quant.as_mut() {
+            pile_q.pousse_null();
         }
     }
 
@@ -1011,6 +1074,9 @@ impl Recherche {
         if let Some(pile) = self.pile.as_mut() {
             pile.depousse();
         }
+        if let Some(pile_q) = self.pile_quant.as_mut() {
+            pile_q.depousse();
+        }
     }
 
     /// (Tests uniquement) Force le chemin de secours « forward complet » :
@@ -1019,6 +1085,9 @@ impl Recherche {
     fn force_forward_complet(&mut self) {
         self.eval = None;
         self.pile = None;
+        self.utilise_int8 = false;
+        self.quant = None;
+        self.pile_quant = None;
     }
 
     // --- Limites -------------------------------------------------------------

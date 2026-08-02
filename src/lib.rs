@@ -45,6 +45,7 @@ pub mod features;
 pub mod features_roi;
 pub mod nn;
 pub mod nnue;
+pub mod quant;
 pub mod search;
 pub mod selfplay;
 pub mod uci;

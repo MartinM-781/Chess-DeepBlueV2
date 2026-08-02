@@ -27,6 +27,16 @@
 //! une fois de chaque couleur. Les schémas de A et B peuvent différer (chaque
 //! moteur porte son propre réseau, aucune vérification croisée). CSV :
 //! `net_a,net_b,partie,couleur_a,resultat` (du point de vue de A).
+//!
+//! Chantier int8 (couperets du chemin quantizé, src/quant.rs) :
+//! - `--quant-a` / `--quant-b` (drapeaux sans valeur) activent l'évaluation
+//!   int8 pour le camp A / le camp B — prioritaire sur la voie f32 du camp.
+//!   Fidélité à budget de nœuds égal : `--net X --net-b X --quant-a` (les
+//!   deux camps portent le même réseau, A le lit en int8, B en f32).
+//! - `--movetime <ms>` : duel à TEMPS égal par coup au lieu de nœuds (les
+//!   budgets --nodes sont ignorés) — c'est là que la vitesse int8 doit se
+//!   convertir en force. NB : à temps égal, préférer `--threads 1` (ou
+//!   accepter la contention symétrique du pool rayon).
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -75,6 +85,11 @@ struct Opt {
     net_b: Option<String>,
     games: usize,
     nodes: u64,
+    /// > 0 : duel à TEMPS égal par coup (ms), --nodes ignoré.
+    movetime: u64,
+    /// Évaluation quantizée int8 pour le camp A / le camp B.
+    quant_a: bool,
+    quant_b: bool,
     threads: usize,
     out: String,
     seed: u64,
@@ -100,6 +115,9 @@ fn parse_args() -> Opt {
         net_b: None,
         games: 200,
         nodes: 8000,
+        movetime: 0,
+        quant_a: false,
+        quant_b: false,
         threads: 4,
         out: "forensic.csv".to_string(),
         seed: 0xF0E5_1C42,
@@ -108,11 +126,26 @@ fn parse_args() -> Opt {
     let mut i = 0;
     while i < args.len() {
         let nom = args[i].clone();
+        // Drapeaux SANS valeur : n'avancent que d'un cran.
+        match nom.as_str() {
+            "--quant-a" => {
+                opt.quant_a = true;
+                i += 1;
+                continue;
+            }
+            "--quant-b" => {
+                opt.quant_b = true;
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
         match nom.as_str() {
             "--net" => opt.net = valeur(&args, i, &nom),
             "--net-b" => opt.net_b = Some(valeur(&args, i, &nom)),
             "--games" => opt.games = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--nodes" => opt.nodes = parse_valeur(&valeur(&args, i, &nom), &nom),
+            "--movetime" => opt.movetime = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--threads" => opt.threads = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--out" => opt.out = valeur(&args, i, &nom),
             "--seed" => opt.seed = parse_valeur(&valeur(&args, i, &nom), &nom),
@@ -127,29 +160,35 @@ fn parse_args() -> Opt {
 }
 
 /// Fabrique un chercheur d'un camp : même réseau, seule la voie d'évaluation
-/// change. C'est TOUTE la différence entre les deux camps.
-fn chercheur(net: &Arc<Mlp>, incremental: bool) -> Recherche {
+/// change (f32 incrémental, forward exact, ou int8 quantizé). C'est TOUTE la
+/// différence entre les camps.
+fn chercheur(net: &Arc<Mlp>, incremental: bool, quant: bool) -> Recherche {
     let mut r = Recherche::new(net.clone(), TAILLE_TT_LOG2);
     r.utilise_nnue = incremental;
+    r.utilise_int8 = quant;
     r
 }
 
 /// Une partie : camp A contre camp B, chacun avec SON réseau et SA voie
-/// d'évaluation, `nodes` nœuds par coup, température 0 (coup du chercheur tel
-/// quel, déterministe). Chercheurs FRAIS (TT vierges de même taille, équité).
-/// Arbitrage identique à partie_gating de train.rs. Renvoie les points du
-/// camp A (1.0 victoire, 0.5 nulle, 0.0 défaite).
+/// d'évaluation, mêmes `limites` par coup (nœuds ou movetime), température 0
+/// (coup du chercheur tel quel, déterministe). Chercheurs FRAIS (TT vierges
+/// de même taille, équité). Arbitrage identique à partie_gating de train.rs.
+/// Renvoie les points du camp A (1.0 victoire, 0.5 nulle, 0.0 défaite).
 ///
 /// Mode historique : A = (net, incrémental), B = (même net, forward exact).
 /// Mode duel A/B : A = (net_a, incrémental), B = (net_b, incrémental).
+/// --quant-a / --quant-b : le camp correspondant évalue en int8.
+#[allow(clippy::too_many_arguments)]
 fn partie(
     net_a: &Arc<Mlp>,
     incr_a: bool,
+    quant_a: bool,
     net_b: &Arc<Mlp>,
     incr_b: bool,
+    quant_b: bool,
     a_blanc: bool,
     ouverture: &[Move],
-    nodes: u64,
+    limites: Limites,
 ) -> f32 {
     let mut pos = Chess::default();
     let mut repetitions: HashMap<u64, u8> = HashMap::new();
@@ -158,9 +197,8 @@ fn partie(
         pos = pos.play(m).expect("coup d'ouverture légal");
         *repetitions.entry(zobrist(&pos)).or_insert(0) += 1;
     }
-    let limites = Limites { max_noeuds: nodes, max_profondeur: 0, movetime_ms: 0 };
-    let mut camp_a = chercheur(net_a, incr_a);
-    let mut camp_b = chercheur(net_b, incr_b);
+    let mut camp_a = chercheur(net_a, incr_a, quant_a);
+    let mut camp_b = chercheur(net_b, incr_b, quant_b);
     let mut plies = ouverture.len() as u32;
 
     let resultat_blancs = loop {
@@ -221,16 +259,29 @@ fn main() {
         ),
         None => (net.clone(), false),
     };
+    // Budget par coup : temps égal (--movetime) prioritaire sur les nœuds.
+    let limites = if opt.movetime > 0 {
+        Limites { max_noeuds: 0, max_profondeur: 0, movetime_ms: opt.movetime }
+    } else {
+        Limites { max_noeuds: opt.nodes, max_profondeur: 0, movetime_ms: 0 }
+    };
+    let budget = if opt.movetime > 0 {
+        format!("movetime={} ms", opt.movetime)
+    } else {
+        format!("nodes={}", opt.nodes)
+    };
     match &opt.net_b {
         Some(chemin) => println!(
-            "forensic duel A/B : net_a={} sizes_a={:?} net_b={} sizes_b={:?} games={} \
-             nodes={} threads={} out={} seed={}",
-            opt.net, net.sizes, chemin, net_b.sizes, opt.games, opt.nodes, opt.threads,
-            opt.out, opt.seed
+            "forensic duel A/B : net_a={} sizes_a={:?} quant_a={} net_b={} sizes_b={:?} \
+             quant_b={} games={} {budget} threads={} out={} seed={}",
+            opt.net, net.sizes, opt.quant_a, chemin, net_b.sizes, opt.quant_b, opt.games,
+            opt.threads, opt.out, opt.seed
         ),
         None => println!(
-            "forensic : net={} sizes={:?} games={} nodes={} threads={} out={} seed={}",
-            opt.net, net.sizes, opt.games, opt.nodes, opt.threads, opt.out, opt.seed
+            "forensic : net={} sizes={:?} quant_a={} quant_b={} games={} {budget} \
+             threads={} out={} seed={}",
+            opt.net, net.sizes, opt.quant_a, opt.quant_b, opt.games, opt.threads, opt.out,
+            opt.seed
         ),
     }
 
@@ -262,8 +313,12 @@ fn main() {
                 pos = pos.play(&m).expect("coup légal");
                 ouverture.push(m);
             }
-            let pts_blanc = partie(&net, true, &net_b, incr_b, true, &ouverture, opt.nodes);
-            let pts_noir = partie(&net, true, &net_b, incr_b, false, &ouverture, opt.nodes);
+            let pts_blanc = partie(
+                &net, true, opt.quant_a, &net_b, incr_b, opt.quant_b, true, &ouverture, limites,
+            );
+            let pts_noir = partie(
+                &net, true, opt.quant_a, &net_b, incr_b, opt.quant_b, false, &ouverture, limites,
+            );
             let n = faites.fetch_add(1, Ordering::Relaxed) + 1;
             if n % 4 == 0 || n == paires {
                 println!("  forensic : {n}/{paires} paires jouees");

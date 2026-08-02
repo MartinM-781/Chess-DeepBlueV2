@@ -193,6 +193,10 @@ struct Options {
     ancre: String,
     ancre_lambda: f32,
     recalibrage: String,
+    /// --int8 : la RECHERCHE (self-play, gating, échelle Elo) évalue par le
+    /// chemin quantizé de src/quant.rs. L'APPRENTISSAGE reste en f32 —
+    /// seule la lecture du réseau par la recherche change. Défaut : false.
+    int8: bool,
 }
 
 /// Tampon de rejeu DENSE (schéma Classique773) : anneau de positions encodées
@@ -328,11 +332,18 @@ fn parse_options() -> Options {
         ancre: String::new(),
         ancre_lambda: 5.0,
         recalibrage: String::new(),
+        int8: false,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
         let nom = args[i].clone();
+        // Drapeau SANS valeur : n'avance que d'un cran.
+        if nom == "--int8" {
+            opt.int8 = true;
+            i += 1;
+            continue;
+        }
         match nom.as_str() {
             "--out" => opt.out = valeur(&args, i, &nom),
             "--threads" => opt.threads = parse_valeur(&valeur(&args, i, &nom), &nom),
@@ -377,7 +388,7 @@ fn parse_options() -> Options {
                      --search-nodes --td-lambda --gate-every --gate-games --mentor \
                      --mentor-poids --oracle --oracle-movetime \
                      --departs-ouvertures --departs-finales --ancre --ancre-lambda \
-                     --recalibrage"
+                     --recalibrage --int8"
                 );
                 std::process::exit(2);
             }
@@ -467,7 +478,7 @@ fn limites_duel(n: u64) -> search::Limites {
 /// `chemin_moteur` (--oracle) ; chemin vide ou moteur injouable → sautées avec
 /// message, le fit retombe sur les 5 ancres maison (jamais de panique).
 fn mesure_elo_recherche(net: &Arc<Mlp>, parties_par_ancre: usize,
-                        graine: u64, chemin_moteur: &str) -> Vec<elo::MesureAncre> {
+                        graine: u64, chemin_moteur: &str, int8: bool) -> Vec<elo::MesureAncre> {
     let mut mesures: Vec<elo::MesureAncre> = elo::ANCRES
         .iter()
         .filter_map(|a| match a.genre {
@@ -479,12 +490,10 @@ fn mesure_elo_recherche(net: &Arc<Mlp>, parties_par_ancre: usize,
             let net_a = net.clone();
             let score = arena::score(
                 move |g: u64| -> Box<dyn Bot> {
-                    Box::new(BotRecherche::new(
-                        net_a.clone(),
-                        g,
-                        limites_duel(NOEUDS_DUEL),
-                        0.0,
-                    ))
+                    Box::new(
+                        BotRecherche::new(net_a.clone(), g, limites_duel(NOEUDS_DUEL), 0.0)
+                            .avec_int8(int8),
+                    )
                 },
                 |g: u64| -> Box<dyn Bot> {
                     match profondeur {
@@ -512,7 +521,10 @@ fn mesure_elo_recherche(net: &Arc<Mlp>, parties_par_ancre: usize,
     let net_u = net.clone();
     mesures.extend(elo::mesure_uci(
         move |g: u64| -> Box<dyn Bot> {
-            Box::new(BotRecherche::new(net_u.clone(), g, limites_duel(NOEUDS_DUEL), 0.0))
+            Box::new(
+                BotRecherche::new(net_u.clone(), g, limites_duel(NOEUDS_DUEL), 0.0)
+                    .avec_int8(int8),
+            )
         },
         chemin_moteur,
         parties_par_ancre,
@@ -534,6 +546,7 @@ fn partie_gating(
     candidat_blanc: bool,
     ouverture: &[Move],
     graine: u64,
+    int8: bool,
 ) -> f32 {
     let mut pos = Chess::default();
     let mut repetitions: HashMap<u64, u8> = HashMap::new();
@@ -544,14 +557,18 @@ fn partie_gating(
     }
     // Bots frais par partie (TT vierge, équité) ; leurs graines sont inertes à
     // température 0, distinctes par hygiène.
+    // Le drapeau int8 s'applique aux DEUX camps : le gating mesure le réseau,
+    // pas la voie d'évaluation (mêmes conditions de part et d'autre).
     let mut bot_candidat =
-        BotRecherche::new(candidat.clone(), graine, limites_duel(NOEUDS_DUEL), 0.0);
+        BotRecherche::new(candidat.clone(), graine, limites_duel(NOEUDS_DUEL), 0.0)
+            .avec_int8(int8);
     let mut bot_champion = BotRecherche::new(
         champion.clone(),
         graine.wrapping_add(1),
         limites_duel(NOEUDS_DUEL),
         0.0,
-    );
+    )
+    .avec_int8(int8);
     let mut plies = ouverture.len() as u32;
 
     let resultat_blancs = loop {
@@ -595,7 +612,13 @@ fn partie_gating(
 /// mini-arène de search.rs). Paires jouées en parallèle (pool rayon global) ;
 /// `parties` est arrondi au nombre pair inférieur (0 ou 1 partie → 0.5).
 /// Renvoie le pourcentage de points du candidat dans [0, 1].
-fn duel_gating(candidat: Arc<Mlp>, champion: Arc<Mlp>, parties: usize, graine: u64) -> f32 {
+fn duel_gating(
+    candidat: Arc<Mlp>,
+    champion: Arc<Mlp>,
+    parties: usize,
+    graine: u64,
+    int8: bool,
+) -> f32 {
     let paires = parties / 2;
     if paires == 0 {
         return 0.5;
@@ -622,8 +645,8 @@ fn duel_gating(candidat: Arc<Mlp>, champion: Arc<Mlp>, parties: usize, graine: u
                 ouverture.push(m);
             }
             let g = derive_graine(graine, 2 * p as u64 + 1);
-            let pts = partie_gating(&candidat, &champion, true, &ouverture, g)
-                + partie_gating(&candidat, &champion, false, &ouverture, g.wrapping_add(2));
+            let pts = partie_gating(&candidat, &champion, true, &ouverture, g, int8)
+                + partie_gating(&candidat, &champion, false, &ouverture, g.wrapping_add(2), int8);
             let n = faites.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if n % 4 == 0 || n == paires {
                 println!("  gating : {}/{} paires jouees", n, paires);
@@ -925,6 +948,9 @@ fn main() {
                 .map(|&g| {
                     let mut eleve =
                         search::Recherche::new(net.clone(), TAILLE_TT_LOG2_SELFPLAY);
+                    // --int8 : la recherche de self-play évalue en quantizé
+                    // (les étiquettes TD-leaf restent des scores [-1,1]).
+                    eleve.utilise_int8 = opt.int8;
                     // Départ de la partie : ouverture du livre / finale
                     // générée / position initiale, tiré d'un rng DÉRIVÉ de la
                     // graine de la partie (déterminisme : même graine → même
@@ -995,6 +1021,7 @@ fn main() {
                     } else if let Some(m) = &mentor {
                         let mut prof =
                             search::Recherche::new(m.clone(), TAILLE_TT_LOG2_SELFPLAY);
+                        prof.utilise_int8 = opt.int8;
                         match &depart {
                             Some(d) => selfplay::play_training_game_mentor_depuis(
                                 &mut eleve,
@@ -1261,7 +1288,7 @@ fn main() {
             let mesures = if opt.search_nodes > 0 {
                 // Le moteur des ancres UCI est celui de --oracle (réutilisé) ;
                 // absent → mesure_elo_recherche saute proprement ces ancres.
-                mesure_elo_recherche(&net, opt.elo_games, graine_elo, &opt.oracle)
+                mesure_elo_recherche(&net, opt.elo_games, graine_elo, &opt.oracle, opt.int8)
             } else {
                 elo::mesure(&net, PROFONDEUR_ELO, opt.elo_games, graine_elo)
             };
@@ -1328,6 +1355,7 @@ fn main() {
                             Arc::new(champion),
                             opt.gate_games,
                             derive_graine(opt.seed.wrapping_add(etat.cycles), 0x6A7E),
+                            opt.int8,
                         );
                         let promu = score >= SEUIL_PROMOTION;
                         if promu {

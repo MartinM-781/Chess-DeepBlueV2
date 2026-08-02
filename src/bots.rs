@@ -325,6 +325,14 @@ impl BotRecherche {
             temperature,
         }
     }
+
+    /// Active (ou coupe) l'évaluation quantizée int8 de la recherche
+    /// (`Recherche::utilise_int8`, défaut false — voir src/quant.rs).
+    /// Consommant, pour s'enchaîner à `new` dans les fabriques de bots.
+    pub fn avec_int8(mut self, actif: bool) -> Self {
+        self.recherche.utilise_int8 = actif;
+        self
+    }
 }
 
 impl Bot for BotRecherche {
