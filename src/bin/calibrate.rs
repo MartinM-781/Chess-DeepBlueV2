@@ -17,6 +17,19 @@
 //!   --threads 4      threads rayon (parties parallèles → autant de processus moteur)
 //!   --seed 0
 //!
+//! Mode MOTEUR COMPLET (mesure « ce que le modèle a en banque » à temps réel) :
+//!   --recherche-movetime <ms>  le camp réseau n'est plus NetBot(depth) mais le
+//!                    moteur complet BotRecherche (approfondissement itératif,
+//!                    TT 2^20, quiescence...) limité à <ms> ms par coup
+//!                    (Limites { movetime_ms, max_noeuds: 0, max_profondeur: 0 },
+//!                    0 = illimité), température 0, bot frais par partie.
+//!                    --depth est alors ignoré.
+//!   --int8           active le chemin d'évaluation quantizé int8 du moteur
+//!                    (BotRecherche::avec_int8 — sans effet hors mode moteur).
+//!   --net <chemin>   modèle à mesurer (défaut : <out>/chess_latest.bin) —
+//!                    permet de mesurer models/chess_best.bin explicitement.
+//! Sans ces options, le comportement historique est STRICTEMENT inchangé.
+//!
 //! Sortie : une ligne par mesure (ancres + stockfish-XXXX), l'« Elo calibre »,
 //! et une ligne ajoutée à models/elo_calib.csv.
 
@@ -31,10 +44,11 @@ use rand::{Rng, SeedableRng};
 use shakmaty::{Chess, Move};
 
 use echec::arena;
-use echec::bots::{Bot, NetBot};
+use echec::bots::{Bot, BotRecherche, MaterialBot, NetBot, RandomBot};
 use echec::checkpoints;
 use echec::elo::{self, MesureAncre};
 use echec::nn::Mlp;
+use echec::search;
 use echec::uci::{StockfishBot, UciEngine};
 
 /// Options de la ligne de commande (défauts ci-dessus).
@@ -47,6 +61,12 @@ struct Options {
     engine: String,
     threads: usize,
     seed: u64,
+    /// Some(ms) : camp réseau = moteur complet BotRecherche à <ms> ms/coup.
+    recherche_movetime: Option<u64>,
+    /// Chemin int8 du moteur (mode moteur complet uniquement).
+    int8: bool,
+    /// Modèle à mesurer (None = <out>/chess_latest.bin, comme toujours).
+    net: Option<String>,
 }
 
 /// Valeur suivant l'option `nom`, ou sortie propre si elle manque.
@@ -75,6 +95,9 @@ fn parse_options() -> Options {
         engine: "engines/stockfish/stockfish-windows-x86-64-avx2.exe".to_string(),
         threads: 4,
         seed: 0,
+        recherche_movetime: None,
+        int8: false,
+        net: None,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -94,10 +117,21 @@ fn parse_options() -> Options {
             "--engine" => opt.engine = valeur(&args, i, &nom),
             "--threads" => opt.threads = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--seed" => opt.seed = parse_valeur(&valeur(&args, i, &nom), &nom),
+            "--recherche-movetime" => {
+                opt.recherche_movetime = Some(parse_valeur(&valeur(&args, i, &nom), &nom));
+            }
+            "--net" => opt.net = Some(valeur(&args, i, &nom)),
+            "--int8" => {
+                // Drapeau sans valeur : avancer d'UN cran seulement.
+                opt.int8 = true;
+                i += 1;
+                continue;
+            }
             _ => {
                 eprintln!("option inconnue : {nom}");
                 eprintln!(
-                    "options : --games --movetime --elos --depth --out --engine --threads --seed"
+                    "options : --games --movetime --elos --depth --out --engine --threads \
+                     --seed --recherche-movetime --int8 --net"
                 );
                 std::process::exit(2);
             }
@@ -106,6 +140,10 @@ fn parse_options() -> Options {
     }
     if opt.games == 0 || opt.elos.is_empty() {
         eprintln!("--games doit être > 0 et --elos non vide");
+        std::process::exit(2);
+    }
+    if opt.recherche_movetime == Some(0) {
+        eprintln!("--recherche-movetime doit être > 0 (ms par coup)");
         std::process::exit(2);
     }
     opt
@@ -142,6 +180,71 @@ impl Bot for NetBotPossedant {
     }
 }
 
+/// Fabrique du camp réseau pour arena::score (un bot FRAIS par partie —
+/// pour BotRecherche : TT vierge, équité, même pattern que train.rs) :
+/// - défaut : NetBotPossedant(depth), comportement historique ;
+/// - `recherche_movetime = Some(ms)` : moteur complet BotRecherche limité à
+///   <ms> ms par coup (0 = illimité pour nœuds/profondeur, sémantique
+///   vérifiée dans search.rs), TT standard 2^20, température 0, int8 en option.
+fn fabrique_reseau(
+    net: Arc<Mlp>,
+    depth: u32,
+    recherche_movetime: Option<u64>,
+    int8: bool,
+) -> impl Fn(u64) -> Box<dyn Bot> + Sync {
+    move |g: u64| -> Box<dyn Bot> {
+        match recherche_movetime {
+            Some(ms) => Box::new(
+                BotRecherche::new(
+                    net.clone(),
+                    g,
+                    search::Limites { max_noeuds: 0, max_profondeur: 0, movetime_ms: ms },
+                    0.0,
+                )
+                .avec_int8(int8),
+            ),
+            None => Box::new(NetBotPossedant::new(net.clone(), g, depth)),
+        }
+    }
+}
+
+/// Ancres maison en régime MOTEUR COMPLET : duplique elo::mesure (mêmes
+/// ancres, même mélange de graines — seul le bot mesuré change), même pattern
+/// que mesure_elo_recherche de train.rs. elo.rs reste intact.
+fn mesure_maison_fabrique<F>(fabrique: &F, parties_par_ancre: usize, graine: u64) -> Vec<MesureAncre>
+where
+    F: Fn(u64) -> Box<dyn Bot> + Sync,
+{
+    elo::ANCRES
+        .iter()
+        .filter_map(|a| match a.genre {
+            elo::GenreAncre::Maison { profondeur } => Some((a, profondeur)),
+            elo::GenreAncre::Uci { .. } => None,
+        })
+        .enumerate()
+        .map(|(k, (a, profondeur))| {
+            let score = arena::score(
+                fabrique,
+                |g: u64| -> Box<dyn Bot> {
+                    match profondeur {
+                        None => Box::new(RandomBot::new(g)),
+                        Some(d) => Box::new(MaterialBot::new(g, d)),
+                    }
+                },
+                parties_par_ancre,
+                graine.wrapping_add(k as u64).wrapping_mul(0x9E37_79B9),
+            ) as f64;
+            println!(
+                "  echelle Elo : {} -> {:.0} % ({} parties)",
+                a.nom,
+                score * 100.0,
+                parties_par_ancre
+            );
+            MesureAncre { nom: a.nom, elo_ancre: a.elo, score, parties: parties_par_ancre }
+        })
+        .collect()
+}
+
 fn main() {
     let opt = parse_options();
     rayon::ThreadPoolBuilder::new()
@@ -149,16 +252,24 @@ fn main() {
         .build_global()
         .expect("construction du pool rayon global");
 
-    // Modèle courant (celui que l'entraîneur sauve à chaque cycle).
-    let chemin_modele = checkpoints::latest_path(&opt.out);
+    // Modèle mesuré : --net explicite, sinon le modèle courant (celui que
+    // l'entraîneur sauve à chaque cycle).
+    let chemin_modele =
+        opt.net.clone().unwrap_or_else(|| checkpoints::latest_path(&opt.out));
     let net = Arc::new(Mlp::load(&chemin_modele).unwrap_or_else(|e| {
         eprintln!("chargement de {chemin_modele} : {e}");
         std::process::exit(1);
     }));
-    println!(
-        "calibration : {} | depth {} | {} parties/ancre | movetime {} ms",
-        chemin_modele, opt.depth, opt.games, opt.movetime
-    );
+    match opt.recherche_movetime {
+        Some(ms) => println!(
+            "calibration : {} | moteur complet {} ms/coup (int8 : {}) | {} parties/ancre | movetime {} ms",
+            chemin_modele, ms, opt.int8, opt.games, opt.movetime
+        ),
+        None => println!(
+            "calibration : {} | depth {} | {} parties/ancre | movetime {} ms",
+            chemin_modele, opt.depth, opt.games, opt.movetime
+        ),
+    }
 
     // Sonde UCI : vérifie le moteur et relève les bornes UCI_Elo AVANT de
     // jouer, pour nommer les ancres avec l'Elo effectivement appliqué (clamp).
@@ -170,13 +281,20 @@ fn main() {
     drop(sonde); // quitte proprement (Drop) : pas de zombie
     println!("moteur : {} (UCI_Elo {}..{})", opt.engine, elo_min, elo_max);
 
-    // 1. Ancres maison : mêmes duels que l'entraîneur (elo::mesure).
-    let mut mesures = elo::mesure(
-        &net,
-        opt.depth,
-        opt.games,
-        derive_graine(opt.seed, 0xCA11B),
-    );
+    // Fabrique du camp réseau, partagée par les ancres maison et les paliers
+    // Stockfish : NetBot(depth) historique, ou moteur complet BotRecherche
+    // (--recherche-movetime), int8 en option.
+    let fabrique =
+        fabrique_reseau(net.clone(), opt.depth, opt.recherche_movetime, opt.int8);
+
+    // 1. Ancres maison : mêmes duels que l'entraîneur (elo::mesure) ; en mode
+    //    moteur complet, mêmes ancres et mêmes graines mais camp réseau =
+    //    BotRecherche (mesure_maison_fabrique).
+    let mut mesures = if opt.recherche_movetime.is_some() {
+        mesure_maison_fabrique(&fabrique, opt.games, derive_graine(opt.seed, 0xCA11B))
+    } else {
+        elo::mesure(&net, opt.depth, opt.games, derive_graine(opt.seed, 0xCA11B))
+    };
 
     // 2. Paliers Stockfish : arena::score, couleurs alternées, un processus
     //    moteur par partie (nécessaire au parallélisme, tués par Drop).
@@ -185,14 +303,10 @@ fn main() {
         if elo_reel != elo_demande {
             println!("  UCI_Elo {elo_demande} clampé à {elo_reel}");
         }
-        let net_a = net.clone();
-        let depth = opt.depth;
         let engine = opt.engine.clone();
         let movetime = opt.movetime;
         let score = arena::score(
-            move |g: u64| -> Box<dyn Bot> {
-                Box::new(NetBotPossedant::new(net_a.clone(), g, depth))
-            },
+            &fabrique,
             |_g: u64| -> Box<dyn Bot> {
                 Box::new(
                     StockfishBot::new(&engine, elo_reel, movetime)
