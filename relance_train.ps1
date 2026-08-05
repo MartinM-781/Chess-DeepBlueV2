@@ -1,3 +1,6 @@
+# GARDE TEMPORAIRE (phase Couperets) : ne rien relancer tant que le drapeau
+# PAUSE_COUPERETS existe — retirée en fin de phase par l'opérateur.
+if (Test-Path "C:\dev\Echec\PAUSE_COUPERETS") { exit }
 # Chien de garde de l'entraînement : relance train.exe s'il est mort.
 # Appelé toutes les 5 min par la tâche planifiée « EchecTrainWatchdog ».
 # SOURCE DE VÉRITÉ des arguments du régime courant — à mettre à jour à

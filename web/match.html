@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Échecs IA — Match contre le Fantôme de Deep Blue</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+  /* ---- Spécifique à la page « Match » : repris de live.html (jauges), plus
+         horloges et score du match ---- */
+
+  .live-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+              background: var(--good); vertical-align: middle; margin-right: 6px; }
+  .live-dot.stale { background: var(--bad); }
+
+  /* Jauges horizontales sous le plateau : avantage côté BLANCS ∈ [-1, 1]
+     (mêmes classes que la page /live). */
+  .live-gauges { max-width: 640px; margin: 16px auto 0; display: flex;
+                 flex-direction: column; gap: 10px; }
+  .gauge { background: var(--surface); border: 1px solid var(--border);
+           border-radius: 10px; padding: 9px 12px; }
+  .gauge.off { opacity: 0.4; }
+  .gauge-head { display: flex; justify-content: space-between; align-items: baseline;
+                margin-bottom: 6px; }
+  .gauge-name { color: var(--muted); font-size: 10.5px; text-transform: uppercase;
+                letter-spacing: 0.6px; }
+  .gauge-val { color: var(--ink); font-size: 13.5px; font-weight: 600;
+               font-variant-numeric: tabular-nums; }
+  .gauge-track { position: relative; height: 14px; border-radius: 7px;
+                 background: var(--piece-black); border: 1px solid var(--border);
+                 overflow: hidden; }
+  .gauge-fill { position: absolute; top: 0; bottom: 0; left: 0; width: 50%;
+                background: linear-gradient(180deg, #fdfcf7, #d9d4c3);
+                transition: width 0.3s ease; }
+  .gauge-center { position: absolute; top: 0; bottom: 0; left: 50%; width: 2px;
+                  margin-left: -1px; background: var(--series-1); opacity: 0.85;
+                  z-index: 1; }
+
+  /* Score du match, gros et lisible. */
+  .match-score { text-align: center; font-size: 21px; font-weight: 700;
+                 font-variant-numeric: tabular-nums; color: var(--ink); }
+  .match-score .sep { color: var(--muted); margin: 0 8px; font-weight: 400; }
+  .match-sub { text-align: center; color: var(--muted); font-size: 11.5px;
+               margin-top: 2px; }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">♞ <strong>Échecs IA</strong> — 👻 Match : le Fantôme de Deep Blue</div>
+  <div class="sub"><span class="live-dot" id="live-dot"></span>Le champion affronte Stockfish bridé, coup par coup ·
+    <a class="head-link" href="/">← plateau</a> ·
+    <a class="head-link" href="/live">🔴 direct self-play</a> ·
+    <a class="head-link" href="/training">📈 courbes d'entraînement</a></div>
+</header>
+
+<main class="layout">
+  <!-- ============================ PLATEAU ============================ -->
+  <section class="game">
+    <div class="board-wrap">
+      <div class="board-frame">
+        <div class="board" id="board"></div>
+        <div class="banner" id="banner" hidden>
+          <div class="banner-title" id="banner-title"></div>
+          <div class="banner-sub" id="banner-sub"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Jauges d'évaluation (côté blancs) : champion et fantôme -->
+    <div class="live-gauges" id="gauges">
+      <div class="gauge" id="g-champion">
+        <div class="gauge-head">
+          <span class="gauge-name" id="nom-champion">Champion</span>
+          <span class="gauge-val" id="val-champion">—</span>
+        </div>
+        <div class="gauge-track"><div class="gauge-fill" id="fill-champion"></div><div class="gauge-center"></div></div>
+      </div>
+      <div class="gauge" id="g-fantome">
+        <div class="gauge-head">
+          <span class="gauge-name" id="nom-fantome">Fantôme de Deep Blue</span>
+          <span class="gauge-val" id="val-fantome">—</span>
+        </div>
+        <div class="gauge-track"><div class="gauge-fill" id="fill-fantome"></div><div class="gauge-center"></div></div>
+      </div>
+    </div>
+
+    <div class="status" id="status">Connexion au match…</div>
+    <div class="hint">Évaluations ∈ [−1, 1] du point de vue des blancs · trait bleu = égalité ·
+      horloges = temps de réflexion cumulé de la partie</div>
+  </section>
+
+  <!-- ============================ PANNEAU ============================ -->
+  <aside class="panel">
+    <div class="card-box">
+      <div class="card-box-head"><h2>Score du match</h2></div>
+      <div class="match-score"><span id="score-champion">—</span><span class="sep">·</span><span id="score-fantome">—</span></div>
+      <div class="match-sub" id="score-sub">Champion · Fantôme</div>
+    </div>
+
+    <div class="tiles">
+      <div class="tile"><div class="tile-value" id="tile-partie">—</div><div class="tile-label">Partie</div></div>
+      <div class="tile"><div class="tile-value" id="tile-ply">—</div><div class="tile-label">Pli</div></div>
+      <div class="tile"><div class="tile-value small" id="tile-horloge-champion">—</div><div class="tile-label">Horloge champion</div></div>
+      <div class="tile"><div class="tile-value small" id="tile-horloge-fantome">—</div><div class="tile-label">Horloge fantôme</div></div>
+    </div>
+
+    <div class="card-box">
+      <div class="card-box-head"><h2>Historique de la partie (SAN)</h2></div>
+      <div class="moves" id="moves">
+        <div class="moves-empty">En attente d'une partie…</div>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<script src="/match.js"></script>
+</body>
+</html>

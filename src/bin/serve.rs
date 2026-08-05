@@ -29,6 +29,10 @@
 //!  GET  /api/live        → models/live.json tel quel (partie de self-play
 //!                          retransmise par l'entraîneur, voir src/direct.rs) ;
 //!                          404 propre si rien n'a encore été publié.
+//!  GET  /api/match       → models/match_live.json tel quel (match retransmis
+//!                          par match.exe, jumeau du direct self-play — voir
+//!                          src/bin/match.rs ; page /match) ; 404 propre si
+//!                          aucun match n'a encore publié.
 //!
 //! Schéma de l'état ("state") :
 //!  {"fen": "...", "turn": "white"|"black", "your_color": "white"|"black",
@@ -587,6 +591,7 @@ fn servir_statique(chemin: &str) -> Rep {
         "/" => "index.html",
         "/training" => "training.html",
         "/live" => "live.html",
+        "/match" => "match.html",
         autre => autre.trim_start_matches('/'),
     };
     // Pas de traversée de répertoire.
@@ -627,6 +632,17 @@ fn api_live() -> Rep {
         Ok(donnees) => Response::from_data(donnees)
             .with_header(entete("Content-Type", "application/json; charset=utf-8")),
         Err(_) => erreur_json(404, "pas de direct : l'entraîneur n'a encore rien publié"),
+    }
+}
+
+/// GET /api/match : renvoie models/match_live.json tel quel — écrit
+/// ATOMIQUEMENT par match.exe à chaque coup (jumeau du direct self-play,
+/// voir src/bin/match.rs). 404 propre tant qu'aucun match n'a publié.
+fn api_match() -> Rep {
+    match std::fs::read(format!("{MODELS_DIR}/match_live.json")) {
+        Ok(donnees) => Response::from_data(donnees)
+            .with_header(entete("Content-Type", "application/json; charset=utf-8")),
+        Err(_) => erreur_json(404, "pas de match : match.exe n'a encore rien publié"),
     }
 }
 
@@ -735,6 +751,7 @@ fn traiter(mut req: Request, etat: &Etat) {
         "/api/checkpoints" if est_get => reponse_json(200, &checkpoints_json()),
         "/api/progress" if est_get => reponse_json(200, &progress_json()),
         "/api/live" if est_get => api_live(),
+        "/api/match" if est_get => api_match(),
         "/api/new-game" if est_post => api_new_game(etat, &corps),
         "/api/move" if est_post => api_move(etat, &corps),
         c if c.starts_with("/api/") => erreur_json(404, "route API inconnue"),

@@ -20,6 +20,15 @@
 //! près), mêmes coups : la recherche est inchangée, seulement plus rapide.
 //! Chemin de secours : champ `Recherche::utilise_nnue` (défaut true).
 //!
+//! LAZY SMP (champ `Recherche::threads`, défaut 1) : à N threads, N-1
+//! assistants mènent le même approfondissement itératif sur la MÊME position
+//! avec la table de transposition PARTAGÉE (sans verrous : deux mots
+//! atomiques par case, validation cle ^ donnees — voir CaseTT), killers,
+//! historique et piles d'accumulateurs PAR THREAD, profondeurs de départ et
+//! fenêtres d'aspiration légèrement décalées. Le thread principal garde le
+//! comportement mono-thread EXACT et rend le coup ; threads = 1 est bit à bit
+//! le moteur historique (entraînement et gating inchangés).
+//!
 //! C'est l'étage 1 de la fusée « battre Deep Blue » : il sert à la fois à
 //! JOUER (serveur, arène) et à FABRIQUER les étiquettes TD-leaf du self-play
 //! (le score racine devient la cible d'apprentissage).
@@ -28,6 +37,7 @@
 //! préférer les mats courts — SCORE_MAT domine largement l'échelle réseau.
 
 use std::cmp::Reverse;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -92,7 +102,8 @@ const DRAPEAU_BORNE_SUP: u8 = 3;
 /// légal, 0 sert donc de sentinelle.
 const COUP_AUCUN: u16 = 0;
 
-/// Entrée de la table de transposition (16 octets, sans padding).
+/// Entrée de la table de transposition, forme DÉPAQUETÉE du mot de 64 bits
+/// stocké dans une case (voir `paquette`).
 ///
 /// ATTENTION AUX MATS (le piège classique) : un score de mat vaut
 /// ±(SCORE_MAT - ply_racine), il dépend donc de la distance à la RACINE de la
@@ -105,20 +116,83 @@ const COUP_AUCUN: u16 = 0;
 /// correct vu de la nouvelle racine. Voir score_vers_tt / score_depuis_tt.
 #[derive(Clone, Copy)]
 struct EntreeTT {
-    cle: u64,
     score: f32,
     coup: u16,
     profondeur: u8,
     drapeau: u8,
 }
 
-const ENTREE_VIDE: EntreeTT = EntreeTT {
-    cle: 0,
-    score: 0.0,
-    coup: COUP_AUCUN,
-    profondeur: 0,
-    drapeau: DRAPEAU_VIDE,
-};
+/// Compacte une entrée TT en 64 bits : score f32 (bits 0-31, via to_bits,
+/// aller-retour EXACT) | coup (32-47) | profondeur (48-55) | drapeau (56-63).
+/// 0 est la case vide (drapeau DRAPEAU_VIDE) : les tables s'allouent à zéro.
+fn paquette(e: EntreeTT) -> u64 {
+    u64::from(e.score.to_bits())
+        | (u64::from(e.coup) << 32)
+        | (u64::from(e.profondeur) << 48)
+        | (u64::from(e.drapeau) << 56)
+}
+
+fn depaquette(d: u64) -> EntreeTT {
+    EntreeTT {
+        score: f32::from_bits(d as u32),
+        coup: (d >> 32) as u16,
+        profondeur: (d >> 48) as u8,
+        drapeau: (d >> 56) as u8,
+    }
+}
+
+/// Case de la table partagée : DEUX mots atomiques, `donnees` (l'entrée
+/// compactée) et `cle_x = cle ^ donnees`. C'est le hachage « lockless »
+/// standard des moteurs SMP : une course entre deux écritures peut entrelacer
+/// deux entrées, mais la validation `cle_x ^ donnees == cle` de la lecture
+/// échoue alors et l'entrée déchirée est simplement IGNORÉE — une course
+/// donne une entrée invalide DÉTECTÉE, jamais une entrée corrompue acceptée.
+/// Risque résiduel accepté : une fausse validation exigerait une coïncidence
+/// XOR sur 64 bits (~2^-64 par course), du même ordre que les collisions
+/// zobrist déjà tolérées par la table.
+/// (Ceinture indépendante : un coup TT n'est de toute façon JAMAIS joué
+/// directement — il est comparé à la liste LÉGALE de la position, via
+/// `compacter` dans `cle_ordre`, et ne sert qu'au tri.)
+struct CaseTT {
+    cle_x: AtomicU64,
+    donnees: AtomicU64,
+}
+
+/// 16 octets par case (deux u64, comme l'ancienne entrée nue) : une table de
+/// 2^log2 cases pèse 2^(log2+4) octets — log2 26 → 1 Gio, 27 → 2 Gio,
+/// 28 → 4 Gio, 29 → 8 Gio, 30 → 16 Gio (plafond).
+const _: () = assert!(std::mem::size_of::<CaseTT>() == 16);
+
+/// Taille mémoire en octets d'une table de 2^taille_log2 cases : pour les
+/// gardes « TT plus grosse que la RAM » des harnais (match.exe).
+pub fn octets_tt(taille_log2: u32) -> u64 {
+    (std::mem::size_of::<CaseTT>() as u64) << taille_log2
+}
+
+/// Table de transposition, partageable entre threads (lazy SMP) : accès sans
+/// verrous, cohérence par validation XOR (voir CaseTT). En mono-thread, la
+/// sémantique (indexation, politique de remplacement, scores au bit près) est
+/// STRICTEMENT celle de l'ancienne table à entrées nues.
+struct TableTT {
+    cases: Vec<CaseTT>,
+    masque: u64,
+}
+
+impl TableTT {
+    fn new(taille_log2: u32) -> Self {
+        assert!(
+            taille_log2 <= 30,
+            "taille_tt_log2 déraisonnable (> 2^30 cases = 16 Gio)"
+        );
+        let n = 1usize << taille_log2;
+        let mut cases = Vec::new();
+        cases.resize_with(n, || CaseTT {
+            cle_x: AtomicU64::new(0),
+            donnees: AtomicU64::new(0),
+        });
+        TableTT { cases, masque: (n - 1) as u64 }
+    }
+}
 
 /// Conversion d'un score « vu de la racine » en score « vu du nœud » pour le
 /// stockage en TT (voir le commentaire d'EntreeTT : c'est LE piège des mats).
@@ -317,6 +391,28 @@ pub struct Limites {
     pub movetime_ms: u64,
 }
 
+/// Paramètres de diversification d'un thread assistant du lazy SMP : chaque
+/// assistant explore le même approfondissement itératif mais LÉGÈREMENT
+/// décalé, pour peupler la TT partagée de sous-arbres différents.
+#[derive(Clone, Copy)]
+struct ParamsAssistant {
+    /// Profondeur de la PREMIÈRE itération (le principal démarre toujours à 1).
+    profondeur_depart: u32,
+    /// Facteur (>= 1) sur la demi-largeur initiale des fenêtres d'aspiration.
+    facteur_aspiration: f32,
+}
+
+/// Pose le drapeau d'arrêt partagé à sa destruction : les assistants sont
+/// rappelés même si le thread principal sort par panique (sans quoi la
+/// jointure implicite du scope les attendrait sans fin).
+struct GardeArret<'a>(&'a AtomicBool);
+
+impl Drop for GardeArret<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 pub struct Resultat {
     /// Meilleur coup (None seulement sans coup légal).
     pub coup: Option<Move>,
@@ -360,6 +456,12 @@ pub struct Recherche {
     /// Réseau non quantizable (linéaire, poids hors domaine) : repli f32
     /// silencieux, jamais de panique.
     pub utilise_int8: bool,
+    /// Nombre de threads de recherche (défaut 1). À 1, chemin STRICTEMENT
+    /// identique au moteur historique — mêmes coups, mêmes nœuds : c'est le
+    /// mode de l'entraînement, du self-play et du gating, qui ne changent
+    /// pas. À N > 1, lazy SMP (voir cherche_smp) : réservé aux harnais de
+    /// match/analyse.
+    pub threads: u32,
     /// Poids réorganisés pour l'évaluation incrémentale. `None` = réseau sans
     /// couche cachée (les réseaux linéaires [773,1] de certains tests, où il
     /// n'y a de toute façon rien à accélérer) → forward complet d'office.
@@ -379,9 +481,10 @@ pub struct Recherche {
     /// Pile d'accumulateurs ENTIERS (chemin int8), pendante de `pile` —
     /// au plus une des deux est active pendant un cherche().
     pile_quant: Option<PileQuant>,
-    /// Table de transposition : 2^taille_tt_log2 entrées, index = cle & masque.
-    tt: Vec<EntreeTT>,
-    masque: u64,
+    /// Table de transposition : 2^taille_tt_log2 cases, index = cle & masque.
+    /// Arc : les threads assistants du lazy SMP sondent et stockent la MÊME
+    /// table (cohérence sans verrous, voir TableTT/CaseTT).
+    tt: Arc<TableTT>,
     /// Deux killers par ply (coups calmes ayant produit une coupure bêta).
     killers: Vec<[u16; 2]>,
     /// Historique [couleur][from][to] aplati (2 × 64 × 64), incrémenté de
@@ -401,6 +504,16 @@ pub struct Recherche {
     limite_noeuds: u64,
     fin: Option<Instant>,
     prochaine_verif_chrono: u64,
+    /// Drapeau d'arrêt coopératif posé par le thread principal du lazy SMP
+    /// (None hors SMP, donc toujours None sur un chercheur construit par
+    /// `new`) : consulté par les assistants au même rythme que le chrono,
+    /// tous les ~INTERVALLE_CHRONO nœuds.
+    arret_partage: Option<Arc<AtomicBool>>,
+    /// Statistiques TT du DERNIER cherche() — sondes et hits, tous threads
+    /// confondus en SMP. Diagnostic des harnais ; aucun effet sur la
+    /// recherche.
+    pub tt_sondes: u64,
+    pub tt_hits: u64,
 }
 
 impl Recherche {
@@ -408,8 +521,13 @@ impl Recherche {
     /// d'entrées). La table est allouée une fois et réutilisée entre coups
     /// (les hits entre coups successifs sont une grosse part du gain).
     pub fn new(net: Arc<Mlp>, taille_tt_log2: u32) -> Self {
-        assert!(taille_tt_log2 <= 30, "taille_tt_log2 déraisonnable (> 2^30 entrées)");
-        let n = 1usize << taille_tt_log2;
+        Self::avec_table(net, Arc::new(TableTT::new(taille_tt_log2)))
+    }
+
+    /// Constructeur interne : chercheur posé sur une table EXISTANTE — le
+    /// partage du lazy SMP (voir `assistant`). Tout le reste de l'état est
+    /// neuf et PAR THREAD.
+    fn avec_table(net: Arc<Mlp>, tt: Arc<TableTT>) -> Self {
         // Évaluation incrémentale construite UNE FOIS depuis le réseau (copie
         // des poids en colonnes) : voir le commentaire de la struct pour le
         // rechargement du réseau. Réseau sans couche cachée → forward complet.
@@ -419,13 +537,13 @@ impl Recherche {
             mode_classique: false,
             utilise_nnue: true,
             utilise_int8: false,
+            threads: 1,
             eval,
             pile: None,
             quant: None,
             quant_tente: false,
             pile_quant: None,
-            tt: vec![ENTREE_VIDE; n],
-            masque: (n - 1) as u64,
+            tt,
             killers: vec![[COUP_AUCUN; 2]; MAX_PLY],
             historique: vec![0; 2 * 64 * 64],
             tampon: vec![0.0; N_FEATURES],
@@ -436,6 +554,9 @@ impl Recherche {
             limite_noeuds: u64::MAX,
             fin: None,
             prochaine_verif_chrono: 0,
+            arret_partage: None,
+            tt_sondes: 0,
+            tt_hits: 0,
         }
     }
 
@@ -445,7 +566,97 @@ impl Recherche {
     /// tri coup TT > prises MVV-LVA > killers > historique, mats/pats exacts,
     /// nulles (50 coups, matériel insuffisant) à 0. La détection de répétition
     /// DANS l'arbre n'est pas exigée (les boucles de jeu l'arbitrent).
+    /// `threads` = 1 (défaut) : recherche historique exacte ; > 1 : lazy SMP,
+    /// même contrat, le coup rendu est celui du thread principal.
     pub fn cherche(&mut self, pos: &Chess, limites: Limites) -> Resultat {
+        if self.threads <= 1 {
+            return self
+                .cherche_thread(pos, limites, None)
+                .expect("l'itération 1 est toujours menée à terme");
+        }
+        self.cherche_smp(pos, limites)
+    }
+
+    /// Lazy SMP (threads >= 2) : N-1 assistants mènent le même
+    /// approfondissement itératif sur la MÊME position, TT partagée, killers/
+    /// historique/piles d'accumulateurs PAR THREAD, profondeurs de départ et
+    /// fenêtres d'aspiration légèrement décalées (ParamsAssistant) pour
+    /// diversifier les arbres. Le thread principal (self) garde exactement le
+    /// comportement mono-thread et REND LE COUP ; à sa sortie, le drapeau
+    /// d'arrêt partagé rappelle les assistants, qui le consultent au même
+    /// rythme que le chrono. Les assistants sont des chercheurs NEUFS à
+    /// chaque appel (quelques Mo de copies de poids — négligeable à la
+    /// cadence d'un match ; leurs killers/historique repartent à zéro, la
+    /// mémoire entre coups vit dans la TT partagée).
+    fn cherche_smp(&mut self, pos: &Chess, limites: Limites) -> Resultat {
+        let arret = Arc::new(AtomicBool::new(false));
+        // Les assistants n'ont ni budget de nœuds ni profondeur propre : ils
+        // s'arrêtent par le drapeau (et, en ceinture, par la même échéance de
+        // chrono que le principal). PROF_MAX tient lieu de critère non nul
+        // pour l'assertion de cherche_thread quand movetime_ms vaut 0
+        // (appelant à nœuds ou profondeur fixes).
+        let limites_assistant = Limites {
+            max_noeuds: 0,
+            max_profondeur: PROF_MAX,
+            movetime_ms: limites.movetime_ms,
+        };
+        let mut assistants: Vec<Recherche> =
+            (0..self.threads - 1).map(|_| self.assistant(&arret)).collect();
+        let mut resultat = None;
+        std::thread::scope(|s| {
+            let garde = GardeArret(&arret);
+            for (i, a) in assistants.iter_mut().enumerate() {
+                // Diversification standard du lazy SMP : la moitié des
+                // assistants commence un pli plus profond, et la demi-largeur
+                // d'aspiration s'élargit par paliers (×1, ×1.5, ×2).
+                let params = ParamsAssistant {
+                    profondeur_depart: 1 + (i as u32 % 2),
+                    facteur_aspiration: 1.0 + 0.5 * ((i / 2) % 3) as f32,
+                };
+                s.spawn(move || {
+                    let _ = a.cherche_thread(pos, limites_assistant, Some(params));
+                });
+            }
+            resultat = self.cherche_thread(pos, limites, None);
+            // Le principal a fini : rappel des assistants, puis jointure
+            // implicite en fin de scope. La garde couvre aussi la panique.
+            drop(garde);
+        });
+        let mut resultat = resultat.expect("l'itération 1 est toujours menée à terme");
+        // Comptes agrégés (diagnostic) : le coup, le score et scores_racine
+        // restent ceux du thread principal.
+        for a in &assistants {
+            resultat.noeuds += a.noeuds;
+            self.tt_sondes += a.tt_sondes;
+            self.tt_hits += a.tt_hits;
+        }
+        resultat
+    }
+
+    /// Chercheur assistant du lazy SMP : état de recherche NEUF (killers,
+    /// historique, piles), mêmes drapeaux d'évaluation, même réseau (Arc) et
+    /// MÊME table de transposition (Arc) que `self`.
+    fn assistant(&self, arret: &Arc<AtomicBool>) -> Recherche {
+        let mut a = Recherche::avec_table(self.net.clone(), self.tt.clone());
+        a.mode_classique = self.mode_classique;
+        a.utilise_nnue = self.utilise_nnue;
+        a.utilise_int8 = self.utilise_int8;
+        a.arret_partage = Some(arret.clone());
+        a
+    }
+
+    /// Corps de la recherche d'UN thread — l'ancien cherche(), paramétré.
+    /// `assistant` : None pour le thread principal (comportement historique
+    /// EXACT, l'itération 1 ignore les limites, résultat toujours Some) ;
+    /// Some(params) pour un assistant SMP (limites actives dès la première
+    /// itération, profondeur de départ et aspiration décalées, None si
+    /// interrompu avant une première itération complète).
+    fn cherche_thread(
+        &mut self,
+        pos: &Chess,
+        limites: Limites,
+        assistant: Option<ParamsAssistant>,
+    ) -> Option<Resultat> {
         assert!(
             limites.max_noeuds > 0 || limites.max_profondeur > 0 || limites.movetime_ms > 0,
             "Limites : au moins un critère doit être non nul"
@@ -457,17 +668,19 @@ impl Recherche {
         self.fin = (limites.movetime_ms > 0)
             .then(|| Instant::now() + Duration::from_millis(limites.movetime_ms));
         self.prochaine_verif_chrono = INTERVALLE_CHRONO;
+        self.tt_sondes = 0;
+        self.tt_hits = 0;
 
         let coups = pos.legal_moves();
         if coups.is_empty() {
             // Position terminale : mat (le trait perd, ply 0) ou pat.
-            return Resultat {
+            return Some(Resultat {
                 coup: None,
                 score: if pos.is_check() { -SCORE_MAT } else { 0.0 },
                 profondeur: 0,
                 noeuds: 0,
                 scores_racine: Vec::new(),
-            };
+            });
         }
         // NB : si la position est déjà nulle « aux règles » (50 coups, matériel
         // insuffisant), l'arbitrage appartient aux boucles de jeu ; ici on rend
@@ -520,10 +733,16 @@ impl Recherche {
         // Dernière itération COMPLÈTE : (meilleur coup, score, profondeur, scores racine).
         let mut complete: Option<(Move, f32, u32, Vec<(Move, f32)>)> = None;
 
-        'iterations: for d in 1..=prof_max {
-            // L'itération 1 ignore les limites : il faut TOUJOURS un coup.
-            self.limites_actives = d > 1;
-            if d > 1 && self.budget_epuise() {
+        // Assistant SMP : première itération décalée (diversification) et
+        // limites actives d'emblée — il n'a pas à garantir un coup, le
+        // principal s'en charge. Principal : départ à 1, itération 1 hors
+        // limites, comme toujours.
+        let depart = assistant.map_or(1, |p| p.profondeur_depart.clamp(1, prof_max));
+        'iterations: for d in depart..=prof_max {
+            // L'itération 1 (du principal) ignore les limites : il faut
+            // TOUJOURS un coup.
+            self.limites_actives = assistant.is_some() || d > 1;
+            if self.limites_actives && self.budget_epuise() {
                 break;
             }
 
@@ -539,7 +758,12 @@ impl Recherche {
             let aspiration = !self.mode_classique
                 && d >= 3
                 && score_prec.is_some_and(|s| s.abs() <= SEUIL_MAT);
-            let mut demi = DELTA_ASPIRATION;
+            // Assistant SMP : fenêtre initiale élargie d'un facteur propre au
+            // thread (diversification) ; principal : DELTA_ASPIRATION tel quel.
+            let mut demi = match assistant {
+                Some(p) => DELTA_ASPIRATION * p.facteur_aspiration,
+                None => DELTA_ASPIRATION,
+            };
             let (mut fen_bas, mut fen_haut) = if aspiration {
                 let s = score_prec.expect("aspiration exige une itération précédente");
                 (s - demi, s + demi)
@@ -576,8 +800,12 @@ impl Recherche {
                     // en nœuds (INTERVALLE_CHRONO) peut être trop grossière quand le
                     // réseau est lent ; ici l'appel d'horloge est gratuit à l'échelle
                     // d'un sous-arbre. Sans incidence sur le déterminisme à budget de
-                    // nœuds fixe (fin = None dans ce cas).
-                    if self.limites_actives && self.fin.is_some_and(|f| Instant::now() >= f) {
+                    // nœuds fixe (fin = None dans ce cas). Même consultation du
+                    // drapeau d'arrêt partagé pour un assistant SMP (None sinon).
+                    if self.limites_actives
+                        && (self.fin.is_some_and(|f| Instant::now() >= f)
+                            || self.arret_partage.as_ref().is_some_and(|a| a.load(Ordering::Relaxed)))
+                    {
                         self.stop = true;
                         break 'iterations;
                     }
@@ -637,21 +865,28 @@ impl Recherche {
             }
         }
 
-        let (coup, score, profondeur, scores_racine) =
-            complete.expect("l'itération 1 est toujours menée à terme");
-        Resultat {
+        // Principal : Some garanti (son itération 1 ignore les limites) —
+        // l'expect vit chez les appelants. Assistant : None si le drapeau
+        // d'arrêt l'a interrompu avant une première itération complète.
+        let (coup, score, profondeur, scores_racine) = complete?;
+        Some(Resultat {
             coup: Some(coup),
             score,
             profondeur,
             noeuds: self.noeuds,
             scores_racine,
-        }
+        })
     }
 
     /// À appeler entre deux PARTIES (pas entre deux coups) : vide TT,
-    /// killers et historique.
+    /// killers et historique. (La table étant partagée en SMP, la remise à
+    /// zéro vaut pour tous les threads — les assistants d'un cherche() sont
+    /// de toute façon éphémères.)
     pub fn nouvelle_partie(&mut self) {
-        self.tt.fill(ENTREE_VIDE);
+        for case in &self.tt.cases {
+            case.cle_x.store(0, Ordering::Relaxed);
+            case.donnees.store(0, Ordering::Relaxed);
+        }
         self.killers.fill([COUP_AUCUN; 2]);
         self.historique.fill(0);
     }
@@ -1094,7 +1329,8 @@ impl Recherche {
 
     /// Vrai si la recherche doit s'arrêter. Le budget de nœuds est testé à
     /// CHAQUE nœud (comparaison d'entiers, gratuite et déterministe) ; le
-    /// chrono seulement tous les ~INTERVALLE_CHRONO nœuds.
+    /// chrono — et, pour un assistant SMP, le drapeau d'arrêt partagé — tous
+    /// les ~INTERVALLE_CHRONO nœuds seulement.
     fn verifier_arret(&mut self) -> bool {
         if self.stop {
             return true;
@@ -1106,43 +1342,71 @@ impl Recherche {
             self.stop = true;
             return true;
         }
-        if let Some(fin) = self.fin {
-            if self.noeuds >= self.prochaine_verif_chrono {
-                self.prochaine_verif_chrono = self.noeuds + INTERVALLE_CHRONO;
-                if Instant::now() >= fin {
-                    self.stop = true;
-                    return true;
-                }
+        if (self.fin.is_some() || self.arret_partage.is_some())
+            && self.noeuds >= self.prochaine_verif_chrono
+        {
+            self.prochaine_verif_chrono = self.noeuds + INTERVALLE_CHRONO;
+            if self.fin.is_some_and(|f| Instant::now() >= f) {
+                self.stop = true;
+                return true;
+            }
+            if self.arret_partage.as_ref().is_some_and(|a| a.load(Ordering::Relaxed)) {
+                self.stop = true;
+                return true;
             }
         }
         false
     }
 
-    /// Test direct (entre deux itérations) : budget déjà consommé ?
+    /// Test direct (entre deux itérations) : budget déjà consommé ? (Pour un
+    /// assistant SMP, le drapeau d'arrêt partagé compte comme un budget.)
     fn budget_epuise(&self) -> bool {
         self.noeuds >= self.limite_noeuds
             || self.fin.is_some_and(|f| Instant::now() >= f)
+            || self.arret_partage.as_ref().is_some_and(|a| a.load(Ordering::Relaxed))
     }
 
     // --- Table de transposition ----------------------------------------------
 
-    fn sonde(&self, cle: u64) -> Option<EntreeTT> {
-        let e = self.tt[(cle & self.masque) as usize];
-        (e.drapeau != DRAPEAU_VIDE && e.cle == cle).then_some(e)
+    fn sonde(&mut self, cle: u64) -> Option<EntreeTT> {
+        let case = &self.tt.cases[(cle & self.tt.masque) as usize];
+        let cle_x = case.cle_x.load(Ordering::Relaxed);
+        let donnees = case.donnees.load(Ordering::Relaxed);
+        self.tt_sondes += 1;
+        let e = depaquette(donnees);
+        // Validation lockless : drapeau non vide ET clé reconstituée exacte
+        // (cle_x ^ donnees). Une écriture déchirée par une course entre
+        // threads échoue ici et vaut simplement « absent ».
+        if e.drapeau != DRAPEAU_VIDE && cle_x ^ donnees == cle {
+            self.tt_hits += 1;
+            Some(e)
+        } else {
+            None
+        }
     }
 
     /// Remplacement : case vide, clé différente, ou profondeur >= existante
     /// (une recherche plus profonde de la même position est plus fiable).
+    /// Lecture-décision-écriture NON atomique : entre threads, le pire cas
+    /// est un remplacement « injuste » ou perdu — jamais une entrée corrompue
+    /// acceptée (la validation XOR de sonde() détecte tout entrelacement).
     fn stocke(&mut self, cle: u64, profondeur: u32, drapeau: u8, score: f32, coup: u16) {
-        let e = &mut self.tt[(cle & self.masque) as usize];
-        if e.drapeau == DRAPEAU_VIDE || e.cle != cle || profondeur >= u32::from(e.profondeur) {
-            *e = EntreeTT {
-                cle,
+        let case = &self.tt.cases[(cle & self.tt.masque) as usize];
+        let cle_x = case.cle_x.load(Ordering::Relaxed);
+        let ancien = case.donnees.load(Ordering::Relaxed);
+        let e = depaquette(ancien);
+        if e.drapeau == DRAPEAU_VIDE
+            || cle_x ^ ancien != cle
+            || profondeur >= u32::from(e.profondeur)
+        {
+            let d = paquette(EntreeTT {
                 score,
                 coup,
                 profondeur: profondeur.min(255) as u8,
                 drapeau,
-            };
+            });
+            case.donnees.store(d, Ordering::Relaxed);
+            case.cle_x.store(cle ^ d, Ordering::Relaxed);
         }
     }
 
@@ -1901,6 +2165,281 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- Harnais de parité mono-thread (chantier lazy SMP) -------------------
+
+    /// Réseau réduit à biais non nuls (même recette que le test de parité
+    /// NNUE) : couvre le transport des biais dans les piles d'accumulateurs.
+    fn reseau_reduit_biaise() -> Arc<Mlp> {
+        let mut net = Arc::try_unwrap(reseau_reduit()).ok().expect("Arc unique");
+        let mut rng = StdRng::seed_from_u64(0xB1A15);
+        for biais in net.biases.iter_mut() {
+            for b in biais.iter_mut() {
+                *b = rng.gen::<f32>() * 0.2 - 0.1;
+            }
+        }
+        Arc::new(net)
+    }
+
+    /// `n` positions variées et déterministes : marches aléatoires (graines
+    /// fixes) de 2 à 41 plis depuis la position initiale, jamais terminales.
+    /// NE PAS MODIFIER cette génération : la référence de parité en dépend.
+    fn positions_variees(n: usize) -> Vec<Chess> {
+        let mut v = Vec::new();
+        let mut graine = 0u64;
+        while v.len() < n {
+            graine += 1;
+            let mut rng = StdRng::seed_from_u64(0x5EED_0000 + graine);
+            let mut pos = Chess::default();
+            for _ in 0..(2 + (graine as usize * 7) % 40) {
+                let coups = pos.legal_moves();
+                if coups.is_empty() || pos.is_insufficient_material() || pos.halfmoves() >= 100 {
+                    break;
+                }
+                pos = pos
+                    .play(coups.choose(&mut rng).expect("liste non vide"))
+                    .expect("coup légal");
+            }
+            if !pos.legal_moves().is_empty() {
+                v.push(pos);
+            }
+        }
+        v
+    }
+
+    /// Empreinte comportementale du chercheur mono-thread : pour chaque
+    /// (config, position), le coup choisi, le score AU BIT PRÈS, la profondeur
+    /// et le nombre EXACT de nœuds, à budget de nœuds fixe (aucune horloge en
+    /// jeu, tout est déterministe). La TT est conservée d'une position à
+    /// l'autre au sein d'une config : la politique de remplacement fait
+    /// partie du comportement capturé.
+    fn empreinte_parite() -> Vec<String> {
+        let net = reseau_reduit_biaise();
+        let positions = positions_variees(200);
+        let mut lignes = Vec::new();
+        for (nom, classique, int8) in
+            [("defaut", false, false), ("classique", true, false), ("int8", false, true)]
+        {
+            let mut r = Recherche::new(net.clone(), 18);
+            r.mode_classique = classique;
+            r.utilise_int8 = int8;
+            for pos in &positions {
+                let res = r.cherche(pos, limites_noeuds(2500));
+                let coup = res
+                    .coup
+                    .map(|m| m.to_uci(CastlingMode::Standard).to_string())
+                    .unwrap_or_else(|| "aucun".into());
+                lignes.push(format!(
+                    "{nom};{};{coup};{:08x};{};{}",
+                    Fen::from_position(pos.clone(), EnPassantMode::Legal),
+                    res.score.to_bits(),
+                    res.profondeur,
+                    res.noeuds
+                ));
+            }
+        }
+        lignes
+    }
+
+    /// (Parité SMP) Test piloté par ECHEC_PARITE_REF :
+    /// - le fichier n'existe pas → l'empreinte du code COURANT y est écrite ;
+    /// - il existe → l'empreinte recalculée doit lui être IDENTIQUE.
+    /// Généré AVANT le chantier SMP, rejoué APRÈS : threads=1 doit rejouer
+    /// exactement les mêmes coups, scores (au bit), profondeurs et nœuds.
+    /// Lancer : ECHEC_PARITE_REF=<fichier> cargo test --lib --release
+    ///          parite_threads_1 -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn parite_threads_1_contre_reference() {
+        let Some(chemin) = std::env::var_os("ECHEC_PARITE_REF") else {
+            println!("ECHEC_PARITE_REF absent : rien à faire");
+            return;
+        };
+        let chemin = std::path::PathBuf::from(chemin);
+        let lignes = empreinte_parite();
+        if chemin.exists() {
+            let attendu = std::fs::read_to_string(&chemin).expect("lecture de la référence");
+            let attendu: Vec<&str> = attendu.lines().collect();
+            let mut ecarts = 0usize;
+            for (i, (a, b)) in attendu.iter().zip(&lignes).enumerate() {
+                if *a != b.as_str() {
+                    ecarts += 1;
+                    if ecarts <= 10 {
+                        println!("écart ligne {i} :\n  réf : {a}\n  ici : {b}");
+                    }
+                }
+            }
+            assert_eq!(attendu.len(), lignes.len(), "nombre de lignes");
+            assert_eq!(ecarts, 0, "{ecarts} écart(s) contre la référence");
+            println!("parité stricte : {} lignes identiques", lignes.len());
+        } else {
+            std::fs::write(&chemin, lignes.join("\n")).expect("écriture de la référence");
+            println!("référence écrite ({} lignes) : {}", lignes.len(), chemin.display());
+        }
+    }
+
+    /// Compactage TT : aller-retour exact champ à champ (score au bit près,
+    /// scores de mat compris), et détection d'une écriture déchirée par la
+    /// validation XOR du hachage lockless.
+    #[test]
+    fn tt_paquette_depaquette_exacts() {
+        for (score, coup, profondeur, drapeau) in [
+            (0.0f32, COUP_AUCUN, 0u8, DRAPEAU_VIDE),
+            (0.123_456_79, 4095u16, 17, DRAPEAU_EXACT),
+            (-0.987_654_3, 513, 255, DRAPEAU_BORNE_INF),
+            (SCORE_MAT - 7.0, u16::MAX, 64, DRAPEAU_BORNE_SUP),
+            (-(SCORE_MAT - 12.0), 1, 1, DRAPEAU_EXACT),
+        ] {
+            let d = paquette(EntreeTT { score, coup, profondeur, drapeau });
+            let r = depaquette(d);
+            assert_eq!(r.score.to_bits(), score.to_bits());
+            assert_eq!(r.coup, coup);
+            assert_eq!(r.profondeur, profondeur);
+            assert_eq!(r.drapeau, drapeau);
+        }
+        // Écriture déchirée simulée : cle_x d'une entrée, donnees d'une autre
+        // → la clé reconstituée ne colle plus, l'entrée est ignorée.
+        let e1 = paquette(EntreeTT { score: 0.25, coup: 100, profondeur: 9, drapeau: DRAPEAU_EXACT });
+        let e2 = paquette(EntreeTT { score: -0.5, coup: 7, profondeur: 3, drapeau: DRAPEAU_BORNE_INF });
+        let (cle1, cle2) = (0xDEAD_BEEF_1234_5678u64, 0x0BAD_F00D_8765_4321u64);
+        assert_eq!((cle1 ^ e1) ^ e1, cle1); // écriture propre : validée
+        assert_ne!((cle1 ^ e1) ^ e2, cle1); // entrelacement : détecté...
+        assert_ne!((cle1 ^ e1) ^ e2, cle2); // ...pour les deux clés en course
+    }
+
+    /// (SMP) Fumée 2 threads : un coup légal et un score fini à 150 ms sur un
+    /// milieu de partie, TT partagée effectivement sondée. La couverture SMP
+    /// sérieuse vit dans smp_8_threads_50_positions_500ms (ignoré, release).
+    #[test]
+    fn smp_2_threads_fumee() {
+        let pos = pos_de_fen(
+            "r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
+        );
+        let mut r = Recherche::new(reseau_reduit_biaise(), 16);
+        r.threads = 2;
+        let res =
+            r.cherche(&pos, Limites { max_noeuds: 0, max_profondeur: 0, movetime_ms: 150 });
+        let coup = res.coup.expect("coup légal");
+        assert!(pos.is_legal(&coup));
+        assert!(res.score.is_finite());
+        assert!(r.tt_sondes > 0, "la TT partagée n'a jamais été sondée");
+    }
+
+    /// (SMP, ignoré par défaut) Le test du contrat : 8 threads sur 50
+    /// positions variées à 500 ms chacune, réseau complet — aucun crash, un
+    /// coup légal partout, TT partagée réellement utile (taux de hit
+    /// raisonnable, la table est conservée de position en position). Puis
+    /// fumée int8 SMP sur 5 positions (piles quantizées PAR THREAD sous
+    /// concurrence).
+    /// Lancer : cargo test --lib --release smp_8_threads -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn smp_8_threads_50_positions_500ms() {
+        let limites = Limites { max_noeuds: 0, max_profondeur: 0, movetime_ms: 500 };
+        let mut r = Recherche::new(Arc::new(Mlp::new(0)), 22);
+        r.threads = 8;
+        let positions = positions_variees(50);
+        let (mut sondes, mut hits, mut noeuds) = (0u64, 0u64, 0u64);
+        for (i, pos) in positions.iter().enumerate() {
+            let res = r.cherche(pos, limites);
+            let coup = res.coup.expect("coup légal attendu");
+            assert!(pos.is_legal(&coup), "coup illégal {coup:?} (position {i})");
+            assert!(res.score.is_finite(), "score non fini (position {i})");
+            sondes += r.tt_sondes;
+            hits += r.tt_hits;
+            noeuds += res.noeuds;
+        }
+        let taux = hits as f64 / sondes.max(1) as f64;
+        println!(
+            "SMP 8 threads : {} positions, {noeuds} nœuds cumulés, TT {hits}/{sondes} hits ({:.1} %)",
+            positions.len(),
+            100.0 * taux
+        );
+        assert!(taux >= 0.05, "taux de hit TT anormalement bas : {:.2} %", 100.0 * taux);
+
+        let mut r8 = Recherche::new(Arc::new(Mlp::new(0)), 22);
+        r8.threads = 8;
+        r8.utilise_int8 = true;
+        for pos in positions.iter().take(5) {
+            let res = r8.cherche(pos, limites);
+            let coup = res.coup.expect("coup légal attendu");
+            assert!(pos.is_legal(&coup));
+        }
+        println!("fumée int8 SMP : 5 positions OK");
+    }
+
+    /// Diagnostic (ignoré par défaut) : mise à l'échelle du lazy SMP — nœuds
+    /// cumulés et profondeur atteinte à 2 s par position, 1 thread contre 8,
+    /// réseau complet. Les nœuds doivent croître nettement ; la profondeur ne
+    /// doit jamais reculer de plus d'un pli (aléas d'horloge).
+    #[test]
+    #[ignore]
+    fn diag_smp_scaling_2s() {
+        let fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+        ];
+        let limites = Limites { max_noeuds: 0, max_profondeur: 0, movetime_ms: 2000 };
+        for fen in fens {
+            let pos = pos_de_fen(fen);
+            let mut ligne = String::new();
+            for threads in [1u32, 8] {
+                let mut r = Recherche::new(Arc::new(Mlp::new(0)), 24);
+                r.threads = threads;
+                let res = r.cherche(&pos, limites);
+                ligne.push_str(&format!(
+                    "  {threads} thread(s) : prof {:>2}, {:>8} nœuds ({:>5.1} % hits TT)",
+                    res.profondeur,
+                    res.noeuds,
+                    100.0 * r.tt_hits as f64 / r.tt_sondes.max(1) as f64
+                ));
+            }
+            println!("{ligne}  {fen}");
+        }
+    }
+
+    /// (TT géante, ignoré par défaut) Alloue une table de 2^log2 cases
+    /// (log2 = ECHEC_TT_LOG2, défaut 28 → 4 Gio à 16 octets/case) et vérifie
+    /// qu'elle FONCTIONNE : deux recherches successives de la même position,
+    /// la seconde nettement accélérée par les hits. À lancer SEUL, en
+    /// release, avec la RAM libre correspondante (2^29 → 8 Gio, 2^30 →
+    /// 16 Gio : voir octets_tt).
+    #[test]
+    #[ignore]
+    fn tt_geante_s_alloue_et_fonctionne() {
+        let log2: u32 = std::env::var("ECHEC_TT_LOG2")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(28);
+        println!(
+            "allocation d'une TT de 2^{log2} cases ({:.1} Gio)...",
+            octets_tt(log2) as f64 / (1u64 << 30) as f64
+        );
+        let debut = Instant::now();
+        let table = Arc::new(TableTT::new(log2));
+        println!("allouée en {:?}", debut.elapsed());
+        let pos = pos_de_fen(
+            "r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
+        );
+        let mut r = Recherche::avec_table(reseau_reduit_biaise(), table);
+        let a = r.cherche(&pos, limites_prof(5));
+        let (s1, h1) = (r.tt_sondes, r.tt_hits);
+        let b = r.cherche(&pos, limites_prof(5));
+        let (s2, h2) = (r.tt_sondes, r.tt_hits);
+        println!(
+            "passe 1 : {} nœuds, TT {h1}/{s1} ; passe 2 : {} nœuds, TT {h2}/{s2}",
+            a.noeuds, b.noeuds
+        );
+        assert!(a.coup.is_some() && b.coup.is_some());
+        assert!(
+            b.noeuds * 2 <= a.noeuds,
+            "TT géante inopérante : passe 2 à {} nœuds contre {}",
+            b.noeuds,
+            a.noeuds
+        );
+        assert!(h2 > 0, "aucun hit TT sur la seconde passe");
     }
 
     /// Sonde de performance (ignorée par défaut) : nœuds/s et profondeur en

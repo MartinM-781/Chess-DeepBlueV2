@@ -90,6 +90,12 @@ struct Opt {
     /// Évaluation quantizée int8 pour le camp A / le camp B.
     quant_a: bool,
     quant_b: bool,
+    /// Threads de recherche (lazy SMP) du camp A / du camp B (défaut 1 :
+    /// chemin mono-thread historique). Couperet de force SMP : A à N threads
+    /// contre B à 1 thread, même movetime, avec --threads 1 (parties
+    /// séquentielles, tout le CPU au camp au trait).
+    smp_a: u32,
+    smp_b: u32,
     threads: usize,
     out: String,
     seed: u64,
@@ -118,6 +124,8 @@ fn parse_args() -> Opt {
         movetime: 0,
         quant_a: false,
         quant_b: false,
+        smp_a: 1,
+        smp_b: 1,
         threads: 4,
         out: "forensic.csv".to_string(),
         seed: 0xF0E5_1C42,
@@ -146,6 +154,8 @@ fn parse_args() -> Opt {
             "--games" => opt.games = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--nodes" => opt.nodes = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--movetime" => opt.movetime = parse_valeur(&valeur(&args, i, &nom), &nom),
+            "--smp-a" => opt.smp_a = parse_valeur(&valeur(&args, i, &nom), &nom),
+            "--smp-b" => opt.smp_b = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--threads" => opt.threads = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--out" => opt.out = valeur(&args, i, &nom),
             "--seed" => opt.seed = parse_valeur(&valeur(&args, i, &nom), &nom),
@@ -162,10 +172,11 @@ fn parse_args() -> Opt {
 /// Fabrique un chercheur d'un camp : même réseau, seule la voie d'évaluation
 /// change (f32 incrémental, forward exact, ou int8 quantizé). C'est TOUTE la
 /// différence entre les camps.
-fn chercheur(net: &Arc<Mlp>, incremental: bool, quant: bool) -> Recherche {
+fn chercheur(net: &Arc<Mlp>, incremental: bool, quant: bool, smp: u32) -> Recherche {
     let mut r = Recherche::new(net.clone(), TAILLE_TT_LOG2);
     r.utilise_nnue = incremental;
     r.utilise_int8 = quant;
+    r.threads = smp.max(1);
     r
 }
 
@@ -183,9 +194,11 @@ fn partie(
     net_a: &Arc<Mlp>,
     incr_a: bool,
     quant_a: bool,
+    smp_a: u32,
     net_b: &Arc<Mlp>,
     incr_b: bool,
     quant_b: bool,
+    smp_b: u32,
     a_blanc: bool,
     ouverture: &[Move],
     limites: Limites,
@@ -197,8 +210,8 @@ fn partie(
         pos = pos.play(m).expect("coup d'ouverture légal");
         *repetitions.entry(zobrist(&pos)).or_insert(0) += 1;
     }
-    let mut camp_a = chercheur(net_a, incr_a, quant_a);
-    let mut camp_b = chercheur(net_b, incr_b, quant_b);
+    let mut camp_a = chercheur(net_a, incr_a, quant_a, smp_a);
+    let mut camp_b = chercheur(net_b, incr_b, quant_b, smp_b);
     let mut plies = ouverture.len() as u32;
 
     let resultat_blancs = loop {
@@ -272,10 +285,10 @@ fn main() {
     };
     match &opt.net_b {
         Some(chemin) => println!(
-            "forensic duel A/B : net_a={} sizes_a={:?} quant_a={} net_b={} sizes_b={:?} \
-             quant_b={} games={} {budget} threads={} out={} seed={}",
-            opt.net, net.sizes, opt.quant_a, chemin, net_b.sizes, opt.quant_b, opt.games,
-            opt.threads, opt.out, opt.seed
+            "forensic duel A/B : net_a={} sizes_a={:?} quant_a={} smp_a={} net_b={} \
+             sizes_b={:?} quant_b={} smp_b={} games={} {budget} threads={} out={} seed={}",
+            opt.net, net.sizes, opt.quant_a, opt.smp_a, chemin, net_b.sizes, opt.quant_b,
+            opt.smp_b, opt.games, opt.threads, opt.out, opt.seed
         ),
         None => println!(
             "forensic : net={} sizes={:?} quant_a={} quant_b={} games={} {budget} \
@@ -314,10 +327,12 @@ fn main() {
                 ouverture.push(m);
             }
             let pts_blanc = partie(
-                &net, true, opt.quant_a, &net_b, incr_b, opt.quant_b, true, &ouverture, limites,
+                &net, true, opt.quant_a, opt.smp_a, &net_b, incr_b, opt.quant_b, opt.smp_b, true,
+                &ouverture, limites,
             );
             let pts_noir = partie(
-                &net, true, opt.quant_a, &net_b, incr_b, opt.quant_b, false, &ouverture, limites,
+                &net, true, opt.quant_a, opt.smp_a, &net_b, incr_b, opt.quant_b, opt.smp_b, false,
+                &ouverture, limites,
             );
             let n = faites.fetch_add(1, Ordering::Relaxed) + 1;
             if n % 4 == 0 || n == paires {

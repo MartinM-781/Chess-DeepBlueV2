@@ -285,9 +285,26 @@ impl UciEngine {
     /// Les lignes `info ...` émises pendant la recherche sont consommées ici
     /// même — c'est ce qui évite le deadlock « le moteur écrit, personne ne lit ».
     pub fn meilleur_coup_fen(&mut self, fen: &str, movetime_ms: u64) -> Result<String> {
+        self.meilleur_coup_et_score_fen(fen, movetime_ms)
+            .map(|(coup, _)| coup)
+    }
+
+    /// Comme `meilleur_coup_fen`, en relevant AUSSI le score de la DERNIÈRE
+    /// ligne « info ... score ... » reçue avant `bestmove` (la plus profonde),
+    /// converti dans [-1, 1] par `score_de_ligne_info` — convention UCI :
+    /// point de vue du CAMP AU TRAIT, aucun renversement de signe. None si le
+    /// moteur n'a émis aucun score exploitable. Sert au harnais de match
+    /// (src/bin/match.rs) pour afficher l'évaluation de l'adversaire sans
+    /// requête supplémentaire.
+    pub fn meilleur_coup_et_score_fen(
+        &mut self,
+        fen: &str,
+        movetime_ms: u64,
+    ) -> Result<(String, Option<f32>)> {
         self.envoie(&format!("position fen {fen}"))?;
         self.envoie(&format!("go movetime {movetime_ms}"))?;
         let delai = delai_go(movetime_ms);
+        let mut score: Option<f32> = None;
         loop {
             let ligne = self.ligne_avant(delai)?;
             let mut mots = ligne.split_whitespace();
@@ -301,9 +318,12 @@ impl UciEngine {
                 if !(4..=5).contains(&coup.len()) {
                     return Err(erreur(format!("coup UCI mal formé : {coup:?}")));
                 }
-                return Ok(coup.to_string());
+                return Ok((coup.to_string(), score));
             }
-            // Sinon : ligne info/string, on continue à drainer.
+            // Ligne info/string : on mémorise l'éventuel score et on draine.
+            if let Some(v) = score_de_ligne_info(&ligne) {
+                score = Some(v);
+            }
         }
     }
 }
