@@ -46,14 +46,19 @@
 //!                         (departs::tirage, rng dérivé de la graine de la
 //!                         partie — déterminisme préservé)
 //!   --departs-finales 0   idem, proportion des parties qui démarrent d'une
-//!                         finale générée ; le reste part de la position
-//!                         initiale. « 0 0 » = comportement historique STRICT
+//!                         finale générée
+//!   --departs-transition 0  idem, proportion des parties qui démarrent d'un
+//!                         MILIEU TARDIF généré (10-16 pièces, matériel
+//!                         équilibré, aucune prise gagnante évidente — le
+//!                         territoire de conversion fin-de-milieu → finale) ;
+//!                         le reste part de la position initiale.
+//!                         « 0 0 0 » = comportement historique STRICT
 //!                         (aucun tirage, mêmes trajectoires qu'avant).
-//!                         Défauts à ZÉRO : options ABSENTES = « 0 0 » — une
+//!                         Défauts à ZÉRO : options ABSENTES = « 0 0 0 » — une
 //!                         ligne de commande historique reste bit-à-bit
 //!                         identique à avant ; l'activation des départs variés
 //!                         est un opt-in EXPLICITE par flags (valeurs
-//!                         conseillées : 0.6 et 0.2)
+//!                         conseillées : 0.5, 0.2 et 0.2)
 //!   --ancre ""            chemin d'un réseau de RÉFÉRENCE figé : rappel
 //!                         élastique DÉCOUPLÉ (style AdamW) appliqué APRÈS
 //!                         chaque minibatch (frais ET rejeu) —
@@ -72,6 +77,13 @@
 //!                         transporte plus que de l'information d'ordre.
 //!                         L'ARBITRAGE reste sur l'étiquette BRUTE (point de
 //!                         contrat). Vide = strictement aucun changement
+//!   --syzygy ""           dossier des tables de finales Syzygy 3-4-5 (ex.
+//!                         engines/syzygy) pour le SELF-PLAY (régime
+//!                         recherche) : racine ≤ 5 pièces jouée par DTZ,
+//!                         sondes WDL dans l'arbre (src/syzygy.rs) — finales
+//!                         parfaites, meilleures étiquettes z. Le mentor
+//!                         étiquette avec les mêmes tables. Vide (défaut) =
+//!                         strictement aucun changement
 //!
 //! Régime « recherche » (search_nodes > 0) :
 //!   - self-play via selfplay::play_training_game_recherche (un chercheur par
@@ -190,9 +202,14 @@ struct Options {
     oracle_movetime: u32,
     departs_ouvertures: f32,
     departs_finales: f32,
+    departs_transition: f32,
     ancre: String,
     ancre_lambda: f32,
     recalibrage: String,
+    /// Dossier des tables Syzygy 3-4-5 (--syzygy) pour le SELF-PLAY : les
+    /// finales de tables y sont jouées parfaitement (racine DTZ, sondes WDL)
+    /// → meilleures étiquettes z. Vide (défaut) = comportement historique.
+    syzygy: String,
     /// --int8 : la RECHERCHE (self-play, gating, échelle Elo) évalue par le
     /// chemin quantizé de src/quant.rs. L'APPRENTISSAGE reste en f32 —
     /// seule la lecture du réseau par la recherche change. Défaut : false.
@@ -329,9 +346,11 @@ fn parse_options() -> Options {
         oracle_movetime: 15,
         departs_ouvertures: 0.0,
         departs_finales: 0.0,
+        departs_transition: 0.0,
         ancre: String::new(),
         ancre_lambda: 5.0,
         recalibrage: String::new(),
+        syzygy: String::new(),
         int8: false,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -375,11 +394,15 @@ fn parse_options() -> Options {
             "--departs-finales" => {
                 opt.departs_finales = parse_valeur(&valeur(&args, i, &nom), &nom)
             }
+            "--departs-transition" => {
+                opt.departs_transition = parse_valeur(&valeur(&args, i, &nom), &nom)
+            }
             "--ancre" => opt.ancre = valeur(&args, i, &nom),
             "--ancre-lambda" => {
                 opt.ancre_lambda = parse_valeur(&valeur(&args, i, &nom), &nom)
             }
             "--recalibrage" => opt.recalibrage = valeur(&args, i, &nom),
+            "--syzygy" => opt.syzygy = valeur(&args, i, &nom),
             _ => {
                 eprintln!("option inconnue : {nom}");
                 eprintln!(
@@ -387,13 +410,25 @@ fn parse_options() -> Options {
                      --eval-games --replay --elo-every --elo-games --seed \
                      --search-nodes --td-lambda --gate-every --gate-games --mentor \
                      --mentor-poids --oracle --oracle-movetime \
-                     --departs-ouvertures --departs-finales --ancre --ancre-lambda \
-                     --recalibrage --int8"
+                     --departs-ouvertures --departs-finales --departs-transition \
+                     --ancre --ancre-lambda \
+                     --recalibrage --syzygy --int8"
                 );
                 std::process::exit(2);
             }
         }
         i += 2;
+    }
+    // Garde-fou des parts de départs : hors [0, 1] ou somme > 1, refus
+    // explicite — tirage_complet tronquerait silencieusement les dernières
+    // familles et une faute de frappe au déploiement passerait inaperçue.
+    if let Err(e) = echec::departs::valide_parts(
+        opt.departs_ouvertures,
+        opt.departs_finales,
+        opt.departs_transition,
+    ) {
+        eprintln!("{e}");
+        std::process::exit(2);
     }
     opt
 }
@@ -832,16 +867,41 @@ fn main() {
     } else {
         None
     };
+    // Tables Syzygy du SELF-PLAY (--syzygy <dossier>, off par défaut) :
+    // chargées UNE FOIS, partagées par Arc entre tous les chercheurs des
+    // tâches rayon (les tables sont Sync, sondables en parallèle). Les
+    // finales ≤ 5 pièces sont alors jouées PARFAITEMENT (racine DTZ) et les
+    // sous-arbres de tables reçoivent des verdicts exacts (sondes WDL) :
+    // meilleures étiquettes z. Une erreur de chargement est une erreur de
+    // configuration : sortie propre immédiate.
+    let syzygy: Option<Arc<echec::syzygy::Tables>> = if !opt.syzygy.is_empty() {
+        match echec::syzygy::charge(&opt.syzygy) {
+            Ok((tables, n)) => {
+                println!("syzygy : {n} tables chargées depuis {}", opt.syzygy);
+                Some(Arc::new(tables))
+            }
+            Err(e) => {
+                eprintln!("--syzygy {} : {e}", opt.syzygy);
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
     // Départs variés (régime recherche uniquement) : proportion des parties
-    // qui démarrent d'une ouverture du livre / d'une finale générée.
-    // « 0 0 » = comportement historique STRICT (aucun tirage).
-    let utilise_departs =
-        opt.search_nodes > 0 && (opt.departs_ouvertures > 0.0 || opt.departs_finales > 0.0);
+    // qui démarrent d'une ouverture du livre / d'une finale générée / d'un
+    // milieu tardif généré. « 0 0 0 » = comportement historique STRICT
+    // (aucun tirage).
+    let utilise_departs = opt.search_nodes > 0
+        && (opt.departs_ouvertures > 0.0
+            || opt.departs_finales > 0.0
+            || opt.departs_transition > 0.0);
     if opt.search_nodes > 0 {
         println!(
-            "departs : ouvertures {:.0} %, finales {:.0} %",
+            "departs : ouvertures {:.0} %, finales {:.0} %, transition {:.0} %",
             opt.departs_ouvertures * 100.0,
-            opt.departs_finales * 100.0
+            opt.departs_finales * 100.0,
+            opt.departs_transition * 100.0
         );
     }
     // Marqueur de changement de régime pour les courbes du dashboard : posé une
@@ -951,17 +1011,24 @@ fn main() {
                     // --int8 : la recherche de self-play évalue en quantizé
                     // (les étiquettes TD-leaf restent des scores [-1,1]).
                     eleve.utilise_int8 = opt.int8;
+                    // --syzygy : finales de tables jouées parfaitement
+                    // (clone d'Arc, tables partagées entre les tâches).
+                    eleve.syzygy = syzygy.clone();
                     // Départ de la partie : ouverture du livre / finale
-                    // générée / position initiale, tiré d'un rng DÉRIVÉ de la
+                    // générée / milieu tardif généré (transition) / position
+                    // initiale, tiré d'un rng DÉRIVÉ de la
                     // graine de la partie (déterminisme : même graine → même
                     // départ, reprise comprise). None = variantes historiques,
                     // trajectoires strictement identiques à avant.
                     let depart = utilise_departs.then(|| {
                         let mut rng_depart = StdRng::seed_from_u64(derive_graine(g, 0xDE9A47));
-                        echec::departs::tirage(
+                        // tirage_complet : part de transition à 0 = tirage
+                        // historique à l'identique (même consommation du rng).
+                        echec::departs::tirage_complet(
                             &mut rng_depart,
                             opt.departs_ouvertures,
                             opt.departs_finales,
+                            opt.departs_transition,
                         )
                     });
                     let partie = if let Some(pool) = &oracle_pool {
@@ -1022,6 +1089,9 @@ fn main() {
                         let mut prof =
                             search::Recherche::new(m.clone(), TAILLE_TT_LOG2_SELFPLAY);
                         prof.utilise_int8 = opt.int8;
+                        // Le mentor étiquette avec les mêmes tables : ses
+                        // verdicts de finale sont exacts eux aussi.
+                        prof.syzygy = syzygy.clone();
                         match &depart {
                             Some(d) => selfplay::play_training_game_mentor_depuis(
                                 &mut eleve,

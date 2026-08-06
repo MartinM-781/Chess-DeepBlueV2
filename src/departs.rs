@@ -1,10 +1,14 @@
 //! Positions de départ variées pour le self-play (et livre au plateau).
 //!
-//! Trois familles de départs, tirées par `tirage` :
+//! Quatre familles de départs, tirées par `tirage` / `tirage_complet` :
 //! - « ouverture:... » : une ligne de théorie RÉELLE du livre privé `LIGNES`,
 //!   jouée intégralement depuis la position initiale (2 plis chauds ensuite) ;
 //! - « finale:KRPvKR » etc. : une finale GÉNÉRÉE depuis un gabarit de matériel,
 //!   pièces placées au hasard puis validées par shakmaty (0 pli chaud) ;
+//! - « transition:... » : un MILIEU TARDIF généré (10 à 16 pièces, matériel
+//!   équilibré à un pion près, rois abrités, aucune prise gagnante évidente
+//!   au premier coup — vérification SEE), le territoire fin-de-milieu →
+//!   finale où se jouent les conversions (0 pli chaud) ;
 //! - « initiale » : la position de départ historique (8 plis chauds).
 //!
 //! Le PLATEAU (serve.exe) réutilise le même livre via `coup_du_livre` : si la
@@ -373,14 +377,244 @@ fn genere_finale(rng: &mut StdRng) -> (Chess, &'static str) {
 }
 
 // ---------------------------------------------------------------------------
+// Générateur de milieux tardifs (transition fin-de-milieu → finale)
+// ---------------------------------------------------------------------------
+
+/// Gabarits de matériel des MILIEUX TARDIFS : (étiquette, pièces blanches
+/// HORS roi, pièces noires HORS roi). 10 à 16 pièces au total (rois compris),
+/// écart matériel ≤ 1 pion (barème classique P1 N3 B3 R5 Q9) — garanti par
+/// construction, revérifié par le test. Variété : couples de fous/cavaliers,
+/// tours doublées, dames présentes ou non, totaux pairs ET impairs.
+const GABARITS_TRANSITION: &[(&str, &[Role], &[Role])] = &[
+    // 10 pièces
+    ("transition:KRNPPvKRNPP", &[Role::Rook, Role::Knight, Role::Pawn, Role::Pawn],
+     &[Role::Rook, Role::Knight, Role::Pawn, Role::Pawn]),
+    ("transition:KRBPPvKRNPP", &[Role::Rook, Role::Bishop, Role::Pawn, Role::Pawn],
+     &[Role::Rook, Role::Knight, Role::Pawn, Role::Pawn]),
+    ("transition:KQPPPvKQPPP", &[Role::Queen, Role::Pawn, Role::Pawn, Role::Pawn],
+     &[Role::Queen, Role::Pawn, Role::Pawn, Role::Pawn]),
+    ("transition:KQNPPvKQBPP", &[Role::Queen, Role::Knight, Role::Pawn, Role::Pawn],
+     &[Role::Queen, Role::Bishop, Role::Pawn, Role::Pawn]),
+    // 11 pièces (écart d'un pion)
+    ("transition:KRRPPvKRRPPP", &[Role::Rook, Role::Rook, Role::Pawn, Role::Pawn],
+     &[Role::Rook, Role::Rook, Role::Pawn, Role::Pawn, Role::Pawn]),
+    ("transition:KRNPPPvKRNPP",
+     &[Role::Rook, Role::Knight, Role::Pawn, Role::Pawn, Role::Pawn],
+     &[Role::Rook, Role::Knight, Role::Pawn, Role::Pawn]),
+    ("transition:KQRPPPvKQRPP",
+     &[Role::Queen, Role::Rook, Role::Pawn, Role::Pawn, Role::Pawn],
+     &[Role::Queen, Role::Rook, Role::Pawn, Role::Pawn]),
+    // 12 pièces
+    ("transition:KRNPPPvKRNPPP",
+     &[Role::Rook, Role::Knight, Role::Pawn, Role::Pawn, Role::Pawn],
+     &[Role::Rook, Role::Knight, Role::Pawn, Role::Pawn, Role::Pawn]),
+    ("transition:KRBPPPvKRNPPP",
+     &[Role::Rook, Role::Bishop, Role::Pawn, Role::Pawn, Role::Pawn],
+     &[Role::Rook, Role::Knight, Role::Pawn, Role::Pawn, Role::Pawn]),
+    ("transition:KRRPPPvKRRPPP",
+     &[Role::Rook, Role::Rook, Role::Pawn, Role::Pawn, Role::Pawn],
+     &[Role::Rook, Role::Rook, Role::Pawn, Role::Pawn, Role::Pawn]),
+    ("transition:KQRPPPvKQRPPP",
+     &[Role::Queen, Role::Rook, Role::Pawn, Role::Pawn, Role::Pawn],
+     &[Role::Queen, Role::Rook, Role::Pawn, Role::Pawn, Role::Pawn]),
+    ("transition:KRBNPPvKRBNPP",
+     &[Role::Rook, Role::Bishop, Role::Knight, Role::Pawn, Role::Pawn],
+     &[Role::Rook, Role::Bishop, Role::Knight, Role::Pawn, Role::Pawn]),
+    ("transition:KRRNPPvKRRBPP",
+     &[Role::Rook, Role::Rook, Role::Knight, Role::Pawn, Role::Pawn],
+     &[Role::Rook, Role::Rook, Role::Bishop, Role::Pawn, Role::Pawn]),
+    ("transition:KQBPPPvKQNPPP",
+     &[Role::Queen, Role::Bishop, Role::Pawn, Role::Pawn, Role::Pawn],
+     &[Role::Queen, Role::Knight, Role::Pawn, Role::Pawn, Role::Pawn]),
+    ("transition:KQRBPPvKQRNPP",
+     &[Role::Queen, Role::Rook, Role::Bishop, Role::Pawn, Role::Pawn],
+     &[Role::Queen, Role::Rook, Role::Knight, Role::Pawn, Role::Pawn]),
+    // 13 pièces (écart d'un pion)
+    ("transition:KRNPPPPvKRBPPP",
+     &[Role::Rook, Role::Knight, Role::Pawn, Role::Pawn, Role::Pawn, Role::Pawn],
+     &[Role::Rook, Role::Bishop, Role::Pawn, Role::Pawn, Role::Pawn]),
+    // 14 pièces
+    ("transition:KBNPPPPvKBNPPPP",
+     &[Role::Bishop, Role::Knight, Role::Pawn, Role::Pawn, Role::Pawn, Role::Pawn],
+     &[Role::Bishop, Role::Knight, Role::Pawn, Role::Pawn, Role::Pawn, Role::Pawn]),
+    ("transition:KRBPPPPvKRNPPPP",
+     &[Role::Rook, Role::Bishop, Role::Pawn, Role::Pawn, Role::Pawn, Role::Pawn],
+     &[Role::Rook, Role::Knight, Role::Pawn, Role::Pawn, Role::Pawn, Role::Pawn]),
+    ("transition:KRNNPPPvKRBBPPP",
+     &[Role::Rook, Role::Knight, Role::Knight, Role::Pawn, Role::Pawn, Role::Pawn],
+     &[Role::Rook, Role::Bishop, Role::Bishop, Role::Pawn, Role::Pawn, Role::Pawn]),
+    ("transition:KQBNPPPvKQBNPPP",
+     &[Role::Queen, Role::Bishop, Role::Knight, Role::Pawn, Role::Pawn, Role::Pawn],
+     &[Role::Queen, Role::Bishop, Role::Knight, Role::Pawn, Role::Pawn, Role::Pawn]),
+    ("transition:KRRBNPPvKRRBNPP",
+     &[Role::Rook, Role::Rook, Role::Bishop, Role::Knight, Role::Pawn, Role::Pawn],
+     &[Role::Rook, Role::Rook, Role::Bishop, Role::Knight, Role::Pawn, Role::Pawn]),
+    ("transition:KQRBNPPvKQRBNPP",
+     &[Role::Queen, Role::Rook, Role::Bishop, Role::Knight, Role::Pawn, Role::Pawn],
+     &[Role::Queen, Role::Rook, Role::Bishop, Role::Knight, Role::Pawn, Role::Pawn]),
+    // 15 pièces (écart d'un pion)
+    ("transition:KQRBPPPvKQRNPPPP",
+     &[Role::Queen, Role::Rook, Role::Bishop, Role::Pawn, Role::Pawn, Role::Pawn],
+     &[Role::Queen, Role::Rook, Role::Knight, Role::Pawn, Role::Pawn, Role::Pawn,
+       Role::Pawn]),
+    ("transition:KRBNPPPvKRBNPPPP",
+     &[Role::Rook, Role::Bishop, Role::Knight, Role::Pawn, Role::Pawn, Role::Pawn],
+     &[Role::Rook, Role::Bishop, Role::Knight, Role::Pawn, Role::Pawn, Role::Pawn,
+       Role::Pawn]),
+    // 16 pièces
+    ("transition:KRBNPPPPvKRBNPPPP",
+     &[Role::Rook, Role::Bishop, Role::Knight, Role::Pawn, Role::Pawn, Role::Pawn,
+       Role::Pawn],
+     &[Role::Rook, Role::Bishop, Role::Knight, Role::Pawn, Role::Pawn, Role::Pawn,
+       Role::Pawn]),
+    ("transition:KQRBNPPPvKQRBNPPP",
+     &[Role::Queen, Role::Rook, Role::Bishop, Role::Knight, Role::Pawn, Role::Pawn,
+       Role::Pawn],
+     &[Role::Queen, Role::Rook, Role::Bishop, Role::Knight, Role::Pawn, Role::Pawn,
+       Role::Pawn]),
+];
+
+/// Prise « gagnante évidente » : SEE ≥ un pion entier (centièmes de pion,
+/// barème de search::valeur_see).
+const SEUIL_PRISE_GAGNANTE: i32 = 100;
+
+/// Bande de rangées plausible (indices 0..=7, bornes incluses) d'une pièce
+/// d'un milieu tardif : rois abrités ou semi-exposés sur leurs deux premières
+/// rangées, pions ni sur leur rangée de promotion ni sur la pré-dernière
+/// (aucune promotion imminente qui fausserait l'équilibre matériel affiché),
+/// le reste n'importe où.
+fn bande_transition(role: Role, couleur: Color) -> (u32, u32) {
+    match (role, couleur) {
+        (Role::King, Color::White) => (0, 1), // rangées 1-2
+        (Role::King, Color::Black) => (6, 7), // rangées 7-8
+        (Role::Pawn, Color::White) => (1, 5), // rangées 2-6
+        (Role::Pawn, Color::Black) => (2, 6), // rangées 3-7
+        _ => (0, 7),
+    }
+}
+
+/// Case libre au hasard dans une bande de rangées [min, max] (bornes
+/// incluses). Retente tant que la case est occupée.
+fn case_libre_bande(board: &Board, min: u32, max: u32, rng: &mut StdRng) -> Square {
+    loop {
+        let file = File::new(rng.gen_range(0..8));
+        let rank = Rank::new(rng.gen_range(min..=max));
+        let sq = Square::from_coords(file, rank);
+        if board.piece_at(sq).is_none() {
+            return sq;
+        }
+    }
+}
+
+/// Génère un MILIEU TARDIF légal et calme depuis un gabarit tiré au hasard :
+/// rois sur leurs deux premières rangées (jamais adjacents, les bandes sont
+/// disjointes), pions hors des rangées extrêmes, côté au trait aléatoire.
+/// Filtres de plausibilité, dans l'ordre du moins cher au plus cher :
+/// - shakmaty valide la position (`Setup` → `Chess`) ;
+/// - il reste des coups légaux (ni mat ni pat : rien à apprendre sinon) ;
+/// - le camp au trait n'est PAS en échec (départ calme) ;
+/// - recherche éclair de vérification : AUCUNE prise du camp au trait ne
+///   gagne un pion ou plus à l'échange (`search::see` sur chaque prise
+///   légale — l'échange optimal complet, rayons X compris, pas seulement la
+///   victime immédiate). Une pièce « en prise triviale » est ainsi écartée.
+fn genere_transition(rng: &mut StdRng) -> (Chess, &'static str) {
+    let (etiquette, blancs, noirs) =
+        *GABARITS_TRANSITION.choose(rng).expect("gabarits transition non vides");
+    // Les filtres rejettent la grosse majorité des placements bruts (prises
+    // gagnantes surtout) : quelques dizaines d'essais suffisent en pratique,
+    // la borne est très au-dessus.
+    for _ in 0..100_000 {
+        let mut board = Board::empty();
+        for (couleur, roles) in [(Color::White, blancs), (Color::Black, noirs)] {
+            let (min, max) = bande_transition(Role::King, couleur);
+            let roi = case_libre_bande(&board, min, max, rng);
+            board.set_piece_at(roi, Role::King.of(couleur));
+            for &role in roles {
+                let (min, max) = bande_transition(role, couleur);
+                let sq = case_libre_bande(&board, min, max, rng);
+                board.set_piece_at(sq, role.of(couleur));
+            }
+        }
+        let setup = Setup {
+            board,
+            turn: if rng.gen::<bool>() { Color::White } else { Color::Black },
+            ..Setup::empty()
+        };
+        let Ok(pos) = setup.position::<Chess>(CastlingMode::Standard) else {
+            continue;
+        };
+        if pos.legal_moves().is_empty() || pos.is_check() {
+            continue;
+        }
+        if pos
+            .capture_moves()
+            .iter()
+            .any(|m| crate::search::see(&pos, m) >= SEUIL_PRISE_GAGNANTE)
+        {
+            continue;
+        }
+        return (pos, etiquette);
+    }
+    unreachable!("générateur de transition : aucune position légale en 100 000 essais")
+}
+
+// ---------------------------------------------------------------------------
 // Tirage
 // ---------------------------------------------------------------------------
+
+/// Valide un jeu de parts destiné à `tirage_complet` : chaque part dans
+/// [0, 1] et somme ≤ 1 (tolérance d'arrondi f32 pour une somme voulue
+/// exactement à 1). Refus explicite en amont plutôt que la troncature
+/// silencieuse du tirage : des seuils cumulés > 1 écraseraient la dernière
+/// famille et feraient disparaître la famille « initiale » sans un mot.
+/// Utilisée par train.exe et calibration.exe au parsing des options.
+pub fn valide_parts(
+    p_ouverture: f32,
+    p_finale: f32,
+    p_transition: f32,
+) -> Result<(), String> {
+    for (nom, p) in [
+        ("ouvertures", p_ouverture),
+        ("finales", p_finale),
+        ("transition", p_transition),
+    ] {
+        if !(0.0..=1.0).contains(&p) {
+            return Err(format!(
+                "part de départs « {nom} » invalide : {p} (attendue dans [0, 1])"
+            ));
+        }
+    }
+    let somme = p_ouverture + p_finale + p_transition;
+    if somme > 1.0 + 1e-6 {
+        return Err(format!(
+            "parts de départs incohérentes : ouvertures {p_ouverture} + \
+             finales {p_finale} + transition {p_transition} = {somme} > 1"
+        ));
+    }
+    Ok(())
+}
 
 /// Tire une position de départ : ouverture du livre avec probabilité
 /// `p_ouverture`, finale générée avec probabilité `p_finale`, position
 /// initiale sinon. Les plis chauds suivent la famille : 8 (initiale,
 /// comportement historique), 2 (ouverture), 0 (finale).
+/// Signature historique INTACTE : délègue à `tirage_complet` avec une part
+/// de transition NULLE (mêmes consommations du rng, mêmes tirages qu'avant).
 pub fn tirage(rng: &mut StdRng, p_ouverture: f32, p_finale: f32) -> Depart {
+    tirage_complet(rng, p_ouverture, p_finale, 0.0)
+}
+
+/// Tirage à QUATRE familles : ouverture du livre (`p_ouverture`), finale
+/// générée (`p_finale`), milieu tardif généré (`p_transition`), position
+/// initiale sinon. Plis chauds : 8 (initiale), 2 (ouverture), 0 (finale et
+/// transition — la position générée est déjà diversifiée, autant y jouer
+/// précis dès le premier coup). `p_transition` = 0 → strictement `tirage`.
+pub fn tirage_complet(
+    rng: &mut StdRng,
+    p_ouverture: f32,
+    p_finale: f32,
+    p_transition: f32,
+) -> Depart {
     let u: f32 = rng.gen();
     if u < p_ouverture {
         let (etiquette, pos) = livre()
@@ -390,6 +624,9 @@ pub fn tirage(rng: &mut StdRng, p_ouverture: f32, p_finale: f32) -> Depart {
         Depart { pos: pos.clone(), etiquette, plis_chauds: 2 }
     } else if u < p_ouverture + p_finale {
         let (pos, etiquette) = genere_finale(rng);
+        Depart { pos, etiquette, plis_chauds: 0 }
+    } else if u < p_ouverture + p_finale + p_transition {
+        let (pos, etiquette) = genere_transition(rng);
         Depart { pos, etiquette, plis_chauds: 0 }
     } else {
         Depart { pos: Chess::default(), etiquette: "initiale", plis_chauds: 8 }
@@ -470,6 +707,210 @@ mod tests {
             );
             assert!(!pos.legal_moves().is_empty(), "finale {i} : partie déjà finie");
         }
+    }
+
+    /// Valeur matérielle en pions entiers (barème classique P1 N3 B3 R5 Q9)
+    /// d'un camp — pour vérifier l'équilibre des milieux tardifs générés.
+    fn valeur_camp(board: &Board, couleur: Color) -> i32 {
+        [
+            (Role::Pawn, 1),
+            (Role::Knight, 3),
+            (Role::Bishop, 3),
+            (Role::Rook, 5),
+            (Role::Queen, 9),
+        ]
+        .iter()
+        .map(|&(role, v)| (board.by_color(couleur) & board.by_role(role)).count() as i32 * v)
+        .sum()
+    }
+
+    /// 200 milieux tardifs générés : tous légaux (revalidation Setup → Chess),
+    /// 10 à 16 pièces au total, écart matériel ≤ 1 pion, rois dans leurs
+    /// bandes (blanc rangées 1-2, noir 7-8), pions hors des rangées 1/8,
+    /// camp au trait ni en échec ni devant une prise gagnante évidente
+    /// (SEE < 1 pion sur TOUTES ses prises légales), étiquette
+    /// « transition:... » ; la distribution du compte de pièces couvre la
+    /// plage (au moins 5 totaux distincts) et est affichée (--nocapture).
+    #[test]
+    fn transition_200_legales() {
+        let mut rng = StdRng::seed_from_u64(9);
+        let mut par_compte: HashMap<u32, u32> = HashMap::new();
+        for i in 0..200 {
+            let (pos, etiquette) = genere_transition(&mut rng);
+            assert!(etiquette.starts_with("transition:"), "étiquette « {etiquette} »");
+            let setup = pos.clone().into_setup(EnPassantMode::Legal);
+            // Compte de pièces total (rois compris) dans la plage 10-16.
+            let n = setup.board.occupied().count() as u32;
+            assert!((10..=16).contains(&n), "transition {i} ({etiquette}) : {n} pièces");
+            *par_compte.entry(n).or_default() += 1;
+            // Écart matériel ≤ 1 pion.
+            let ecart =
+                (valeur_camp(&setup.board, Color::White) - valeur_camp(&setup.board, Color::Black))
+                    .abs();
+            assert!(ecart <= 1, "transition {i} ({etiquette}) : écart {ecart} pions");
+            // Rois abrités dans leurs bandes.
+            let roi_blanc = setup.board.king_of(Color::White).expect("roi blanc");
+            let roi_noir = setup.board.king_of(Color::Black).expect("roi noir");
+            assert!(u32::from(roi_blanc.rank()) <= 1, "transition {i} : roi blanc {roi_blanc}");
+            assert!(u32::from(roi_noir.rank()) >= 6, "transition {i} : roi noir {roi_noir}");
+            // Pions hors des rangées 1 et 8.
+            for sq in setup.board.pawns() {
+                assert!(
+                    sq.rank() != Rank::First && sq.rank() != Rank::Eighth,
+                    "transition {i} ({etiquette}) : pion en {sq}"
+                );
+            }
+            // Départ calme : pas en échec, des coups légaux, et AUCUNE prise
+            // gagnante évidente au premier coup (recherche éclair SEE).
+            assert!(!pos.is_check(), "transition {i} ({etiquette}) : au trait en échec");
+            assert!(!pos.legal_moves().is_empty(), "transition {i} : partie déjà finie");
+            for m in pos.capture_moves() {
+                let g = crate::search::see(&pos, &m);
+                assert!(
+                    g < SEUIL_PRISE_GAGNANTE,
+                    "transition {i} ({etiquette}) : prise gagnante {m:?} (SEE {g})"
+                );
+            }
+            // Revalidation complète par shakmaty.
+            assert!(
+                setup.position::<Chess>(CastlingMode::Standard).is_ok(),
+                "transition {i} ({etiquette}) : position invalide"
+            );
+        }
+        // Variété de la distribution : au moins 5 totaux distincts sur 200.
+        assert!(par_compte.len() >= 5, "distribution étroite : {par_compte:?}");
+        let mut comptes: Vec<_> = par_compte.into_iter().collect();
+        comptes.sort();
+        println!("distribution du compte de pièces (200 transitions) : {comptes:?}");
+    }
+
+    /// COUPERET TRANSITION (harnais opérateur, ignoré par défaut) : 500
+    /// milieux tardifs générés, chacun vérifié contre TOUTES les clauses du
+    /// contrat — légalité stricte (revalidation Setup → Chess), 10 à 16
+    /// pièces, écart matériel ≤ 1 pion, rois dans leurs bandes, pions hors
+    /// des rangées extrêmes, départ calme (pas d'échec, pas de prise
+    /// gagnante évidente au SEE), étiquette « transition:... ». La variété
+    /// est mesurée et affichée : distribution des comptes de pièces (les 7
+    /// totaux 10..16 attendus sur 500) et nombre de gabarits distincts.
+    /// Lancer :
+    /// cargo test --lib departs::tests::couperet_transition_500 -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn couperet_transition_500() {
+        let mut rng = StdRng::seed_from_u64(2026);
+        let mut par_compte: HashMap<u32, u32> = HashMap::new();
+        let mut gabarits: HashMap<&'static str, u32> = HashMap::new();
+        for i in 0..500 {
+            let (pos, etiquette) = genere_transition(&mut rng);
+            assert!(etiquette.starts_with("transition:"), "étiquette « {etiquette} »");
+            *gabarits.entry(etiquette).or_default() += 1;
+            let setup = pos.clone().into_setup(EnPassantMode::Legal);
+            let n = setup.board.occupied().count() as u32;
+            assert!((10..=16).contains(&n), "transition {i} ({etiquette}) : {n} pièces");
+            *par_compte.entry(n).or_default() += 1;
+            let ecart =
+                (valeur_camp(&setup.board, Color::White) - valeur_camp(&setup.board, Color::Black))
+                    .abs();
+            assert!(ecart <= 1, "transition {i} ({etiquette}) : écart {ecart} pions");
+            let roi_blanc = setup.board.king_of(Color::White).expect("roi blanc");
+            let roi_noir = setup.board.king_of(Color::Black).expect("roi noir");
+            assert!(u32::from(roi_blanc.rank()) <= 1, "transition {i} : roi blanc {roi_blanc}");
+            assert!(u32::from(roi_noir.rank()) >= 6, "transition {i} : roi noir {roi_noir}");
+            for sq in setup.board.pawns() {
+                assert!(
+                    sq.rank() != Rank::First && sq.rank() != Rank::Eighth,
+                    "transition {i} ({etiquette}) : pion en {sq}"
+                );
+            }
+            assert!(!pos.is_check(), "transition {i} ({etiquette}) : au trait en échec");
+            assert!(!pos.legal_moves().is_empty(), "transition {i} : partie déjà finie");
+            for m in pos.capture_moves() {
+                let g = crate::search::see(&pos, &m);
+                assert!(
+                    g < SEUIL_PRISE_GAGNANTE,
+                    "transition {i} ({etiquette}) : prise gagnante {m:?} (SEE {g})"
+                );
+            }
+            assert!(
+                setup.position::<Chess>(CastlingMode::Standard).is_ok(),
+                "transition {i} ({etiquette}) : position invalide"
+            );
+        }
+        // Variété : les 7 comptes de la plage présents, et une majorité des
+        // gabarits visités sur 500 tirages.
+        assert!(par_compte.len() >= 5, "distribution étroite : {par_compte:?}");
+        assert!(
+            gabarits.len() >= GABARITS_TRANSITION.len() / 2,
+            "gabarits visités : {} / {}",
+            gabarits.len(),
+            GABARITS_TRANSITION.len()
+        );
+        let mut comptes: Vec<_> = par_compte.into_iter().collect();
+        comptes.sort();
+        println!("couperet transition : 500/500 positions conformes");
+        println!("distribution du compte de pièces : {comptes:?}");
+        println!(
+            "gabarits distincts visités : {} / {}",
+            gabarits.len(),
+            GABARITS_TRANSITION.len()
+        );
+    }
+
+    /// tirage_complet respecte les quatre parts sur 2000 tirages
+    /// (0.3/0.2/0.2 → ~600/400/400/600, tolérance large ±120), avec les plis
+    /// chauds de chaque famille (2/0/0/8) ; et une part de transition NULLE
+    /// reproduit `tirage` à l'identique (mêmes graines → mêmes départs).
+    #[test]
+    fn tirage_complet_quatre_familles() {
+        let mut rng = StdRng::seed_from_u64(77);
+        let (mut ouvertures, mut finales, mut transitions, mut initiales) = (0i32, 0i32, 0i32, 0i32);
+        for _ in 0..2000 {
+            let d = tirage_complet(&mut rng, 0.3, 0.2, 0.2);
+            if d.etiquette.starts_with("ouverture:") {
+                assert_eq!(d.plis_chauds, 2);
+                ouvertures += 1;
+            } else if d.etiquette.starts_with("finale:") {
+                assert_eq!(d.plis_chauds, 0);
+                finales += 1;
+            } else if d.etiquette.starts_with("transition:") {
+                assert_eq!(d.plis_chauds, 0);
+                transitions += 1;
+            } else {
+                assert_eq!(d.etiquette, "initiale");
+                assert_eq!(d.plis_chauds, 8);
+                assert_eq!(d.pos, Chess::default());
+                initiales += 1;
+            }
+        }
+        assert!((ouvertures - 600).abs() <= 120, "ouvertures : {ouvertures}");
+        assert!((finales - 400).abs() <= 120, "finales : {finales}");
+        assert!((transitions - 400).abs() <= 120, "transitions : {transitions}");
+        assert!((initiales - 600).abs() <= 120, "initiales : {initiales}");
+        // Part de transition nulle = tirage historique, départ pour départ.
+        let mut a = StdRng::seed_from_u64(4242);
+        let mut b = StdRng::seed_from_u64(4242);
+        for _ in 0..200 {
+            let da = tirage(&mut a, 0.5, 0.25);
+            let db = tirage_complet(&mut b, 0.5, 0.25, 0.0);
+            assert_eq!(da.etiquette, db.etiquette);
+            assert_eq!(da.pos, db.pos);
+            assert_eq!(da.plis_chauds, db.plis_chauds);
+        }
+    }
+
+    /// valide_parts accepte les réglages légitimes (dont le réglage de
+    /// production 0.5/0.2/0.2 et une somme exactement à 1) et refuse part
+    /// hors [0, 1], somme > 1 et NaN — le tirage ne doit jamais tronquer.
+    #[test]
+    fn valide_parts_refuse_les_parts_incoherentes() {
+        assert!(valide_parts(0.0, 0.0, 0.0).is_ok());
+        assert!(valide_parts(0.5, 0.2, 0.2).is_ok()); // réglage de production
+        assert!(valide_parts(0.5, 0.25, 0.25).is_ok()); // somme exactement 1
+        assert!(valide_parts(0.3, 0.3, 0.4).is_ok()); // somme 1 aux arrondis f32 près
+        assert!(valide_parts(0.5, 0.4, 0.4).is_err()); // somme 1.3 : troncature
+        assert!(valide_parts(-0.1, 0.2, 0.2).is_err()); // part négative
+        assert!(valide_parts(0.2, 1.5, 0.0).is_err()); // part > 1
+        assert!(valide_parts(0.2, f32::NAN, 0.2).is_err()); // NaN
     }
 
     /// Sur la position initiale, coup_du_livre renvoie un coup qui est bien le

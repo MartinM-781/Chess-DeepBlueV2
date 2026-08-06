@@ -48,4 +48,5 @@ pub mod nnue;
 pub mod quant;
 pub mod search;
 pub mod selfplay;
+pub mod syzygy;
 pub mod uci;

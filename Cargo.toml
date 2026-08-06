@@ -5,6 +5,9 @@ edition = "2021"
 
 [dependencies]
 shakmaty = "0.27"
+# Accès aux tables de finales Syzygy (même écosystème que shakmaty — lib de
+# lecture d'un format de fichiers, pas une dépendance ML).
+shakmaty-syzygy = "0.25"
 rayon = "1"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }

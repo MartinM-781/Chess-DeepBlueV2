@@ -1,6 +1,3 @@
-# GARDE TEMPORAIRE (phase Couperets) : ne rien relancer tant que le drapeau
-# PAUSE_COUPERETS existe — retirée en fin de phase par l'opérateur.
-if (Test-Path "C:\dev\Echec\PAUSE_COUPERETS") { exit }
 # Chien de garde de l'entraînement : relance train.exe s'il est mort.
 # Appelé toutes les 5 min par la tâche planifiée « EchecTrainWatchdog ».
 # SOURCE DE VÉRITÉ des arguments du régime courant — à mettre à jour à
@@ -13,7 +10,8 @@ if (-not (Get-Process train -ErrorAction SilentlyContinue)) {
         "--oracle-movetime","40","--mentor-poids","1.0",`
         "--replay","2400000","--games-per-cycle","60","--eval-games","64",`
         "--gate-every","5","--elo-every","8",`
-        "--departs-ouvertures","0.6","--departs-finales","0.2","--int8" `
+        "--departs-ouvertures","0.5","--departs-finales","0.2",`
+        "--departs-transition","0.2","--syzygy","engines/syzygy","--int8" `
         -WorkingDirectory "C:\dev\Echec" `
         -RedirectStandardOutput "C:\dev\Echec\train.log" `
         -RedirectStandardError "C:\dev\Echec\train.err.log"

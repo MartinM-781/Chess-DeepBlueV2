@@ -29,6 +29,12 @@
 //! comportement mono-thread EXACT et rend le coup ; threads = 1 est bit à bit
 //! le moteur historique (entraînement et gating inchangés).
 //!
+//! TABLES SYZYGY (src/syzygy.rs ; champ `Recherche::syzygy`, None par défaut
+//! = zéro changement, parité bit à bit) : à la racine en territoire de
+//! tables (≤ 5 pièces), coup joué par DTZ sans recherche ; dans l'arbre,
+//! sonde WDL des nœuds atteints par un coup zéroteur — stratégie complète
+//! commentée dans negamax, conversions et règle des 50 coups dans syzygy.rs.
+//!
 //! C'est l'étage 1 de la fusée « battre Deep Blue » : il sert à la fois à
 //! JOUER (serveur, arène) et à FABRIQUER les étiquettes TD-leaf du self-play
 //! (le score racine devient la cible d'apprentissage).
@@ -48,6 +54,7 @@ use crate::features::N_FEATURES;
 use crate::nn::Mlp;
 use crate::nnue::{EvalIncrementale, PileAccus};
 use crate::quant::{PileQuant, QuantNet};
+use crate::syzygy;
 
 pub const SCORE_MAT: f32 = 1000.0;
 
@@ -500,6 +507,16 @@ pub struct Recherche {
     /// bloquer longtemps : il est appelé entre deux itérations, jamais dans
     /// l'arbre.
     pub info: Option<Box<dyn Fn(InfoIteration) + Send + Sync>>,
+    /// Tables de finales Syzygy 3-4-5 pièces (src/syzygy.rs), OPTIONNELLES.
+    /// None (défaut) = ZÉRO changement, parité bit à bit du moteur
+    /// historique. Some : à la RACINE en territoire de tables (≤ 5 pièces),
+    /// le coup est joué par DTZ sans recherche (conversion parfaite, règle
+    /// des 50 coups comprise) ; DANS L'ARBRE, les nœuds atteints par un coup
+    /// zéroteur sont sondés au WDL (voir negamax pour la stratégie complète
+    /// de sondage). Arc : partagé tel quel avec les assistants SMP et entre
+    /// les chercheurs du self-play (les tables sont Sync, sondables en
+    /// parallèle).
+    pub syzygy: Option<Arc<syzygy::Tables>>,
     /// Poids réorganisés pour l'évaluation incrémentale. `None` = réseau sans
     /// couche cachée (les réseaux linéaires [773,1] de certains tests, où il
     /// n'y a de toute façon rien à accélérer) → forward complet d'office.
@@ -577,6 +594,7 @@ impl Recherche {
             utilise_int8: false,
             threads: 1,
             info: None,
+            syzygy: None,
             eval,
             pile: None,
             quant: None,
@@ -608,12 +626,44 @@ impl Recherche {
     /// `threads` = 1 (défaut) : recherche historique exacte ; > 1 : lazy SMP,
     /// même contrat, le coup rendu est celui du thread principal.
     pub fn cherche(&mut self, pos: &Chess, limites: Limites) -> Resultat {
+        // Racine en territoire Syzygy (tables chargées ET ≤ 5 pièces) : coup
+        // par DTZ, sans recherche — conversion parfaite. syzygy None (défaut) :
+        // branche morte, comportement historique intact.
+        if let Some(res) = self.racine_syzygy(pos) {
+            return res;
+        }
         if self.threads <= 1 {
             return self
                 .cherche_thread(pos, limites, None)
                 .expect("l'itération 1 est toujours menée à terme");
         }
         self.cherche_smp(pos, limites)
+    }
+
+    /// Coup de RACINE par les tables Syzygy. None (chemin normal) si : pas de
+    /// tables sur l'instance, plus de PIECES_MAX pièces, position terminale
+    /// (le verdict exact appartient à la recherche), droits de roque
+    /// résiduels ou table manquante (erreurs de sonde — voir syzygy.rs).
+    /// Some : le meilleur coup au sens DTZ (préserve le verdict, règle des
+    /// 50 coups comprise — un « cursed win » est CONVERTI en nulle par le
+    /// choix de coups, c'est la sémantique DTZ50) et le score WDL à
+    /// l'échelle de la recherche. Zéro nœud, profondeur 0 : le Resultat dit
+    /// la vérité (« lu dans les tables, pas cherché ») ; scores_racine ne
+    /// contient que ce coup — l'échantillonnage en température du self-play
+    /// joue donc TOUJOURS le coup parfait en finale de tables.
+    fn racine_syzygy(&self, pos: &Chess) -> Option<Resultat> {
+        let tables = self.syzygy.as_ref()?;
+        if pos.board().occupied().count() > syzygy::PIECES_MAX {
+            return None;
+        }
+        let (coup, score) = syzygy::coup_racine(tables, pos)?;
+        Some(Resultat {
+            coup: Some(coup.clone()),
+            score,
+            profondeur: 0,
+            noeuds: 0,
+            scores_racine: vec![(coup, score)],
+        })
     }
 
     /// Lazy SMP (threads >= 2) : N-1 assistants mènent le même
@@ -680,6 +730,7 @@ impl Recherche {
         a.mode_classique = self.mode_classique;
         a.utilise_nnue = self.utilise_nnue;
         a.utilise_int8 = self.utilise_int8;
+        a.syzygy = self.syzygy.clone();
         a.arret_partage = Some(arret.clone());
         a
     }
@@ -1013,6 +1064,35 @@ impl Recherche {
                     DRAPEAU_BORNE_INF if s >= beta => return s,
                     DRAPEAU_BORNE_SUP if s <= alpha => return s,
                     _ => {}
+                }
+            }
+        }
+
+        // Sonde Syzygy (syzygy None — le défaut — : branche morte, parité
+        // bit à bit du moteur historique). STRATÉGIE DE SONDAGE : seuls les
+        // nœuds atteints par un coup ZÉROTEUR (halfmoves == 0 : prise ou
+        // coup de pion) avec ≤ PIECES_MAX pièces sondent — ce sont exactement
+        // les points d'entrée en territoire de tables et les changements de
+        // matériel à l'intérieur (promotion comprise). Les nœuds calmes
+        // intermédiaires ne sondent JAMAIS (le verdict exact du point
+        // d'entrée coupe déjà leur sous-arbre), la quiescence pas davantage
+        // (nœuds trop nombreux, et ses feuilles ne sont atteintes qu'à
+        // travers un point d'entrée déjà sondé). À halfmoves == 0 le WDL est
+        // EXACT vis-à-vis de la règle des 50 coups (probe_wdl_after_zeroing,
+        // tables WDL seules) ; « cursed win »/« blessed loss » valent NULLE
+        // (sémantique DTZ50, conversion dans syzygy.rs). Le verdict — score
+        // PLAT hors zone de mat, indépendant du ply, TT-sûr — est stocké
+        // EXACT à PROF_MAX : les revisites passent par la TT (sondée juste
+        // au-dessus), pas par les fichiers. La sonde vient APRÈS la TT
+        // (ordre standard : le hit TT est plus rapide) et AVANT null-move et
+        // génération du tri : un nœud de tables ne cherche rien.
+        if let Some(tables) = &self.syzygy {
+            if pos.halfmoves() == 0
+                && pos.board().occupied().count() <= syzygy::PIECES_MAX
+            {
+                if let Some(v) = syzygy::sonde_noeud(tables, pos) {
+                    self.stocke(cle, PROF_MAX, DRAPEAU_EXACT, v, COUP_AUCUN);
+                    return v;
                 }
             }
         }

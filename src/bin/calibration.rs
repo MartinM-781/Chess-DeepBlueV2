@@ -74,6 +74,7 @@ struct Options {
     /// Proportions de départs variés (défauts : régime courant).
     departs_ouvertures: f32,
     departs_finales: f32,
+    departs_transition: f32,
     /// Threads rayon (0 = défaut rayon).
     threads: usize,
     /// Ajoute au CSV existant au lieu de l'écraser (tranches : lancer
@@ -114,6 +115,7 @@ fn parse_options() -> Options {
         search_nodes: 8000,
         departs_ouvertures: 0.6,
         departs_finales: 0.2,
+        departs_transition: 0.0,
         threads: 0,
         append: false,
         fit: String::new(),
@@ -137,6 +139,9 @@ fn parse_options() -> Options {
             "--departs-finales" => {
                 opt.departs_finales = parse_valeur(&valeur(&args, i, &nom), &nom)
             }
+            "--departs-transition" => {
+                opt.departs_transition = parse_valeur(&valeur(&args, i, &nom), &nom)
+            }
             "--threads" => opt.threads = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--append" => {
                 opt.append = true;
@@ -151,6 +156,16 @@ fn parse_options() -> Options {
             }
         }
         i += 2;
+    }
+    // Garde-fou des parts (même refus que train.rs) : une troncature
+    // silencieuse du tirage fausserait la mesure sans prévenir.
+    if let Err(e) = echec::departs::valide_parts(
+        opt.departs_ouvertures,
+        opt.departs_finales,
+        opt.departs_transition,
+    ) {
+        eprintln!("{e}");
+        std::process::exit(2);
     }
     opt
 }
@@ -211,10 +226,17 @@ fn joue_partie(
 ) -> Vec<Ligne> {
     let mut chercheur = search::Recherche::new(net.clone(), TAILLE_TT_LOG2);
     chercheur.nouvelle_partie();
-    // Départ varié : même dérivation de graine et même tirage que train.rs.
+    // Départ varié : même dérivation de graine et même tirage que train.rs
+    // (tirage_complet, part de transition comprise — part nulle = tirage
+    // historique, bit à bit).
     let depart = {
         let mut rng_depart = StdRng::seed_from_u64(derive_graine(graine, 0xDE9A47));
-        echec::departs::tirage(&mut rng_depart, opt.departs_ouvertures, opt.departs_finales)
+        echec::departs::tirage_complet(
+            &mut rng_depart,
+            opt.departs_ouvertures,
+            opt.departs_finales,
+            opt.departs_transition,
+        )
     };
     let mut pos = depart.pos.clone();
     let plis_chauds = depart.plis_chauds;

@@ -40,9 +40,14 @@
 //! Garde : une taille supérieure à la RAM physique DISPONIBLE est refusée
 //! avec un message clair (GlobalMemoryStatusEx, sans dépendance).
 //!
+//! Tables Syzygy : --syzygy <dossier> (ex. engines/syzygy) arme la finale
+//! parfaite du champion — racine ≤ 5 pièces jouée par DTZ, sondes WDL dans
+//! l'arbre (src/syzygy.rs). Off par défaut : comportement historique strict.
+//!
 //! Exemple (fume-test) :
 //!   match --games 1 --movetime-champion 2000 --movetime-adversaire 2000 \
-//!         --uci-elo 2000 --threads-recherche 4 --tt-log2 24 --int8
+//!         --uci-elo 2000 --threads-recherche 4 --tt-log2 24 --int8 \
+//!         --syzygy engines/syzygy
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -79,6 +84,9 @@ struct Opt {
     threads_recherche: u32,
     tt_log2: u32,
     int8: bool,
+    /// Dossier des tables Syzygy 3-4-5 (--syzygy). Vide (défaut) = pas de
+    /// tables : comportement historique strict.
+    syzygy: String,
     games: usize,
     pgn: String,
     /// Réservée (reproductibilité d'une future randomisation : livre,
@@ -111,6 +119,7 @@ fn parse_args() -> Opt {
         threads_recherche: 1,
         tt_log2: 24,
         int8: false,
+        syzygy: String::new(),
         games: 1,
         pgn: "pgn".to_string(),
         seed: 0xDEE9_B1CE,
@@ -139,6 +148,7 @@ fn parse_args() -> Opt {
                 opt.threads_recherche = parse_valeur(&valeur(&args, i, &nom), &nom)
             }
             "--tt-log2" => opt.tt_log2 = parse_valeur(&valeur(&args, i, &nom), &nom),
+            "--syzygy" => opt.syzygy = valeur(&args, i, &nom),
             "--games" => opt.games = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--pgn" => opt.pgn = valeur(&args, i, &nom),
             "--seed" => opt.seed = parse_valeur(&valeur(&args, i, &nom), &nom),
@@ -587,6 +597,11 @@ fn ecrit_pgn(
     writeln!(f, "[MovetimeAdversaireMs \"{}\"]", opt.movetime_adversaire)?;
     writeln!(f, "[ThreadsRecherche \"{}\"]", opt.threads_recherche)?;
     writeln!(f, "[TTLog2 \"{}\"]", opt.tt_log2)?;
+    writeln!(
+        f,
+        "[Syzygy \"{}\"]",
+        if opt.syzygy.is_empty() { "-" } else { opt.syzygy.as_str() }
+    )?;
     writeln!(f, "[Seed \"{}\"]", opt.seed)?;
     writeln!(f, "[Termination \"{}\"]", issue.reason)?;
     writeln!(f)?;
@@ -666,6 +681,22 @@ fn main() {
     let mut recherche = Recherche::new(net, opt.tt_log2);
     recherche.threads = opt.threads_recherche;
     recherche.utilise_int8 = opt.int8;
+
+    // Tables Syzygy (--syzygy <dossier>, off par défaut) : chargement UNE
+    // FOIS ; une erreur est une erreur de configuration — sortie propre
+    // plutôt qu'un match sans l'assurance-finales demandée.
+    if !opt.syzygy.is_empty() {
+        match echec::syzygy::charge(&opt.syzygy) {
+            Ok((tables, n)) => {
+                println!("syzygy : {n} tables chargées depuis {}", opt.syzygy);
+                recherche.syzygy = Some(Arc::new(tables));
+            }
+            Err(e) => {
+                eprintln!("--syzygy {} : {e}", opt.syzygy);
+                std::process::exit(2);
+            }
+        }
+    }
 
     let mut moteur = UciEngine::lance(&opt.engine)
         .unwrap_or_else(|e| panic!("échec de lancement du moteur {} : {e}", opt.engine));
