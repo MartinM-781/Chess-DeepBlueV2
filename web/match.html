@@ -36,6 +36,58 @@
                   margin-left: -1px; background: var(--series-1); opacity: 0.85;
                   z-index: 1; }
 
+  /* ---- Indicateur « en réflexion » : pastille qui pulse sur le camp qui
+         pense (classe .pense posée par match.js sur la jauge et la tuile
+         horloge du penseur, retirée de l'autre camp). ---- */
+  @keyframes pense-pulse { 0%, 100% { opacity: 0.25; } 50% { opacity: 1; } }
+  @keyframes pense-halo  { 0%, 100% { box-shadow: 0 0 0 0 rgba(12, 163, 12, 0); }
+                           50%      { box-shadow: 0 0 0 3px rgba(12, 163, 12, 0.25); } }
+  .gauge.pense .gauge-name::after {
+    content: "●"; color: var(--good); margin-left: 6px; font-size: 9px;
+    animation: pense-pulse 1.1s ease-in-out infinite;
+  }
+  .tile.pense { border-color: var(--good);
+                animation: pense-halo 1.6s ease-in-out infinite; }
+
+  /* ---- Navigation historique (façon chess.com) : ◀ / ▶ / retour direct.
+         .detache = on regarde une position passée (liseré ambré). ---- */
+  .navbar { max-width: 640px; margin: 10px auto 0; display: flex;
+            align-items: center; justify-content: center; gap: 8px; }
+  .navbtn { background: var(--surface); border: 1px solid var(--border);
+            color: var(--ink); border-radius: 8px; padding: 4px 12px;
+            font-size: 13px; line-height: 1.5; cursor: pointer; }
+  .navbtn:hover:not(:disabled) { border-color: var(--series-1); }
+  .navbtn:disabled { opacity: 0.35; cursor: default; }
+  .navbtn.live { color: var(--good); font-weight: 600; }
+  .nav-pos { color: var(--muted); font-size: 12px; min-width: 92px;
+             text-align: center; font-variant-numeric: tabular-nums; }
+  .navbar.detache .nav-pos { color: var(--warn, #b38f00); font-weight: 600; }
+
+  /* ---- Panneau « pensée en direct » : profondeur / éval / nœuds / nœuds
+         par seconde du champion (st.pensee, hook d'itération du moteur). */
+  .pensee-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .pensee-cell { background: var(--surface); border: 1px solid var(--border);
+                 border-radius: 8px; padding: 7px 10px; text-align: center; }
+  .pensee-val { font-size: 16px; font-weight: 700; color: var(--ink);
+                font-variant-numeric: tabular-nums; }
+  .pensee-lbl { color: var(--muted); font-size: 10px; text-transform: uppercase;
+                letter-spacing: 0.5px; margin-top: 2px; }
+  #pensee.off .pensee-grid { opacity: 0.4; }
+
+  /* Rangée d'analyse façon chess.com : [éval en gras] [ligne SAN de la
+     variante principale], publiée avec st.pensee.pv, vidée au coup joué
+     (pensee repart à null côté match.exe). Ligne trop longue : ellipse,
+     jamais de débordement. Masquée (hidden) sans pv. */
+  .pensee-ligne { display: flex; align-items: baseline; gap: 8px; margin-top: 8px;
+                  background: var(--surface); border: 1px solid var(--border);
+                  border-radius: 8px; padding: 6px 10px; min-width: 0; }
+  .pensee-ligne[hidden] { display: none; }
+  .pensee-ligne-eval { flex: none; font-weight: 700; font-size: 13.5px;
+                       color: var(--ink); font-variant-numeric: tabular-nums; }
+  .pensee-ligne-pv { flex: 1; min-width: 0; color: var(--muted); font-size: 12.5px;
+                     font-variant-numeric: tabular-nums; white-space: nowrap;
+                     overflow: hidden; text-overflow: ellipsis; }
+
   /* Score du match, gros et lisible. */
   .match-score { text-align: center; font-size: 21px; font-weight: 700;
                  font-variant-numeric: tabular-nums; color: var(--ink); }
@@ -84,9 +136,17 @@
       </div>
     </div>
 
+    <!-- Navigation historique : flèches (boutons ou clavier), retour direct -->
+    <div class="navbar" id="navbar">
+      <button class="navbtn" id="nav-prec" title="Coup précédent (←)" disabled>◀</button>
+      <span class="nav-pos" id="nav-pos">direct</span>
+      <button class="navbtn" id="nav-suiv" title="Coup suivant (→)" disabled>▶</button>
+      <button class="navbtn live" id="nav-live" title="Revenir au direct (Fin)" disabled>● direct</button>
+    </div>
+
     <div class="status" id="status">Connexion au match…</div>
     <div class="hint">Évaluations ∈ [−1, 1] du point de vue des blancs · trait bleu = égalité ·
-      horloges = temps de réflexion cumulé de la partie</div>
+      horloges = temps de réflexion cumulé · flèches ←/→ : revoir la partie, Fin : direct</div>
   </section>
 
   <!-- ============================ PANNEAU ============================ -->
@@ -102,6 +162,21 @@
       <div class="tile"><div class="tile-value" id="tile-ply">—</div><div class="tile-label">Pli</div></div>
       <div class="tile"><div class="tile-value small" id="tile-horloge-champion">—</div><div class="tile-label">Horloge champion</div></div>
       <div class="tile"><div class="tile-value small" id="tile-horloge-fantome">—</div><div class="tile-label">Horloge fantôme</div></div>
+    </div>
+
+    <div class="card-box off" id="pensee">
+      <div class="card-box-head"><h2>Pensée en direct</h2></div>
+      <div class="pensee-grid">
+        <div class="pensee-cell"><div class="pensee-val" id="pensee-prof">—</div><div class="pensee-lbl">Profondeur</div></div>
+        <div class="pensee-cell"><div class="pensee-val" id="pensee-eval">—</div><div class="pensee-lbl">Éval (blancs)</div></div>
+        <div class="pensee-cell"><div class="pensee-val" id="pensee-noeuds">—</div><div class="pensee-lbl">Nœuds</div></div>
+        <div class="pensee-cell"><div class="pensee-val" id="pensee-nps">—</div><div class="pensee-lbl">Nœuds / s</div></div>
+      </div>
+      <!-- Rangée d'analyse : [éval en gras] [variante principale en SAN] -->
+      <div class="pensee-ligne" id="pensee-ligne" hidden>
+        <span class="pensee-ligne-eval" id="pensee-ligne-eval">—</span>
+        <span class="pensee-ligne-pv" id="pensee-ligne-pv"></span>
+      </div>
     </div>
 
     <div class="card-box">

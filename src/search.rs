@@ -88,6 +88,10 @@ const DELTA_ASPIRATION: f32 = 0.08;
 /// d'horloge par nœud coûterait plus cher que le nœud lui-même.
 const INTERVALLE_CHRONO: u64 = 1024;
 
+/// Longueur maximale (en plis) de la variante principale reconstruite par
+/// marche de TT pour le hook d'information (voir `pv_depuis_tt`).
+const PV_MAX_PLIS: usize = 12;
+
 // --- Table de transposition -------------------------------------------------
 
 const DRAPEAU_VIDE: u8 = 0;
@@ -413,6 +417,26 @@ impl Drop for GardeArret<'_> {
     }
 }
 
+/// Charge utile du hook d'information (`Recherche::info`) : cliché d'UNE
+/// itération d'approfondissement TERMINÉE du thread principal.
+pub struct InfoIteration {
+    /// Profondeur de l'itération qui vient de se terminer.
+    pub profondeur: u32,
+    /// Score du point de vue du trait ([-1,1] hors mats, ±(SCORE_MAT-ply) sinon).
+    pub score: f32,
+    /// Nœuds du thread principal depuis le début du cherche().
+    pub noeuds: u64,
+    /// Millisecondes écoulées depuis le début du cherche().
+    pub ecoule_ms: u64,
+    /// VARIANTE PRINCIPALE reconstruite par MARCHE DE TT depuis la racine
+    /// (voir `pv_depuis_tt`) : au plus PV_MAX_PLIS coups, tous VALIDÉS légaux
+    /// le long de la ligne. Peut être plus courte que la profondeur (entrée
+    /// TT écrasée, coup TT bruité, répétition) — jamais vide après une
+    /// itération complète dans le cas nominal (l'entrée racine vient d'être
+    /// stockée), mais l'appelant ne doit PAS compter dessus.
+    pub pv: Vec<Move>,
+}
+
 pub struct Resultat {
     /// Meilleur coup (None seulement sans coup légal).
     pub coup: Option<Move>,
@@ -462,6 +486,20 @@ pub struct Recherche {
     /// pas. À N > 1, lazy SMP (voir cherche_smp) : réservé aux harnais de
     /// match/analyse.
     pub threads: u32,
+    /// Hook optionnel d'information « pensée en direct » : appelé par le
+    /// THREAD PRINCIPAL uniquement (les assistants SMP n'en reçoivent
+    /// jamais — voir `assistant`) à CHAQUE itération d'approfondissement
+    /// TERMINÉE, avec un `InfoIteration` (profondeur, score du point de vue
+    /// du trait, nœuds du thread principal, écoulé_ms, et la variante
+    /// principale extraite par marche de TT — lecture SEULE, hors chemin
+    /// chaud, voir `pv_depuis_tt`).
+    /// None (défaut) → ZÉRO coût et ZÉRO changement : aucun appel d'horloge
+    /// supplémentaire, aucune marche de TT, le chemin chaud (negamax/quiesce)
+    /// n'est pas touché — la parité bit-à-bit du mono-thread est intacte
+    /// (harnais parite_threads_1_contre_reference). Le hook ne doit pas
+    /// bloquer longtemps : il est appelé entre deux itérations, jamais dans
+    /// l'arbre.
+    pub info: Option<Box<dyn Fn(InfoIteration) + Send + Sync>>,
     /// Poids réorganisés pour l'évaluation incrémentale. `None` = réseau sans
     /// couche cachée (les réseaux linéaires [773,1] de certains tests, où il
     /// n'y a de toute façon rien à accélérer) → forward complet d'office.
@@ -538,6 +576,7 @@ impl Recherche {
             utilise_nnue: true,
             utilise_int8: false,
             threads: 1,
+            info: None,
             eval,
             pile: None,
             quant: None,
@@ -670,6 +709,10 @@ impl Recherche {
         self.prochaine_verif_chrono = INTERVALLE_CHRONO;
         self.tt_sondes = 0;
         self.tt_hits = 0;
+        // Chrono du hook d'information : posé UNIQUEMENT si un hook est
+        // branché (hook None → pas même un Instant::now() de plus, le
+        // comportement historique est inchangé au bit près).
+        let debut_info = self.info.as_ref().map(|_| Instant::now());
 
         let coups = pos.legal_moves();
         if coups.is_empty() {
@@ -860,6 +903,20 @@ impl Recherche {
             self.stocke(cle_racine, d, DRAPEAU_EXACT, score_vers_tt(best, 0), compacter(&coup));
             let mat_trouve = best.abs() > SEUIL_MAT;
             complete = Some((coup, best, d, scores_iter));
+            // Hook d'information : itération d TERMINÉE (l'itération jetée
+            // par un stop ne passe jamais ici). Seul le thread qui porte un
+            // hook appelle — les assistants SMP n'en ont jamais. La marche de
+            // TT (PV) n'a lieu QUE si un hook est branché : hook None →
+            // strictement rien, comme avant.
+            if let (Some(info), Some(t0)) = (self.info.as_ref(), debut_info) {
+                info(InfoIteration {
+                    profondeur: d,
+                    score: best,
+                    noeuds: self.noeuds,
+                    ecoule_ms: t0.elapsed().as_millis() as u64,
+                    pv: self.pv_depuis_tt(pos, PV_MAX_PLIS),
+                });
+            }
             if mat_trouve {
                 break; // mat prouvé dans l'horizon : inutile de creuser
             }
@@ -1408,6 +1465,56 @@ impl Recherche {
             case.donnees.store(d, Ordering::Relaxed);
             case.cle_x.store(cle ^ d, Ordering::Relaxed);
         }
+    }
+
+    /// Sonde en LECTURE PURE, sans toucher aux compteurs tt_sondes/tt_hits :
+    /// réservée à la marche de PV (hors recherche), pour que les statistiques
+    /// de diagnostic restent celles de la recherche seule. Même validation
+    /// lockless que `sonde`.
+    fn sonde_lecture(&self, cle: u64) -> Option<EntreeTT> {
+        let case = &self.tt.cases[(cle & self.tt.masque) as usize];
+        let cle_x = case.cle_x.load(Ordering::Relaxed);
+        let donnees = case.donnees.load(Ordering::Relaxed);
+        let e = depaquette(donnees);
+        (e.drapeau != DRAPEAU_VIDE && cle_x ^ donnees == cle).then_some(e)
+    }
+
+    /// VARIANTE PRINCIPALE par MARCHE DE TT depuis `racine` : sonder la TT →
+    /// coup de l'entrée → VALIDATION contre les coups légaux (impératif, la
+    /// TT peut porter du bruit : collisions d'index, entrées d'une autre
+    /// position, écritures concurrentes en SMP) → jouer → re-sonder, jusqu'à
+    /// `max_plis`. Arrêt propre sur : entrée absente, coup sentinelle
+    /// (COUP_AUCUN), coup sans correspondant légal, ou POSITION RÉPÉTÉE
+    /// (garde anti-boucle par ensemble de clés zobrist — deux coups TT
+    /// peuvent se renvoyer l'un à l'autre à l'infini).
+    ///
+    /// Lecture SEULE de la TT (sonde_lecture), appelée par le thread
+    /// principal APRÈS une itération terminée, uniquement quand un hook
+    /// `info` est branché : coût négligeable (≤ max_plis sondes + genérations
+    /// de coups), chemin chaud intouché.
+    fn pv_depuis_tt(&self, racine: &Chess, max_plis: usize) -> Vec<Move> {
+        let mut pv = Vec::new();
+        let mut pos = racine.clone();
+        let mut vus = std::collections::HashSet::with_capacity(max_plis + 1);
+        vus.insert(zobrist(&pos));
+        for _ in 0..max_plis {
+            let Some(e) = self.sonde_lecture(zobrist(&pos)) else { break };
+            if e.coup == COUP_AUCUN {
+                break;
+            }
+            // Validation impérative : le coup TT n'est JAMAIS joué
+            // directement, seulement retrouvé parmi les coups légaux.
+            let Some(m) = pos.legal_moves().into_iter().find(|m| compacter(m) == e.coup)
+            else {
+                break;
+            };
+            pos.play_unchecked(&m);
+            pv.push(m);
+            if !vus.insert(zobrist(&pos)) {
+                break; // position déjà vue sur la ligne : boucle TT, on coupe
+            }
+        }
+        pv
     }
 
     // --- Tri des coups -------------------------------------------------------
@@ -2306,6 +2413,93 @@ mod tests {
         assert_eq!((cle1 ^ e1) ^ e1, cle1); // écriture propre : validée
         assert_ne!((cle1 ^ e1) ^ e2, cle1); // entrelacement : détecté...
         assert_ne!((cle1 ^ e1) ^ e2, cle2); // ...pour les deux clés en course
+    }
+
+    /// Marche de TT (la PV du hook info) : TT peuplée À LA MAIN sur une ligne
+    /// connue depuis la position initiale → la marche rend exactement cette
+    /// ligne et s'arrête sur la première position sans entrée ; un coup TT
+    /// sans correspondant légal arrête proprement (PV vide) ; une boucle de
+    /// coups TT est coupée par la garde anti-répétition (ensemble de zobrist).
+    #[test]
+    fn pv_marche_tt_nominale_et_gardes() {
+        let coup_de = |pos: &Chess, uci: &str| -> Move {
+            pos.legal_moves()
+                .into_iter()
+                .find(|m| m.to_uci(CastlingMode::Standard).to_string() == uci)
+                .unwrap_or_else(|| panic!("coup {uci} illégal ici"))
+        };
+        // Peuple la TT le long d'une ligne de coups UCI depuis `depart`, puis
+        // rend la ligne jouée (les Move attendus).
+        let peuple = |r: &mut Recherche, depart: &Chess, ucis: &[&str]| -> Vec<Move> {
+            let mut pos = depart.clone();
+            let mut attendus = Vec::new();
+            for uci in ucis {
+                let m = coup_de(&pos, uci);
+                r.stocke(zobrist(&pos), 5, DRAPEAU_EXACT, 0.0, compacter(&m));
+                pos.play_unchecked(&m);
+                attendus.push(m);
+            }
+            attendus
+        };
+
+        // (a) Nominal : 1.e4 e5 2.Cf3 — trois entrées, la marche rend les
+        // trois coups puis s'arrête (pas d'entrée pour la 4e position).
+        let depart = Chess::default();
+        let mut r = Recherche::new(reseau_reduit(), 14);
+        let attendus = peuple(&mut r, &depart, &["e2e4", "e7e5", "g1f3"]);
+        assert_eq!(r.pv_depuis_tt(&depart, PV_MAX_PLIS), attendus);
+
+        // (b) Troncature : max_plis borne la marche même si la TT va plus loin.
+        assert_eq!(r.pv_depuis_tt(&depart, 2), attendus[..2]);
+
+        // (c) Coup TT invalide : entrée dont le coup compacté (a1→a2) ne
+        // correspond à AUCUN coup légal de la position initiale → arrêt
+        // propre, PV vide (le bruit de TT n'est jamais joué).
+        let mut r = Recherche::new(reseau_reduit(), 14);
+        let bruit: u16 = 8 << 6; // from=a1 (0), to=a2 (8), promotion=0
+        r.stocke(zobrist(&depart), 5, DRAPEAU_EXACT, 0.0, bruit);
+        assert!(r.pv_depuis_tt(&depart, PV_MAX_PLIS).is_empty());
+
+        // (d) Anti-boucle : 1.Cf3 Cf6 2.Cg1 Cg8 ramène à la position
+        // initiale (même zobrist) — sans garde, la marche tournerait jusqu'à
+        // max_plis ; avec la garde elle rend exactement les 4 coups du cycle.
+        let mut r = Recherche::new(reseau_reduit(), 14);
+        let cycle = peuple(&mut r, &depart, &["g1f3", "g8f6", "f3g1", "f6g8"]);
+        assert_eq!(r.pv_depuis_tt(&depart, PV_MAX_PLIS), cycle);
+    }
+
+    /// Hook info : chaque itération terminée livre un InfoIteration — une
+    /// livraison par itération, profondeurs croissantes, et la PV (marche de
+    /// TT) commence par le meilleur coup rendu et n'aligne que des coups
+    /// légaux le long de sa ligne.
+    #[test]
+    fn hook_info_livre_pv() {
+        let infos: Arc<std::sync::Mutex<Vec<InfoIteration>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = infos.clone();
+        let pos = pos_de_fen(
+            "r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
+        );
+        let mut r = Recherche::new(reseau_reduit(), 14);
+        r.info = Some(Box::new(move |it| capture.lock().unwrap().push(it)));
+        let res = r.cherche(&pos, limites_prof(4));
+        let infos = infos.lock().unwrap();
+        assert_eq!(
+            infos.len() as u32,
+            res.profondeur,
+            "une livraison par itération complète"
+        );
+        let dernier = infos.last().expect("au moins l'itération 1");
+        assert_eq!(dernier.profondeur, res.profondeur);
+        assert_eq!(dernier.score.to_bits(), res.score.to_bits());
+        assert!(!dernier.pv.is_empty(), "PV vide après une itération complète");
+        assert!(dernier.pv.len() <= PV_MAX_PLIS);
+        assert_eq!(dernier.pv.first(), res.coup.as_ref(), "la PV ouvre sur le coup rendu");
+        let mut p = pos.clone();
+        for m in &dernier.pv {
+            assert!(p.is_legal(m), "coup de PV illégal le long de la ligne : {m:?}");
+            p.play_unchecked(m);
+        }
     }
 
     /// (SMP) Fumée 2 threads : un coup légal et un score fini à 150 ms sur un

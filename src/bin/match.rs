@@ -15,6 +15,16 @@
 //!  "champion_blanc": bool, "elo_fantome": u32,
 //!  "ply": u32, "fen": "...", "last_move": "uci"|null,
 //!  "history_san": ["e4", ...],
+//!  "history_fen": ["<FEN initiale>", "<FEN après pli 1>", ...]
+//!      (history_fen[i] = position après i plis : navigation du viewer),
+//!  "pensee": null | {"profondeur": u32, "eval": f32 (CÔTÉ BLANCS, [-1,1]),
+//!      "noeuds": u64, "ecoule_ms": u64, "camp": "champion",
+//!      "pv": "41...Rxe3 42.fxe3 Rf8"|null}
+//!      (réflexion EN COURS du champion : réécrite par le hook d'itération
+//!       de la recherche, throttle ~1/s ; remise à null à chaque coup joué ;
+//!       "pv" : variante principale de l'itération — marche de TT côté
+//!       recherche — en SAN numéroté depuis la position au trait, null si
+//!       introuvable),
 //!  "v_champion": f32|null, "v_fantome": f32|null   (CÔTÉ BLANCS, [-1,1]),
 //!  "temps_champion_ms": u64, "temps_fantome_ms": u64  (cumul de la partie),
 //!  "movetime_champion_ms": u64, "movetime_fantome_ms": u64,
@@ -36,7 +46,7 @@
 
 use std::collections::HashMap;
 use std::io::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use shakmaty::fen::Fen;
@@ -46,7 +56,7 @@ use shakmaty::zobrist::{Zobrist64, ZobristHash};
 use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, Move, Position};
 
 use echec::nn::Mlp;
-use echec::search::{octets_tt, Limites, Recherche};
+use echec::search::{octets_tt, InfoIteration, Limites, Recherche};
 use echec::uci::UciEngine;
 
 /// Plafond de plis d'une partie (long, exigence du contrat : pas de plafond
@@ -222,6 +232,17 @@ fn garde_tt(tt_log2: u32) {
 // Direct (jumeau de src/direct.rs, fichier dédié au match)
 // ---------------------------------------------------------------------------
 
+/// Écriture atomique du fichier du direct (.tmp puis rename, comme
+/// direct.rs) : le lecteur (serve.exe → match.js) ne voit jamais de JSON
+/// partiel. Les erreurs d'E/S sont ignorées : le direct ne doit jamais
+/// faire tomber le match.
+fn ecrit_live(contenu: &str) {
+    let tmp = format!("{CHEMIN_LIVE}.tmp");
+    if std::fs::write(&tmp, contenu).is_ok() {
+        let _ = std::fs::rename(&tmp, CHEMIN_LIVE);
+    }
+}
+
 /// État permanent du match publié à chaque coup.
 struct Direct {
     games: usize,
@@ -234,13 +255,18 @@ struct Direct {
     tt_log2: u32,
     score_champion: f64,
     score_fantome: f64,
+    /// Cliché de la DERNIÈRE publication (JSON complet) : le hook « pensée »
+    /// de la recherche (thread principal du champion) le relit pour réécrire
+    /// le fichier avec le champ "pensee" à jour sans re-connaître tout
+    /// l'état de la partie. Mutex par principe (le hook et publie() tournent
+    /// en fait sur le même thread) ; Arc pour la capture 'static du hook.
+    etat: Arc<Mutex<serde_json::Value>>,
 }
 
 impl Direct {
-    /// Écrit models/match_live.json ATOMIQUEMENT (.tmp puis rename, comme
-    /// direct.rs) : le lecteur (serve.exe → match.js) ne voit jamais de JSON
-    /// partiel. Les erreurs d'E/S sont ignorées : le direct ne doit jamais
-    /// faire tomber le match.
+    /// Publie l'état complet dans models/match_live.json (écriture atomique
+    /// via ecrit_live) et met le cliché partagé à jour. "pensee" repart à
+    /// null : un coup vient d'être joué, la réflexion précédente est close.
     #[allow(clippy::too_many_arguments)]
     fn publie(
         &self,
@@ -249,6 +275,7 @@ impl Direct {
         fen: &str,
         last_move: Option<&str>,
         history_san: &[String],
+        history_fen: &[String],
         v_champion: Option<f32>,
         v_fantome: Option<f32>,
         temps_champion_ms: u64,
@@ -267,6 +294,8 @@ impl Direct {
             "fen": fen,
             "last_move": last_move,
             "history_san": history_san,
+            "history_fen": history_fen,
+            "pensee": serde_json::Value::Null,
             "v_champion": v_champion,
             "v_fantome": v_fantome,
             "temps_champion_ms": temps_champion_ms,
@@ -280,9 +309,9 @@ impl Direct {
             "result": result,
             "result_reason": result_reason,
         });
-        let tmp = format!("{CHEMIN_LIVE}.tmp");
-        if std::fs::write(&tmp, v.to_string()).is_ok() {
-            let _ = std::fs::rename(&tmp, CHEMIN_LIVE);
+        ecrit_live(&v.to_string());
+        if let Ok(mut etat) = self.etat.lock() {
+            *etat = v;
         }
     }
 }
@@ -303,12 +332,45 @@ fn vers_blancs(score_trait: f32, trait_blanc: bool) -> f32 {
     v.clamp(-1.0, 1.0)
 }
 
+/// Ligne SAN NUMÉROTÉE d'une variante principale depuis `pos` (la position
+/// au trait, racine de la réflexion) : « 41...Rxe3 42.fxe3 Rf8 » — numéro de
+/// coup devant chaque coup blanc, « N... » en tête si le trait est aux noirs.
+/// Réutilise SanPlus (le SAN du PGN, suffixes +/# compris). Coup illégal
+/// (TT bruitée, FEN désynchronisée) → troncature propre sur ce qui précède.
+fn pv_en_san(pos: &Chess, pv: &[Move]) -> String {
+    let mut p = pos.clone();
+    let mut ligne = String::new();
+    for (i, m) in pv.iter().enumerate() {
+        if !p.is_legal(m) {
+            break; // ceinture : on n'affiche jamais une suite illégale
+        }
+        let num = p.fullmoves();
+        if p.turn() == Color::White {
+            if i > 0 {
+                ligne.push(' ');
+            }
+            ligne.push_str(&format!("{num}."));
+        } else if i == 0 {
+            ligne.push_str(&format!("{num}..."));
+        } else {
+            ligne.push(' ');
+        }
+        let san = SanPlus::from_move(p.clone(), m).to_string();
+        ligne.push_str(&san);
+        p.play_unchecked(m);
+    }
+    ligne
+}
+
 /// Issue d'une partie (résultat + dernier état publié, pour la publication
 /// finale « match terminé » qui garde la position réelle à l'écran).
 struct Issue {
     result: &'static str,
     reason: &'static str,
     history_san: Vec<String>,
+    /// FEN après chaque pli, position initiale incluse (history_fen[i] =
+    /// après i plis) : navigation du viewer, republiée à la fin du match.
+    history_fen: Vec<String>,
     /// Points du champion : 1.0 / 0.5 / 0.0.
     points_champion: f64,
     fen: String,
@@ -362,6 +424,7 @@ fn partie(
     let mut repetitions: HashMap<u64, u32> = HashMap::new();
     repetitions.insert(zobrist(&pos), 1);
     let mut history_san: Vec<String> = Vec::new();
+    let mut history_fen: Vec<String> = Vec::new();
     let mut plies: u32 = 0;
     let mut temps_champion_ms: u64 = 0;
     let mut temps_fantome_ms: u64 = 0;
@@ -369,9 +432,13 @@ fn partie(
     let mut v_fantome: Option<f32> = None;
     let mut dernier_uci: Option<String> = None;
 
-    // Position initiale au micro dès le premier tick de la page.
+    // Position initiale au micro dès le premier tick de la page (elle ouvre
+    // aussi history_fen : la navigation remonte jusqu'à elle).
     let fen0 = Fen::from_position(pos.clone(), EnPassantMode::Legal).to_string();
-    direct.publie(false, 0, &fen0, None, &history_san, None, None, 0, 0, None, None);
+    history_fen.push(fen0.clone());
+    direct.publie(
+        false, 0, &fen0, None, &history_san, &history_fen, None, None, 0, 0, None, None,
+    );
 
     let limites_champion = Limites {
         max_noeuds: 0,
@@ -441,6 +508,7 @@ fn partie(
 
         dernier_uci = Some(uci.clone());
         let fen = Fen::from_position(pos.clone(), EnPassantMode::Legal).to_string();
+        history_fen.push(fen.clone());
         let verdict = arbitre(&pos, compte, plies);
         direct.publie(
             false,
@@ -448,6 +516,7 @@ fn partie(
             &fen,
             Some(&uci),
             &history_san,
+            &history_fen,
             v_champion,
             v_fantome,
             temps_champion_ms,
@@ -469,6 +538,7 @@ fn partie(
         result,
         reason,
         history_san,
+        history_fen,
         points_champion: if champion_blanc { points_blancs } else { 1.0 - points_blancs },
         fen: Fen::from_position(pos, EnPassantMode::Legal).to_string(),
         last_move: dernier_uci,
@@ -625,7 +695,55 @@ fn main() {
         tt_log2: opt.tt_log2,
         score_champion: 0.0,
         score_fantome: 0.0,
+        etat: Arc::new(Mutex::new(serde_json::Value::Null)),
     };
+
+    // Hook « pensée en direct » (Recherche::info) : à chaque itération
+    // d'approfondissement TERMINÉE du champion, la dernière publication est
+    // réécrite avec un objet "pensee" à jour (profondeur, éval CÔTÉ BLANCS,
+    // nœuds du thread principal, écoulé). Écriture atomique (ecrit_live),
+    // throttle ~1 écriture/s : à 3 min/coup, largement assez vivant sans
+    // marteler le disque. Le hook est hors chemin chaud (entre itérations)
+    // et n'existe que sur la recherche du champion — jamais sur le Fantôme.
+    let etat_live = direct.etat.clone();
+    let derniere_ecriture: Mutex<Option<Instant>> = Mutex::new(None);
+    recherche.info = Some(Box::new(move |it: InfoIteration| {
+        if let Ok(mut t) = derniere_ecriture.lock() {
+            if t.is_some_and(|t0| t0.elapsed().as_millis() < 1000) {
+                return; // throttle : au plus ~1 écriture par seconde
+            }
+            *t = Some(Instant::now());
+        }
+        let Ok(mut v) = etat_live.lock() else { return };
+        if v.is_null() {
+            return; // rien encore publié : pas d'état à enrichir
+        }
+        // Le penseur est TOUJOURS le champion (le hook n'est posé que sur sa
+        // recherche) : score perspective du trait → côté blancs via la
+        // couleur du champion dans la partie en cours, clampé comme les
+        // jauges (les mats saturent à ±1).
+        let champion_blanc = v["champion_blanc"].as_bool().unwrap_or(true);
+        let eval = (if champion_blanc { it.score } else { -it.score }).clamp(-1.0, 1.0);
+        // PV en SAN numéroté : la racine de la réflexion est la position de
+        // la dernière publication (v["fen"] — publie() précède toujours le
+        // cherche() du champion). FEN illisible ou PV vide → null, le
+        // panneau web éteint simplement la ligne.
+        let pv_san = v["fen"]
+            .as_str()
+            .and_then(|f| f.parse::<Fen>().ok())
+            .and_then(|f| f.into_position::<Chess>(CastlingMode::Standard).ok())
+            .map(|pos| pv_en_san(&pos, &it.pv))
+            .filter(|l| !l.is_empty());
+        v["pensee"] = serde_json::json!({
+            "profondeur": it.profondeur,
+            "eval": eval,
+            "noeuds": it.noeuds,
+            "ecoule_ms": it.ecoule_ms,
+            "camp": "champion",
+            "pv": pv_san,
+        });
+        ecrit_live(&v.to_string());
+    }));
 
     for i in 0..opt.games {
         // Couleurs alternées : le champion a les blancs aux parties impaires
@@ -675,6 +793,7 @@ fn main() {
                 &issue.fen,
                 issue.last_move.as_deref(),
                 &issue.history_san,
+                &issue.history_fen,
                 issue.v_champion,
                 issue.v_fantome,
                 issue.temps_champion_ms,
