@@ -25,6 +25,12 @@
 //!       "pv" : variante principale de l'itération — marche de TT côté
 //!       recherche — en SAN numéroté depuis la position au trait, null si
 //!       introuvable),
+//!  "ponder": null | {"lances": u64, "justes": u64, "taux": f64,
+//!      "ms_cumules": u64}
+//!      (null sans --ponder ; sinon compteurs CUMULÉS du match : recherches
+//!       de fond démarrées sur le temps de l'adversaire, celles dont la
+//!       réponse prédite était le vrai coup joué, taux, et temps de recherche
+//!       de fond RÉELLEMENT passé — pas la fenêtre d'attente),
 //!  "v_champion": f32|null, "v_fantome": f32|null   (CÔTÉ BLANCS, [-1,1]),
 //!  "temps_champion_ms": u64, "temps_fantome_ms": u64  (cumul de la partie),
 //!  "movetime_champion_ms": u64, "movetime_fantome_ms": u64,
@@ -44,10 +50,50 @@
 //! parfaite du champion — racine ≤ 5 pièces jouée par DTZ, sondes WDL dans
 //! l'arbre (src/syzygy.rs). Off par défaut : comportement historique strict.
 //!
+//! Ponder : --ponder (OFF par défaut) fait réfléchir le champion PENDANT le
+//! tour du Fantôme. Mécanisme « préchauffage de TT » (src/ponder.rs) : après
+//! notre coup C, si la variante principale valait [C, R, ...], une recherche
+//! de fond part sur la position après C puis R, sur un chercheur DÉDIÉ posé
+//! sur la MÊME table de transposition ; elle est rappelée et JOINTE dès
+//! l'arrivée du vrai coup adverse, avant notre recherche. Son score n'est
+//! jamais réutilisé : tout le gain vient de la table chaude quand la
+//! prédiction est juste.
+//!
+//! --ponder-threads N : threads de la recherche de FOND. Défaut = la MOITIÉ
+//! de --threads-recherche (au moins 1), pas la totalité — voir « partage des
+//! cœurs » ci-dessous.
+//!
+//! Sans --ponder, le MOTEUR est strictement inchangé : `arret_externe` reste
+//! None sur tout le chemin de recherche (parité bit à bit, mono-thread comme
+//! SMP), pas un thread de fond, pas une entrée de TT de plus. Les SORTIES,
+//! elles, gagnent deux marqueurs constants : la balise PGN [Ponder "non"] et
+//! le champ "ponder": null du direct (le panneau web masque sa ligne dans ce
+//! cas, et absorbe aussi les json d'ancienne génération, sans ce champ). Les
+//! artefacts ne sont donc pas octet pour octet ceux d'avant le chantier.
+//!
+//! PARTAGE DES CŒURS — à savoir avant tout match classé. Le movetime du
+//! Fantôme est FIXE : le ponder ne lui vole aucun temps de mur, mais il lui
+//! dispute le CPU, le L3 et la bande passante mémoire pendant qu'il réfléchit.
+//! Avant ce chantier notre processus était strictement inactif sur son tour.
+//! Deux garde-fous, tous deux imparfaits : --ponder-threads borne notre
+//! consommation ; et rien ici ne configure le moteur UCI, à qui src/uci.rs
+//! n'envoie que UCI_LimitStrength/UCI_Elo — il tourne donc sur 1 thread et
+//! 16 Mio de hash par défaut. Si le partage des cœurs doit devenir un choix
+//! explicite, c'est un `setoption name Threads/Hash` à poser dans uci.rs, et
+//! cela change la force de l'adversaire : à décider, pas à subir.
+//!
+//! MESURER LE GAIN (A/B) — le ponder est un pari, pas un acquis : sur une
+//! prédiction fausse la recherche de fond ÉVINCE des entrées profondes du
+//! champion (voir l'en-tête de src/ponder.rs). Protocole : deux séries
+//! IDENTIQUES (mêmes --seed, --movetime-*, --uci-elo, --tt-log2,
+//! --threads-recherche, --games), l'une avec --ponder, l'autre sans, et
+//! comparer le score du match — en lisant au passage le taux publié dans
+//! "ponder", qui dit si la prédiction porte.
+//!
 //! Exemple (fume-test) :
 //!   match --games 1 --movetime-champion 2000 --movetime-adversaire 2000 \
 //!         --uci-elo 2000 --threads-recherche 4 --tt-log2 24 --int8 \
-//!         --syzygy engines/syzygy
+//!         --syzygy engines/syzygy --ponder
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -61,6 +107,7 @@ use shakmaty::zobrist::{Zobrist64, ZobristHash};
 use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, Move, Position};
 
 use echec::nn::Mlp;
+use echec::ponder::{DernierePv, Ponder, StatsPonder};
 use echec::search::{octets_tt, InfoIteration, Limites, Recherche};
 use echec::uci::UciEngine;
 
@@ -87,6 +134,15 @@ struct Opt {
     /// Dossier des tables Syzygy 3-4-5 (--syzygy). Vide (défaut) = pas de
     /// tables : comportement historique strict.
     syzygy: String,
+    /// Réflexion sur le temps de l'adversaire (--ponder). false (défaut) =
+    /// comportement historique strict : le moteur ne pense que sur son tour.
+    ponder: bool,
+    /// Threads de la recherche de FOND (--ponder-threads). 0 (défaut) = auto :
+    /// la MOITIÉ de threads_recherche, au moins 1. Volontairement inférieur au
+    /// nombre de threads de la recherche officielle : le movetime du Fantôme
+    /// est fixe, donc tout ce que nous consommons sur son tour se prend sur
+    /// SES cœurs et SON cache, pas sur son horloge (voir l'en-tête).
+    ponder_threads: u32,
     games: usize,
     pgn: String,
     /// Réservée (reproductibilité d'une future randomisation : livre,
@@ -120,6 +176,8 @@ fn parse_args() -> Opt {
         tt_log2: 24,
         int8: false,
         syzygy: String::new(),
+        ponder: false,
+        ponder_threads: 0,
         games: 1,
         pgn: "pgn".to_string(),
         seed: 0xDEE9_B1CE,
@@ -131,6 +189,11 @@ fn parse_args() -> Opt {
         // Drapeaux SANS valeur : n'avancent que d'un cran.
         if nom == "--int8" {
             opt.int8 = true;
+            i += 1;
+            continue;
+        }
+        if nom == "--ponder" {
+            opt.ponder = true;
             i += 1;
             continue;
         }
@@ -146,6 +209,9 @@ fn parse_args() -> Opt {
             }
             "--threads-recherche" => {
                 opt.threads_recherche = parse_valeur(&valeur(&args, i, &nom), &nom)
+            }
+            "--ponder-threads" => {
+                opt.ponder_threads = parse_valeur(&valeur(&args, i, &nom), &nom)
             }
             "--tt-log2" => opt.tt_log2 = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--syzygy" => opt.syzygy = valeur(&args, i, &nom),
@@ -292,7 +358,17 @@ impl Direct {
         temps_fantome_ms: u64,
         result: Option<&str>,
         result_reason: Option<&str>,
+        ponder: Option<StatsPonder>,
     ) {
+        // Bloc "ponder" : null sans --ponder (le panneau web éteint sa ligne).
+        let ponder = ponder.map(|s| {
+            serde_json::json!({
+                "lances": s.lances,
+                "justes": s.justes,
+                "taux": s.taux(),
+                "ms_cumules": s.ms_cumules,
+            })
+        });
         let v = serde_json::json!({
             "actif": true,
             "termine": termine,
@@ -306,6 +382,7 @@ impl Direct {
             "history_san": history_san,
             "history_fen": history_fen,
             "pensee": serde_json::Value::Null,
+            "ponder": ponder,
             "v_champion": v_champion,
             "v_fantome": v_fantome,
             "temps_champion_ms": temps_champion_ms,
@@ -422,12 +499,26 @@ fn arbitre(pos: &Chess, repetitions: u32, plies: u32) -> Option<(&'static str, &
 /// Joue UNE partie complète, publie le direct à chaque coup, renvoie l'issue.
 /// Le champion garde sa TT entre les coups (nouvelle_partie() la vide entre
 /// deux parties) ; le Fantôme reçoit un ucinewgame par partie.
+///
+/// PONDER (src/ponder.rs, `ponder` éteint = comportement historique strict) :
+/// après CHAQUE coup du champion, si la variante principale de la recherche
+/// prédit une réponse, une recherche de fond part sur la position
+/// correspondante et occupe le temps de réflexion du Fantôme ; elle est
+/// rappelée et JOINTE dès l'arrivée du coup adverse, donc AVANT la recherche
+/// suivante du champion. Invariants tenus ici :
+///   - au plus une recherche de fond en vol, jamais pendant notre recherche
+///     ni entre deux parties (la TT y est vidée) ;
+///   - toutes les sorties de la boucle passent par un arrêt du ponder ;
+///   - le chercheur de fond n'a pas de hook `info` : il n'écrit JAMAIS dans
+///     models/match_live.json, dont la boucle reste seule propriétaire.
 fn partie(
     recherche: &mut Recherche,
     moteur: &mut UciEngine,
     direct: &Direct,
     movetime_champion: u64,
     movetime_fantome: u64,
+    ponder: &mut Ponder,
+    derniere_pv: &DernierePv,
 ) -> Issue {
     let champion_blanc = direct.champion_blanc;
     let mut pos = Chess::default();
@@ -447,7 +538,19 @@ fn partie(
     let fen0 = Fen::from_position(pos.clone(), EnPassantMode::Legal).to_string();
     history_fen.push(fen0.clone());
     direct.publie(
-        false, 0, &fen0, None, &history_san, &history_fen, None, None, 0, 0, None, None,
+        false,
+        0,
+        &fen0,
+        None,
+        &history_san,
+        &history_fen,
+        None,
+        None,
+        0,
+        0,
+        None,
+        None,
+        ponder.stats_publiables(),
     );
 
     let limites_champion = Limites {
@@ -460,26 +563,47 @@ fn partie(
         let trait_blanc = pos.turn() == Color::White;
         let tour_champion = trait_blanc == champion_blanc;
         let debut = Instant::now();
+        // Réponse prédite par la recherche du champion (ponder) : posée à
+        // notre tour, consommée après que le coup a été joué.
+        let mut prediction: Option<Move> = None;
 
         let coup: Move = if tour_champion {
+            // Ceinture : aucune recherche de fond ne doit tourner pendant la
+            // nôtre (elle est normalement déjà jointe — arrivée du coup
+            // adverse — ce rappel est un no-op).
+            ponder.arrete(None);
+            // La boîte aux lettres repart vide : jamais de prédiction bâtie
+            // sur la variante principale du coup précédent.
+            derniere_pv.vide();
             let res = recherche.cherche(&pos, limites_champion);
             v_champion = Some(vers_blancs(res.score, trait_blanc));
             temps_champion_ms += debut.elapsed().as_millis() as u64;
-            res.coup.expect("coups légaux non vides (l'arbitre a déjà statué)")
+            let coup = res.coup.expect("coups légaux non vides (l'arbitre a déjà statué)");
+            prediction = derniere_pv.reponse_apres(&coup);
+            coup
         } else {
             let fen = Fen::from_position(pos.clone(), EnPassantMode::Legal).to_string();
-            match moteur.meilleur_coup_et_score_fen(&fen, movetime_fantome) {
+            let reponse = moteur.meilleur_coup_et_score_fen(&fen, movetime_fantome);
+            let ecoule_fantome = debut.elapsed().as_millis() as u64;
+            // Parse UCI + validation de LÉGALITÉ contre la position : un coup
+            // illégal du moteur vaut forfait, jamais de corruption
+            // silencieuse de la partie.
+            let coup_adverse = match &reponse {
+                Ok((texte, _)) => UciMove::from_ascii(texte.as_bytes())
+                    .ok()
+                    .and_then(|u| u.to_move(&pos).ok())
+                    .filter(|m| pos.legal_moves().contains(m)),
+                Err(_) => None,
+            };
+            // LE COUP ADVERSE EST LÀ : la recherche de fond est rappelée et
+            // JOINTE ici, avant tout le reste — y compris avant les sorties
+            // par forfait ci-dessous. Le coup sert à créditer la prédiction.
+            ponder.arrete(coup_adverse.as_ref());
+            match reponse {
                 Ok((texte, score)) => {
                     v_fantome = score.map(|s| vers_blancs(s, trait_blanc));
-                    temps_fantome_ms += debut.elapsed().as_millis() as u64;
-                    // Parse UCI + validation de LÉGALITÉ contre la position :
-                    // un coup illégal du moteur vaut forfait, jamais de
-                    // corruption silencieuse de la partie.
-                    let coup = UciMove::from_ascii(texte.as_bytes())
-                        .ok()
-                        .and_then(|u| u.to_move(&pos).ok())
-                        .filter(|m| pos.legal_moves().contains(m));
-                    match coup {
+                    temps_fantome_ms += ecoule_fantome;
+                    match coup_adverse {
                         Some(m) => m,
                         None => {
                             // Le trait est au Fantôme : le forfait donne la
@@ -533,11 +657,25 @@ fn partie(
             temps_fantome_ms,
             verdict.map(|(r, _)| r),
             verdict.map(|(_, raison)| raison),
+            ponder.stats_publiables(),
         );
         if let Some((r, raison)) = verdict {
             break (r, raison);
         }
+        // PONDER : notre coup vient d'être joué, la partie continue, et c'est
+        // maintenant au Fantôme de consommer son temps de réflexion. Si la
+        // variante principale prédit une réponse, la recherche de fond part
+        // sur la position qui suivrait — la légalité de la réponse est
+        // revérifiée par `demarre` contre `pos`.
+        if let Some(reponse) = prediction {
+            ponder.demarre(&pos, &reponse);
+        }
     };
+    // Toute sortie de boucle est déjà passée par un arrêt du ponder ; ce
+    // rappel final ferme le cas des sorties par forfait ET garantit qu'aucun
+    // thread de fond ne franchit la fin de partie (la TT est vidée juste
+    // après, par nouvelle_partie()).
+    ponder.arrete(None);
 
     let points_blancs = match result {
         "1-0" => 1.0,
@@ -602,6 +740,7 @@ fn ecrit_pgn(
         "[Syzygy \"{}\"]",
         if opt.syzygy.is_empty() { "-" } else { opt.syzygy.as_str() }
     )?;
+    writeln!(f, "[Ponder \"{}\"]", if opt.ponder { "oui" } else { "non" })?;
     writeln!(f, "[Seed \"{}\"]", opt.seed)?;
     writeln!(f, "[Termination \"{}\"]", issue.reason)?;
     writeln!(f)?;
@@ -698,6 +837,44 @@ fn main() {
         }
     }
 
+    // PONDER (--ponder, off par défaut) : un chercheur DÉDIÉ, construit
+    // APRÈS le réglage des drapeaux du champion (threads, int8, syzygy) qu'il
+    // recopie, et surtout posé sur la MÊME TABLE DE TRANSPOSITION (Arc
+    // partagé) — c'est ce partage, et lui seul, qui transporte le travail de
+    // la réflexion de fond vers la recherche officielle du coup suivant.
+    // Sans l'option : Ponder::eteint(), pas un thread, pas un octet de plus.
+    //
+    // THREADS DU FOND : volontairement RÉDUITS par rapport à la recherche
+    // officielle (défaut : la moitié). Le movetime du Fantôme est fixe — ce
+    // que nous prenons sur son tour ne se voit sur aucune horloge, seulement
+    // sur ses nœuds, c'est-à-dire sur sa force. Laisser des cœurs libres est
+    // le seul garde-fou que ce harnais possède (voir l'en-tête).
+    let mut ponder = if opt.ponder {
+        let n = if opt.ponder_threads > 0 {
+            opt.ponder_threads
+        } else {
+            (opt.threads_recherche / 2).max(1)
+        };
+        if n >= opt.threads_recherche && opt.threads_recherche > 1 {
+            println!(
+                "ponder : ATTENTION — {n} thread(s) de fond pour {} de recherche : le Fantôme \
+                 réfléchira sur une machine saturée, sa force en pâtira sans que son horloge \
+                 le montre",
+                opt.threads_recherche
+            );
+        }
+        println!(
+            "ponder : actif (réflexion sur le temps du Fantôme, TT partagée, {n} thread(s) \
+             de fond contre {} de recherche)",
+            opt.threads_recherche
+        );
+        let mut fond = recherche.jumeau_meme_tt();
+        fond.threads = n;
+        Ponder::arme(fond)
+    } else {
+        Ponder::eteint()
+    };
+
     let mut moteur = UciEngine::lance(&opt.engine)
         .unwrap_or_else(|e| panic!("échec de lancement du moteur {} : {e}", opt.engine));
     let elo = moteur
@@ -736,9 +913,19 @@ fn main() {
     // throttle ~1 écriture/s : à 3 min/coup, largement assez vivant sans
     // marteler le disque. Le hook est hors chemin chaud (entre itérations)
     // et n'existe que sur la recherche du champion — jamais sur le Fantôme.
+    //
+    // Le hook sert AUSSI de source au ponder : la variante principale de
+    // chaque itération est déposée dans `derniere_pv` (boîte aux lettres de
+    // src/ponder.rs) AVANT le throttle — la dernière PV déposée est donc
+    // toujours celle de l'itération qui a fourni le coup joué, quel que soit
+    // le rythme d'écriture du direct. Coût : une copie de ≤ 12 coups par
+    // itération, hors chemin chaud.
     let etat_live = direct.etat.clone();
+    let derniere_pv = DernierePv::nouvelle();
+    let pv_pour_hook = derniere_pv.clone();
     let derniere_ecriture: Mutex<Option<Instant>> = Mutex::new(None);
     recherche.info = Some(Box::new(move |it: InfoIteration| {
+        pv_pour_hook.depose(&it.pv);
         if let Ok(mut t) = derniere_ecriture.lock() {
             if t.is_some_and(|t0| t0.elapsed().as_millis() < 1000) {
                 return; // throttle : au plus ~1 écriture par seconde
@@ -781,6 +968,13 @@ fn main() {
         // (1re, 3e, ...).
         direct.partie = i + 1;
         direct.champion_blanc = i % 2 == 0;
+        // AVANT le vidage de la table : joint un éventuel fond en vol (partie()
+        // le fait déjà — ceinture) ET remet à zéro les killers/historique du
+        // chercheur de FOND, que `recherche.nouvelle_partie()` ne touche pas
+        // (ils sont par chercheur, pas dans la table partagée). Sans ce rappel,
+        // le fond traverserait tout le match avec des heuristiques héritées de
+        // parties révolues.
+        ponder.nouvelle_partie();
         recherche.nouvelle_partie();
         if let Err(e) = moteur.nouvelle_partie() {
             panic!("ucinewgame en erreur avant la partie {} : {e}", i + 1);
@@ -798,7 +992,10 @@ fn main() {
             &direct,
             opt.movetime_champion,
             opt.movetime_adversaire,
+            &mut ponder,
+            &derniere_pv,
         );
+        debug_assert!(ponder.au_repos(), "thread de ponder survivant à la partie");
         direct.score_champion += issue.points_champion;
         direct.score_fantome += 1.0 - issue.points_champion;
 
@@ -831,6 +1028,7 @@ fn main() {
                 issue.temps_fantome_ms,
                 Some(issue.result),
                 Some(issue.reason),
+                ponder.stats_publiables(),
             );
         }
     }
@@ -839,4 +1037,14 @@ fn main() {
         "match terminé : Champion {} — Fantôme {} ({} partie(s))",
         direct.score_champion, direct.score_fantome, opt.games
     );
+    if let Some(s) = ponder.stats_publiables() {
+        println!(
+            "ponder : {} lancé(s), {} juste(s) ({:.1} %), {:.1} s de recherche de fond \
+             effective sur le temps du Fantôme",
+            s.lances,
+            s.justes,
+            100.0 * s.taux(),
+            s.ms_cumules as f64 / 1000.0
+        );
+    }
 }

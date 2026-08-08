@@ -42,6 +42,12 @@
 //!             "3 répétitions"|"matériel insuffisant"|"abandon",
 //!   "opponent": "t1h", "thinking_ms": 42}
 //!
+//! Options : `--int8` (évaluation quantizée, src/quant.rs) et
+//! `--syzygy <dossier>` (tables de finales 3-4-5 : racine ≤ 5 pièces jouée par
+//! DTZ, sondes WDL dans l'arbre — le réseau étant entraîné AVEC les tables,
+//! c'est le déploiement nominal du plateau). Sans option : comportement
+//! historique inchangé.
+//!
 //! Adversaires : "random" → RandomBot ; "material" → MaterialBot(depth 2) ;
 //! paliers et "latest" → Mlp chargé + BotRecherche (négamax alpha-bêta,
 //! movetime 150 ms par coup, température 0). Le bot vit DANS la session :
@@ -94,9 +100,18 @@ const LIMITES_SERVEUR: Limites = Limites {
 const PLIS_LIVRE_MAX: usize = 12;
 
 /// `--int8` sur la ligne de commande : les bots de recherche du plateau
-/// évaluent par le chemin quantizé (src/quant.rs). Serve n'a pas d'autre
-/// option : un simple drapeau global posé au démarrage suffit.
+/// évaluent par le chemin quantizé (src/quant.rs). Un simple drapeau global
+/// posé au démarrage suffit.
 static INT8: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `--syzygy <dossier>` : tables de finales 3-4-5 chargées UNE fois au
+/// démarrage et partagées par tous les bots du plateau (les tables sont Sync).
+/// Sans l'option, la cellule reste vide et le comportement est strictement
+/// celui d'avant — mais l'entraînement, lui, se fait AVEC les tables : servir
+/// le réseau sans elles, c'est lui réclamer en finale ce que le professeur
+/// faisait à sa place. `--syzygy engines/syzygy` est donc le déploiement
+/// nominal (voir relance_train.ps1).
+static SYZYGY: std::sync::OnceLock<Arc<echec::syzygy::Tables>> = std::sync::OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Session de jeu
@@ -307,7 +322,10 @@ fn coup_ia(session: &mut Session, cache: &CacheModeles) -> Result<(), String> {
                         // force est l'objectif) ; la variété vient de la
                         // graine de la partie.
                         BotRecherche::new(net, graine, LIMITES_SERVEUR, 0.0)
-                            .avec_int8(INT8.load(std::sync::atomic::Ordering::Relaxed)),
+                            .avec_int8(INT8.load(std::sync::atomic::Ordering::Relaxed))
+                            // Tables de finales (--syzygy) : clone d'Arc, les
+                            // 290 fichiers ne sont lus qu'une fois, au démarrage.
+                            .avec_syzygy(SYZYGY.get().cloned()),
                     ));
                 }
             }
@@ -493,7 +511,11 @@ fn progress_json() -> serde_json::Value {
     // absent avant la première mesure : tableau vide, la page gère).
     let mut ancres: Vec<serde_json::Value> = Vec::new();
     if let Ok(contenu) = std::fs::read_to_string(format!("{MODELS_DIR}/ancres.csv")) {
-        // Entête : heures,ancre,score_pct,parties
+        // Entête : heures,ancre,score_pct,parties[,resondage]
+        // La 5e colonne est facultative (lignes antérieures à l'échelle
+        // adaptative) : absente, elle vaut 0. Le VOLUME est exposé lui aussi —
+        // un re-sondage de 12 parties a ~14 points d'écart-type là où une mesure
+        // de 56 en a ~7, et la page doit pouvoir ne pas les confondre.
         for ligne in contenu.lines().skip(1) {
             let cols: Vec<&str> = ligne.split(',').collect();
             if cols.len() < 4 {
@@ -507,6 +529,8 @@ fn progress_json() -> serde_json::Value {
                     "h": h,
                     "ancre": cols[1].trim(),
                     "score_pct": s,
+                    "parties": cols[3].trim().parse::<u64>().unwrap_or(0),
+                    "resondage": cols.get(4).map(|c| c.trim() == "1").unwrap_or(false),
                 }));
             }
         }
@@ -770,9 +794,33 @@ fn boucle(serveur: Server, etat: Arc<Etat>) {
 
 fn main() {
     echec::pleine_puissance(); // la réflexion de l'IA jamais bridée par l'EcoQoS
-    if std::env::args().skip(1).any(|a| a == "--int8") {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--int8") {
         INT8.store(true, std::sync::atomic::Ordering::Relaxed);
         println!("évaluation quantizée int8 active (--int8)");
+    }
+    // --syzygy <dossier> : tables de finales du plateau. Un dossier illisible
+    // n'empêche PAS le serveur de démarrer — le plateau doit rester jouable —
+    // mais la dégradation est annoncée haut et fort (stdout ET stderr) : jouer
+    // sans les tables qu'on a demandées coûte les finales, silencieusement.
+    if let Some(i) = args.iter().position(|a| a == "--syzygy") {
+        match args.get(i + 1) {
+            None => eprintln!("option --syzygy : dossier manquant — tables ignorées"),
+            Some(dossier) => match echec::syzygy::charge(dossier) {
+                Ok((tables, n)) => {
+                    let _ = SYZYGY.set(Arc::new(tables));
+                    println!(
+                        "tables Syzygy : {n} fichiers charges depuis {dossier} \
+                         (finales <= {} pieces jouees par DTZ)",
+                        echec::syzygy::PIECES_MAX
+                    );
+                }
+                Err(e) => {
+                    println!("attention : --syzygy {dossier} : {e} — plateau SANS tables");
+                    eprintln!("attention : --syzygy {dossier} : {e} — plateau SANS tables");
+                }
+            },
+        }
     }
     let etat = Arc::new(Etat {
         // Session par défaut : humain (blancs) contre le bot aléatoire.

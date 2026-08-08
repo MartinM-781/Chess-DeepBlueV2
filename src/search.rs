@@ -402,6 +402,17 @@ pub struct Limites {
     pub movetime_ms: u64,
 }
 
+impl Limites {
+    /// Limites « de fond » : ni budget de nœuds ni chrono — seul le plafond
+    /// de profondeur du moteur borne la recherche. Faites pour
+    /// `cherche_interruptible`, dont l'arrêt vient du drapeau externe ;
+    /// PROF_MAX tient lieu de critère non nul pour l'assertion de
+    /// `cherche_thread` (au moins un critère doit l'être).
+    pub fn illimitees() -> Self {
+        Limites { max_noeuds: 0, max_profondeur: PROF_MAX, movetime_ms: 0 }
+    }
+}
+
 /// Paramètres de diversification d'un thread assistant du lazy SMP : chaque
 /// assistant explore le même approfondissement itératif mais LÉGÈREMENT
 /// décalé, pour peupler la TT partagée de sous-arbres différents.
@@ -564,6 +575,15 @@ pub struct Recherche {
     /// `new`) : consulté par les assistants au même rythme que le chrono,
     /// tous les ~INTERVALLE_CHRONO nœuds.
     arret_partage: Option<Arc<AtomicBool>>,
+    /// Drapeau d'arrêt fourni par L'APPELANT (`cherche_interruptible`) :
+    /// None sur tout le chemin normal — un chercheur construit par `new` n'en
+    /// a jamais, et `cherche` ne le pose pas. Consulté exactement au même
+    /// rythme que le chrono et le drapeau du lazy SMP (tous les
+    /// ~INTERVALLE_CHRONO nœuds, plus entre deux coups racine), par le thread
+    /// principal ET par les assistants (propagé par `assistant`). C'est le
+    /// support du ponder de match.exe : la recherche de fond doit pouvoir
+    /// être rappelée à l'arrivée du coup adverse.
+    arret_externe: Option<Arc<AtomicBool>>,
     /// Statistiques TT du DERNIER cherche() — sondes et hits, tous threads
     /// confondus en SMP. Diagnostic des harnais ; aucun effet sur la
     /// recherche.
@@ -612,9 +632,36 @@ impl Recherche {
             fin: None,
             prochaine_verif_chrono: 0,
             arret_partage: None,
+            arret_externe: None,
             tt_sondes: 0,
             tt_hits: 0,
         }
+    }
+
+    /// Chercheur JUMEAU posé sur la MÊME TABLE DE TRANSPOSITION (Arc
+    /// partagé) : état de recherche NEUF et PAR THREAD (killers, historique,
+    /// piles d'accumulateurs, compteurs), mais même réseau (Arc), mêmes
+    /// drapeaux d'évaluation, même nombre de threads SMP et même Syzygy.
+    ///
+    /// C'est le support du ponder de match.exe : la recherche de fond tourne
+    /// sur son propre chercheur — aucun partage d'état mutable avec la
+    /// recherche « officielle », donc aucun verrou — mais elle PEUPLE la
+    /// table que celle-ci sondera au coup suivant. La TT est sans verrous et
+    /// validée par XOR (voir CaseTT) : deux chercheurs qui y écrivent en même
+    /// temps ne peuvent pas la corrompre. En pratique le ponder est de toute
+    /// façon joint AVANT notre recherche.
+    ///
+    /// Le hook `info` n'est PAS transporté (il n'est pas clonable, et une
+    /// recherche de fond n'a rien à publier — c'est aussi ce qui garantit
+    /// qu'elle n'écrit jamais dans le direct).
+    pub fn jumeau_meme_tt(&self) -> Recherche {
+        let mut j = Recherche::avec_table(self.net.clone(), self.tt.clone());
+        j.mode_classique = self.mode_classique;
+        j.utilise_nnue = self.utilise_nnue;
+        j.utilise_int8 = self.utilise_int8;
+        j.threads = self.threads;
+        j.syzygy = self.syzygy.clone();
+        j
     }
 
     /// Approfondissement itératif 1..=max jusqu'à épuisement des limites.
@@ -640,6 +687,44 @@ impl Recherche {
         self.cherche_smp(pos, limites)
     }
 
+    /// `cherche` PLUS un drapeau d'arrêt fourni par l'appelant : la recherche
+    /// (thread principal ET assistants du lazy SMP) le consulte exactement au
+    /// même rythme que le chrono — tous les ~INTERVALLE_CHRONO nœuds, plus
+    /// entre deux coups racine — et sort dès qu'il est posé.
+    ///
+    /// Faite pour la recherche de FOND du ponder (match.exe) : limites
+    /// `Limites::illimitees()`, arrêt à l'arrivée du coup adverse.
+    ///
+    /// LATENCE D'ARRÊT — ne pas la citer comme un chiffre : elle dépend de la
+    /// configuration, et deux prologues la bornent PAR LE BAS, tous deux hors
+    /// d'atteinte du drapeau.
+    ///   1. L'itération 1 est délibérément menée hors limites (invariant « un
+    ///      coup est TOUJOURS rendu ») : tant qu'elle dure, le drapeau ne peut
+    ///      rien.
+    ///   2. En SMP, `cherche_smp` construit ses N-1 assistants SÉQUENTIELLEMENT
+    ///      sur le thread appelant AVANT tout spawn, et chaque construction
+    ///      recopie le réseau en colonnes (`EvalIncrementale::new`) — plusieurs
+    ///      Mio par assistant sur un réseau de match. Le court-circuit ci-
+    ///      dessous évite ce prologue quand le drapeau est DÉJÀ posé, mais pas
+    ///      quand il tombe pendant.
+    /// Autrement dit l'arrêt est prompt, jamais instantané, et sa borne se
+    /// mesure sur la configuration visée — pas sur un réseau de test.
+    ///
+    /// Chemin normal INTACT : sans appel à cette fonction, `arret_externe`
+    /// vaut None partout et aucune comparaison supplémentaire n'influe sur le
+    /// résultat (parité bit à bit, mono-thread comme SMP).
+    pub fn cherche_interruptible(
+        &mut self,
+        pos: &Chess,
+        limites: Limites,
+        arret: Arc<AtomicBool>,
+    ) -> Resultat {
+        self.arret_externe = Some(arret);
+        let res = self.cherche(pos, limites);
+        self.arret_externe = None;
+        res
+    }
+
     /// Coup de RACINE par les tables Syzygy. None (chemin normal) si : pas de
     /// tables sur l'instance, plus de PIECES_MAX pièces, position terminale
     /// (le verdict exact appartient à la recherche), droits de roque
@@ -651,6 +736,17 @@ impl Recherche {
     /// la vérité (« lu dans les tables, pas cherché ») ; scores_racine ne
     /// contient que ce coup — l'échantillonnage en température du self-play
     /// joue donc TOUJOURS le coup parfait en finale de tables.
+    /// Vrai si `cherche` rendrait cette position SANS chercher — coup lu dans
+    /// les tables Syzygy (voir `racine_syzygy`). Faux partout ailleurs, et
+    /// toujours faux sans tables (le défaut).
+    ///
+    /// Sert au ponder : une recherche de fond partant sur une telle racine
+    /// sort immédiatement sans écrire une seule entrée de TT — elle ne
+    /// préchauffe RIEN, il ne faut donc ni la lancer ni la compter.
+    pub fn racine_resolue_par_syzygy(&self, pos: &Chess) -> bool {
+        self.racine_syzygy(pos).is_some()
+    }
+
     fn racine_syzygy(&self, pos: &Chess) -> Option<Resultat> {
         let tables = self.syzygy.as_ref()?;
         if pos.board().occupied().count() > syzygy::PIECES_MAX {
@@ -689,8 +785,17 @@ impl Recherche {
             max_profondeur: PROF_MAX,
             movetime_ms: limites.movetime_ms,
         };
+        // Drapeau externe DÉJÀ posé (recherche de fond rappelée avant même
+        // d'avoir démarré) : on n'engage pas le prologue des assistants — leur
+        // construction est séquentielle, recopie le réseau en colonnes, et
+        // AUCUN drapeau ne peut l'interrompre une fois lancée. Le principal
+        // mène son itération 1 (invariant « un coup est toujours rendu ») et
+        // sort. `arret_externe` est None sur tout le chemin normal : la
+        // condition y est fausse et le nombre d'assistants inchangé.
+        let deja_arrete = self.arret_externe.as_ref().is_some_and(|a| a.load(Ordering::Relaxed));
+        let n_assistants = if deja_arrete { 0 } else { self.threads - 1 };
         let mut assistants: Vec<Recherche> =
-            (0..self.threads - 1).map(|_| self.assistant(&arret)).collect();
+            (0..n_assistants).map(|_| self.assistant(&arret)).collect();
         let mut resultat = None;
         std::thread::scope(|s| {
             let garde = GardeArret(&arret);
@@ -732,6 +837,10 @@ impl Recherche {
         a.utilise_int8 = self.utilise_int8;
         a.syzygy = self.syzygy.clone();
         a.arret_partage = Some(arret.clone());
+        // Drapeau externe (ponder) : les assistants le portent aussi, sans
+        // quoi ils n'apprendraient l'arrêt qu'en cascade, une fois le
+        // principal sorti. None sur le chemin normal.
+        a.arret_externe = self.arret_externe.clone();
         a
     }
 
@@ -895,10 +1004,12 @@ impl Recherche {
                     // réseau est lent ; ici l'appel d'horloge est gratuit à l'échelle
                     // d'un sous-arbre. Sans incidence sur le déterminisme à budget de
                     // nœuds fixe (fin = None dans ce cas). Même consultation du
-                    // drapeau d'arrêt partagé pour un assistant SMP (None sinon).
+                    // drapeau d'arrêt partagé pour un assistant SMP (None sinon)
+                    // et du drapeau externe d'un cherche_interruptible (idem).
                     if self.limites_actives
                         && (self.fin.is_some_and(|f| Instant::now() >= f)
-                            || self.arret_partage.as_ref().is_some_and(|a| a.load(Ordering::Relaxed)))
+                            || self.arret_partage.as_ref().is_some_and(|a| a.load(Ordering::Relaxed))
+                            || self.arret_externe.as_ref().is_some_and(|a| a.load(Ordering::Relaxed)))
                     {
                         self.stop = true;
                         break 'iterations;
@@ -995,6 +1106,15 @@ impl Recherche {
             case.cle_x.store(0, Ordering::Relaxed);
             case.donnees.store(0, Ordering::Relaxed);
         }
+        self.oublie_heuristiques();
+    }
+
+    /// Remet à zéro les seules heuristiques de TRI (killers, historique), sans
+    /// toucher à la table de transposition. C'est la moitié « par chercheur »
+    /// de `nouvelle_partie` : à appeler sur un chercheur SECONDAIRE posé sur
+    /// une table partagée (recherche de fond du ponder) quand la partie
+    /// change, la table ayant déjà été vidée par le chercheur principal.
+    pub fn oublie_heuristiques(&mut self) {
         self.killers.fill([COUP_AUCUN; 2]);
         self.historique.fill(0);
     }
@@ -1466,8 +1586,8 @@ impl Recherche {
 
     /// Vrai si la recherche doit s'arrêter. Le budget de nœuds est testé à
     /// CHAQUE nœud (comparaison d'entiers, gratuite et déterministe) ; le
-    /// chrono — et, pour un assistant SMP, le drapeau d'arrêt partagé — tous
-    /// les ~INTERVALLE_CHRONO nœuds seulement.
+    /// chrono — et les drapeaux d'arrêt (partagé du lazy SMP, externe d'un
+    /// cherche_interruptible) — tous les ~INTERVALLE_CHRONO nœuds seulement.
     fn verifier_arret(&mut self) -> bool {
         if self.stop {
             return true;
@@ -1479,7 +1599,7 @@ impl Recherche {
             self.stop = true;
             return true;
         }
-        if (self.fin.is_some() || self.arret_partage.is_some())
+        if (self.fin.is_some() || self.arret_partage.is_some() || self.arret_externe.is_some())
             && self.noeuds >= self.prochaine_verif_chrono
         {
             self.prochaine_verif_chrono = self.noeuds + INTERVALLE_CHRONO;
@@ -1491,16 +1611,22 @@ impl Recherche {
                 self.stop = true;
                 return true;
             }
+            if self.arret_externe.as_ref().is_some_and(|a| a.load(Ordering::Relaxed)) {
+                self.stop = true;
+                return true;
+            }
         }
         false
     }
 
-    /// Test direct (entre deux itérations) : budget déjà consommé ? (Pour un
-    /// assistant SMP, le drapeau d'arrêt partagé compte comme un budget.)
+    /// Test direct (entre deux itérations) : budget déjà consommé ? (Les
+    /// drapeaux d'arrêt — partagé du lazy SMP, externe d'un
+    /// cherche_interruptible — comptent comme un budget.)
     fn budget_epuise(&self) -> bool {
         self.noeuds >= self.limite_noeuds
             || self.fin.is_some_and(|f| Instant::now() >= f)
             || self.arret_partage.as_ref().is_some_and(|a| a.load(Ordering::Relaxed))
+            || self.arret_externe.as_ref().is_some_and(|a| a.load(Ordering::Relaxed))
     }
 
     // --- Table de transposition ----------------------------------------------
@@ -2580,6 +2706,123 @@ mod tests {
             assert!(p.is_legal(m), "coup de PV illégal le long de la ligne : {m:?}");
             p.play_unchecked(m);
         }
+    }
+
+    // --- Recherche interruptible de l'extérieur (chantier ponder) -----------
+
+    /// PARITÉ : un drapeau externe JAMAIS posé ne change RIEN. À budget de
+    /// nœuds fixe (aucune horloge en jeu, tout est déterministe),
+    /// `cherche_interruptible` rejoue exactement `cherche` : même coup, même
+    /// score AU BIT, même profondeur, même nombre EXACT de nœuds.
+    #[test]
+    fn interruptible_sans_arret_est_identique_a_cherche() {
+        for pos in positions_variees(12) {
+            let mut a = Recherche::new(reseau_reduit_biaise(), 16);
+            let ra = a.cherche(&pos, limites_noeuds(2000));
+            let mut b = Recherche::new(reseau_reduit_biaise(), 16);
+            let rb = b.cherche_interruptible(
+                &pos,
+                limites_noeuds(2000),
+                Arc::new(AtomicBool::new(false)),
+            );
+            assert_eq!(ra.coup, rb.coup, "coup ({})", Fen::from_position(pos.clone(), EnPassantMode::Legal));
+            assert_eq!(ra.score.to_bits(), rb.score.to_bits(), "score au bit");
+            assert_eq!(ra.profondeur, rb.profondeur, "profondeur");
+            assert_eq!(ra.noeuds, rb.noeuds, "nœuds");
+        }
+    }
+
+    /// Recherche de FOND (`Limites::illimitees`, ni budget ni chrono) rappelée
+    /// depuis un AUTRE thread, comme le fera match.exe à l'arrivée du coup
+    /// adverse : mono-thread et lazy SMP (les assistants portent le drapeau),
+    /// la recherche rend la main promptement, avec un coup légal.
+    #[test]
+    fn interruptible_arret_externe_rappelle_la_recherche() {
+        let pos =
+            pos_de_fen("r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4");
+        for threads in [1u32, 4] {
+            let mut r = Recherche::new(reseau_reduit_biaise(), 16);
+            r.threads = threads;
+            let arret = Arc::new(AtomicBool::new(false));
+            let sonneur = {
+                let a = arret.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(120));
+                    a.store(true, Ordering::Relaxed);
+                })
+            };
+            let debut = Instant::now();
+            let res = r.cherche_interruptible(&pos, Limites::illimitees(), arret);
+            let ecoule = debut.elapsed();
+            sonneur.join().expect("thread de rappel");
+            let coup = res.coup.expect("un coup est toujours rendu");
+            assert!(pos.is_legal(&coup), "coup illégal {coup:?} ({threads} thread(s))");
+            assert!(
+                ecoule < Duration::from_secs(30),
+                "recherche de fond non rappelée ({threads} thread(s)) : {ecoule:?}"
+            );
+        }
+    }
+
+    /// Drapeau DÉJÀ posé au départ : l'invariant « un coup est TOUJOURS rendu »
+    /// tient (l'itération 1 est menée à terme), et l'itération 2 ne démarre
+    /// même pas — la profondeur rendue vaut 1, pas PROF_MAX.
+    ///
+    /// En SMP, c'est aussi le court-circuit de `cherche_smp` qui est éprouvé :
+    /// drapeau déjà posé → AUCUN assistant n'est construit. Ce prologue est
+    /// séquentiel et non interruptible (une copie du réseau en colonnes par
+    /// assistant), donc l'éviter est la seule façon de borner la latence
+    /// d'arrêt dans ce cas.
+    #[test]
+    fn interruptible_arret_pose_d_avance_sort_a_la_profondeur_1() {
+        let pos =
+            pos_de_fen("r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4");
+        for threads in [1u32, 4] {
+            let mut r = Recherche::new(reseau_reduit_biaise(), 16);
+            r.threads = threads;
+            let res = r.cherche_interruptible(
+                &pos,
+                Limites::illimitees(),
+                Arc::new(AtomicBool::new(true)),
+            );
+            let coup = res.coup.expect("un coup est toujours rendu");
+            assert!(pos.is_legal(&coup), "coup illégal ({threads} thread(s))");
+            assert_eq!(
+                res.profondeur, 1,
+                "l'itération 2 n'aurait pas dû démarrer ({threads} thread(s))"
+            );
+            // Aucun assistant construit : les nœuds agrégés sont ceux du seul
+            // thread principal, donc ceux de son itération 1.
+            assert_eq!(res.noeuds, r.noeuds, "des assistants ont tourné malgré l'arrêt");
+        }
+    }
+
+    /// Jumeau de ponder : chercheur NEUF (killers, historique, piles) mais
+    /// posé sur la MÊME table. Ce que le jumeau y écrit est immédiatement
+    /// visible du champion — c'est tout le mécanisme du préchauffage.
+    #[test]
+    fn jumeau_partage_bien_la_table_du_champion() {
+        let pos =
+            pos_de_fen("r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4");
+        let mut champion = Recherche::new(reseau_reduit_biaise(), 16);
+        champion.utilise_int8 = true;
+        champion.threads = 3;
+        let mut jumeau = champion.jumeau_meme_tt();
+        // Drapeaux transportés (le jumeau doit évaluer comme le champion).
+        assert_eq!(jumeau.utilise_int8, champion.utilise_int8);
+        assert_eq!(jumeau.threads, champion.threads);
+        assert!(jumeau.info.is_none(), "le jumeau ne doit rien publier");
+
+        assert!(champion.sonde(zobrist(&pos)).is_none(), "table censée être vierge");
+        jumeau.cherche(&pos, limites_prof(4));
+        let e = champion
+            .sonde(zobrist(&pos))
+            .expect("l'entrée écrite par le jumeau doit être visible du champion");
+        assert!(e.profondeur >= 4, "profondeur stockée inattendue : {}", e.profondeur);
+
+        // Et la remise à zéro d'une nouvelle partie porte sur LA MÊME table.
+        champion.nouvelle_partie();
+        assert!(jumeau.sonde(zobrist(&pos)).is_none(), "table non vidée pour le jumeau");
     }
 
     /// (SMP) Fumée 2 threads : un coup légal et un score fini à 150 ms sur un

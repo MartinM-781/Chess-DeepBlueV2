@@ -192,20 +192,32 @@ function render(data) {
   // data.ancres (models/ancres.csv) : [{h, ancre, score_pct}, ...] — vide ou
   // absent tant que l'entraîneur n'a rien journalisé.
   const ancres = data.ancres || [];
+  // Les RE-SONDAGES sont exclus de la courbe : ce sont des sondes à 12 parties
+  // (~14 points d'écart-type) qui vérifient si une ancre saturée redevient
+  // informative, pas des mesures du réseau. Tracés comme les autres, leurs
+  // écarts de ±20 points seraient indiscernables d'une vraie variation.
   const parAncre = (nom) => ancres
-    .filter((a) => a.ancre === nom && Number.isFinite(a.h) && Number.isFinite(a.score_pct))
+    .filter((a) => a.ancre === nom && !a.resondage
+      && Number.isFinite(a.h) && Number.isFinite(a.score_pct))
     .map((a) => [a.h, a.score_pct]);
   const ptsMat4 = parAncre("materiel d4");
   const ptsSf17 = parAncre("stockfish 1700");
   const ptsSf20 = parAncre("stockfish 2000");
+  const ptsSf23 = parAncre("stockfish 2300");
   const dern = (pts) => (pts.length ? fr(pts[pts.length - 1][1], 1) + " %" : "—");
-  $("ancres-last").textContent = !ptsMat4.length && !ptsSf17.length && !ptsSf20.length ? "" :
+  // Échelle ADAPTATIVE : une ancre saturée cesse d'être jouée, sa courbe
+  // s'arrête donc — c'est voulu (son budget part aux ancres informatives) et
+  // elle reprend au premier re-sondage. Une série vide est normale.
+  const aucune = !ptsMat4.length && !ptsSf17.length && !ptsSf20.length && !ptsSf23.length;
+  $("ancres-last").textContent = aucune ? "" :
     `Dernière mesure : ${dern(ptsMat4)} vs Matériel d4 · ` +
-    `${dern(ptsSf17)} vs Stockfish 1700 · ${dern(ptsSf20)} vs Stockfish 2000`;
+    `${dern(ptsSf17)} vs Stockfish 1700 · ${dern(ptsSf20)} vs Stockfish 2000 · ` +
+    `${dern(ptsSf23)} vs Stockfish 2300`;
   drawChart("chart-ancres", "empty-ancres", [
     { color: css("--series-1"), pts: ptsMat4, dots: true },
     { color: css("--series-2"), pts: ptsSf17, dots: true },
     { color: css("--series-4"), pts: ptsSf20, dots: true },
+    { color: css("--series-3"), pts: ptsSf23, dots: true },
   ], { yMin: 0, yMax: 100, baseline: 50, yFmt: (v) => `${Math.round(v)} %`, events });
 
   // Gating : synthèse des duels candidat vs champion (régime recherche).

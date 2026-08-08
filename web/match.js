@@ -195,6 +195,30 @@ function majPensee(st) {
   $("pensee-ligne-pv").textContent = pv || "";
 }
 
+/* Ligne « ponder » (option --ponder de match.exe, src/ponder.rs) : part des
+   réponses de l'adversaire correctement prédites — c'est ce taux, et lui
+   seul, qui dit si la réflexion menée sur son temps a servi — et temps de
+   recherche de fond RÉELLEMENT passé (pas la fenêtre d'attente : une
+   recherche de fond qui prouve un mat s'arrête d'elle-même et cesse d'être
+   comptée). Compteurs CUMULÉS sur tout le match ; la ligne reste donc lisible
+   une fois la partie close. st.ponder absent ou null (ponder éteint, json
+   d'ancienne génération) → ligne entièrement masquée. */
+function majPonder(st) {
+  const ligne = $("ponder-ligne");
+  const p = st ? st.ponder : null;
+  if (!p || !isFinite(p.lances)) { ligne.hidden = true; return; }
+  ligne.hidden = false;
+  const taux = p.lances > 0 ? Math.round(100 * p.taux) + " %" : "—";
+  ligne.innerHTML = "";
+  ligne.append("Ponder · ");
+  const fort = document.createElement("span");
+  fort.className = "ponder-taux";
+  fort.textContent = taux;
+  ligne.append(fort);
+  ligne.append(` de réponses prédites (${p.justes}/${p.lances}) · ` +
+    `${horloge(p.ms_cumules)} de recherche de fond`);
+}
+
 /* --------------------------------------------------- navigation (rendu) */
 
 /* history_fen exploitable, ou null (json d'ancienne génération). */
@@ -350,6 +374,7 @@ function afficherEtat(st) {
   majJauge("champion", st.v_champion);
   majJauge("fantome", st.v_fantome);
   majPensee(st);
+  majPonder(st);
   majPanneau(st);
 
   const banner = $("banner");

@@ -104,6 +104,7 @@
         <span><i style="background:var(--series-1)"></i>vs Matériel d4</span>
         <span><i style="background:var(--series-2)"></i>vs Stockfish 1700</span>
         <span><i style="background:var(--series-4)"></i>vs Stockfish 2000</span>
+        <span><i style="background:var(--series-3)"></i>vs Stockfish 2300</span>
       </div>
     </div>
     <div class="tr-lastvals" id="ancres-last"></div>
@@ -114,6 +115,10 @@
       Scores bruts contre les ancres hautes de l'échelle d'Elo (les mêmes duels que la courbe
       ci-dessus, sans l'ajustement logistique). 50&nbsp;% (ligne pointillée) = égalité : c'est là que
       se lit la marge de progression restante contre Stockfish bridé.
+      L'échelle est <strong>adaptative</strong> : une ancre dont le score sort de
+      [15&nbsp;%, 85&nbsp;%] n'apprend plus rien et cesse d'être jouée — son budget de parties
+      passe aux ancres encore serrées, et elle est re-sondée périodiquement. Une courbe qui
+      s'interrompt est donc une ancre saturée, pas une mesure manquante.
     </div>
   </div>
 

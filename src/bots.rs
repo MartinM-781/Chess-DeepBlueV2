@@ -11,6 +11,7 @@ use shakmaty::{Board, Chess, Color, Move, Position};
 
 use crate::nn::{evalue_position, Mlp};
 use crate::search;
+use crate::syzygy;
 
 pub trait Bot {
     fn choose(&mut self, pos: &Chess) -> Option<Move>;
@@ -304,6 +305,11 @@ fn est_position_initiale(pos: &Chess) -> bool {
 /// approfondissement itératif, TT persistante entre les coups d'une même
 /// partie. `temperature == 0` → meilleur coup ; `temperature > 0` → softmax
 /// sur les scores racine (clampés, voir `echantillonne_scores_racine`).
+///
+/// Deux armements optionnels, tous deux INACTIFS par défaut (comportement
+/// historique bit à bit) et posés par les fabriques de bots : l'évaluation
+/// quantizée int8 (`avec_int8`) et les tables de finales Syzygy
+/// (`avec_syzygy`).
 pub struct BotRecherche {
     /// UN chercheur persistant : la TT est réutilisée entre coups (gros gain),
     /// et vidée au début de chaque partie via `nouvelle_partie()`.
@@ -331,6 +337,23 @@ impl BotRecherche {
     /// Consommant, pour s'enchaîner à `new` dans les fabriques de bots.
     pub fn avec_int8(mut self, actif: bool) -> Self {
         self.recherche.utilise_int8 = actif;
+        self
+    }
+
+    /// Arme le bot des tables de finales Syzygy 3-4-5 (voir src/syzygy.rs) :
+    /// racine ≤ 5 pièces jouée par DTZ, sondes WDL exactes dans l'arbre.
+    /// `None` (le défaut de `new`) = comportement historique STRICT.
+    ///
+    /// L'état vit dans le champ `Recherche::syzygy` du chercheur possédé —
+    /// même conception que `avec_int8`, qui écrit dans `utilise_int8` : un
+    /// champ jumeau sur le bot ne ferait que dupliquer la source de vérité et
+    /// pourrait diverger d'elle. Le paramètre est un `Option<Arc<_>>` (et non
+    /// un `Arc`) parce que TOUS les appelants tiennent déjà l'option issue de
+    /// leur drapeau `--syzygy` : `.avec_syzygy(tables.clone())` s'écrit sans
+    /// branchement, et cloner l'Arc ne recharge JAMAIS les 290 fichiers.
+    /// Consommant, pour s'enchaîner à `new` dans les fabriques de bots.
+    pub fn avec_syzygy(mut self, tables: Option<Arc<syzygy::Tables>>) -> Self {
+        self.recherche.syzygy = tables;
         self
     }
 }
@@ -407,5 +430,113 @@ mod tests_recherche {
     fn echantillonnage_vide() {
         let mut rng = StdRng::seed_from_u64(3);
         assert!(echantillonne_scores_racine(&[], 0.5, &mut rng).is_none());
+    }
+}
+
+/// Tables Syzygy portées par le bot (R4) : propagation du champ jusqu'à la
+/// recherche, et conversion effective d'une finale gagnée.
+#[cfg(test)]
+mod tests_syzygy {
+    use super::*;
+    use crate::features::N_FEATURES;
+    use crate::search::Limites;
+    use shakmaty::fen::Fen;
+    use shakmaty::CastlingMode;
+
+    /// Dossier des tables (relatif à la racine du crate = cwd de cargo test).
+    const DOSSIER: &str = "engines/syzygy";
+
+    /// Réseau linéaire nul (éval constante 0.0) : le test mesure les tables et
+    /// la recherche, pas la qualité d'un réseau — et reste rapide en profil dev.
+    fn reseau_nul() -> Arc<Mlp> {
+        Arc::new(Mlp {
+            sizes: vec![N_FEATURES, 1],
+            weights: vec![vec![0.0; N_FEATURES]],
+            biases: vec![vec![0.0]],
+            adam_mw: vec![vec![0.0; N_FEATURES]],
+            adam_vw: vec![vec![0.0; N_FEATURES]],
+            adam_mb: vec![vec![0.0]],
+            adam_vb: vec![vec![0.0]],
+            steps: 0,
+            pas_colonnes: vec![0u64; N_FEATURES],
+        })
+    }
+
+    fn limites_noeuds(n: u64) -> Limites {
+        Limites { max_noeuds: n, max_profondeur: 0, movetime_ms: 0 }
+    }
+
+    /// Joue les DEUX camps avec le même bot depuis `fen` et rend le nombre de
+    /// plis jusqu'au mat, ou None si aucun mat n'est délivré en `plis_max`.
+    fn plis_jusqu_au_mat(bot: &mut BotRecherche, fen: &str, plis_max: u32) -> Option<u32> {
+        let mut pos: Chess = fen
+            .parse::<Fen>()
+            .expect("FEN valide")
+            .into_position(CastlingMode::Standard)
+            .expect("position légale");
+        let mut plis = 0u32;
+        while plis < plis_max {
+            if pos.legal_moves().is_empty() {
+                return pos.is_check().then_some(plis);
+            }
+            let coup = bot.choose(&pos)?;
+            pos = pos.play(&coup).expect("coup légal");
+            plis += 1;
+        }
+        None
+    }
+
+    /// Propagation du champ jusqu'à la recherche — sans aucun fichier de
+    /// table (Tablebase vide) : ce test tourne PARTOUT, y compris sur une
+    /// machine sans tables installées.
+    #[test]
+    fn avec_syzygy_propage_jusqu_a_la_recherche() {
+        let bot = BotRecherche::new(reseau_nul(), 1, limites_noeuds(64), 0.0);
+        assert!(bot.recherche.syzygy.is_none(), "défaut : aucune table (historique)");
+        let bot = bot.avec_syzygy(Some(Arc::new(syzygy::Tables::new())));
+        assert!(bot.recherche.syzygy.is_some(), "les tables doivent atteindre la recherche");
+        // None remet le bot dans son état historique (pas d'effet cliquet).
+        let bot = bot.avec_syzygy(None);
+        assert!(bot.recherche.syzygy.is_none());
+    }
+
+    /// KQvK, budget de recherche volontairement famélique (400 nœuds) : ARMÉ
+    /// des tables, le bot mate par DTZ ; SANS elles, le même bot (même réseau
+    /// nul, mêmes limites) ne convertit pas — ou pas aussi vite. C'est
+    /// exactement l'écart que R4 supprime au gating, aux ancres et au plateau.
+    /// Sauté proprement si les tables ne sont pas installées.
+    #[test]
+    fn kqvk_les_tables_convertissent_ce_que_le_bot_seul_rate() {
+        if !std::path::Path::new(DOSSIER).is_dir() {
+            println!("tables absentes ({DOSSIER}) : test sauté");
+            return;
+        }
+        let (tables, _) = syzygy::charge(DOSSIER).expect("chargement des tables");
+        let tables = Arc::new(tables);
+        const KQVK: &str = "4k3/8/8/8/8/8/8/4KQ2 w - - 0 1";
+        const PLIS_MAX: u32 = 60;
+
+        let mut arme = BotRecherche::new(reseau_nul(), 7, limites_noeuds(400), 0.0)
+            .avec_syzygy(Some(tables));
+        let avec = plis_jusqu_au_mat(&mut arme, KQVK, PLIS_MAX)
+            .expect("armé des tables, le mat KQvK doit tomber en moins de 60 plis");
+
+        let mut nu = BotRecherche::new(reseau_nul(), 7, limites_noeuds(400), 0.0);
+        let sans = plis_jusqu_au_mat(&mut nu, KQVK, PLIS_MAX);
+
+        println!(
+            "KQvK a 400 noeuds : {avec} plis AVEC les tables, {} SANS",
+            match sans {
+                Some(p) => format!("{p} plis"),
+                None => format!("pas de mat en {PLIS_MAX}"),
+            }
+        );
+        match sans {
+            None => {} // le bot nu ne convertit pas du tout : le cas nominal.
+            Some(p) => assert!(
+                avec < p,
+                "les tables doivent convertir plus vite : {avec} plis avec, {p} sans"
+            ),
+        }
     }
 }

@@ -94,6 +94,13 @@
   .match-score .sep { color: var(--muted); margin: 0 8px; font-weight: 400; }
   .match-sub { text-align: center; color: var(--muted); font-size: 11.5px;
                margin-top: 2px; }
+
+  /* Ligne « ponder » : taux de réponses correctement prédites pendant le
+     temps du Fantôme (st.ponder, option --ponder de match.exe). Discrète,
+     sous les tuiles ; entièrement masquée quand le ponder est éteint. */
+  .ponder-ligne { margin-top: 10px; font-variant-numeric: tabular-nums; }
+  .ponder-ligne[hidden] { display: none; }
+  .ponder-ligne .ponder-taux { color: var(--ink); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -163,6 +170,10 @@
       <div class="tile"><div class="tile-value small" id="tile-horloge-champion">—</div><div class="tile-label">Horloge champion</div></div>
       <div class="tile"><div class="tile-value small" id="tile-horloge-fantome">—</div><div class="tile-label">Horloge fantôme</div></div>
     </div>
+
+    <!-- Ponder (--ponder) : réflexion sur le temps du Fantôme. Ligne masquée
+         quand le champ "ponder" du json est null (option éteinte). -->
+    <div class="match-sub ponder-ligne" id="ponder-ligne" hidden></div>
 
     <div class="card-box off" id="pensee">
       <div class="card-box-head"><h2>Pensée en direct</h2></div>
