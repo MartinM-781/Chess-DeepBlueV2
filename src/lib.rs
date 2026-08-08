@@ -35,6 +35,7 @@ pub fn pleine_puissance() {
 #[cfg(not(windows))]
 pub fn pleine_puissance() {}
 
+pub mod arbitre;
 pub mod arena;
 pub mod bots;
 pub mod checkpoints;

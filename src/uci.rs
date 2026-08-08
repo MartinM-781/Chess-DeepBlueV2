@@ -237,6 +237,21 @@ impl UciEngine {
         self.pret()
     }
 
+    /// Pose les deux options de RESSOURCES standard de tout moteur UCI :
+    /// `Threads` (fils de recherche) et `Hash` (Mio de table de transposition).
+    ///
+    /// Sciemment ABSENT du chemin historique : ni la calibration ni le match ne
+    /// l'appellent, donc le Fantôme continue de tourner sur les défauts du
+    /// moteur (1 thread, 16 Mio) — changer cela changerait sa FORCE, et donc
+    /// la validité des matchs déjà joués. C'est l'arbitre (src/bin/arbitre.rs)
+    /// qui s'en sert, dans l'autre sens : se BRIDER à 1 thread pendant que le
+    /// match consomme la machine.
+    pub fn regle_ressources(&mut self, threads: u32, hash_mio: u32) -> Result<()> {
+        self.envoie(&format!("setoption name Threads value {}", threads.max(1)))?;
+        self.envoie(&format!("setoption name Hash value {}", hash_mio.max(1)))?;
+        self.pret()
+    }
+
     /// Lance le moteur PLEINE FORCE — aucun UCI_LimitStrength : l'étiqueteur
     /// (oracle) du self-play doit évaluer au niveau maximal du moteur, pas au
     /// niveau bridé de la calibration. `movetime_ms` est mémorisé et sert de
@@ -282,16 +297,17 @@ impl UciEngine {
 
     /// Demande le meilleur coup sur une FEN donnée en `movetime_ms` ms.
     /// Renvoie le coup UCI brut (« e2e4 », promotion « e7e8q » à 5 caractères).
-    /// Les lignes `info ...` émises pendant la recherche sont consommées ici
-    /// même — c'est ce qui évite le deadlock « le moteur écrit, personne ne lit ».
+    /// Les lignes `info ...` émises pendant la recherche sont consommées sur ce
+    /// chemin — c'est ce qui évite le deadlock « le moteur écrit, personne ne
+    /// lit » (boucle commune : `meilleur_coup_et_score_brut_fen`).
     pub fn meilleur_coup_fen(&mut self, fen: &str, movetime_ms: u64) -> Result<String> {
         self.meilleur_coup_et_score_fen(fen, movetime_ms)
             .map(|(coup, _)| coup)
     }
 
-    /// Comme `meilleur_coup_fen`, en relevant AUSSI le score de la DERNIÈRE
-    /// ligne « info ... score ... » reçue avant `bestmove` (la plus profonde),
-    /// converti dans [-1, 1] par `score_de_ligne_info` — convention UCI :
+    /// Comme `meilleur_coup_fen`, en relevant AUSSI le score de la dernière
+    /// ligne « info ... score ... » NON BORNÉE reçue avant `bestmove`,
+    /// converti dans [-1, 1] par `valeur_de_score` — convention UCI :
     /// point de vue du CAMP AU TRAIT, aucun renversement de signe. None si le
     /// moteur n'a émis aucun score exploitable. Sert au harnais de match
     /// (src/bin/match.rs) pour afficher l'évaluation de l'adversaire sans
@@ -301,10 +317,32 @@ impl UciEngine {
         fen: &str,
         movetime_ms: u64,
     ) -> Result<(String, Option<f32>)> {
+        self.meilleur_coup_et_score_brut_fen(fen, movetime_ms)
+            .map(|(coup, score)| (coup, score.map(valeur_de_score)))
+    }
+
+    /// Cœur commun de `meilleur_coup_fen` / `meilleur_coup_et_score_fen`, en
+    /// rendant le score BRUT (`ScoreUci`) au lieu de l'écrasement dans [-1, 1] :
+    /// l'arbitre (src/bin/arbitre.rs) annote des pertes en CENTIPIONS, or
+    /// tanh(cp/300) est irréversible et sature : 400 cp donne 0,87 et 900 cp
+    /// 0,995 — deux positions très différentes se retrouvent à un cheveu l'une
+    /// de l'autre —, et « mat en 7 » ne se distingue plus de « mat en 1 ».
+    /// Convention UCI inchangée : point de vue du CAMP AU TRAIT, aucun
+    /// renversement de signe ici.
+    pub fn meilleur_coup_et_score_brut_fen(
+        &mut self,
+        fen: &str,
+        movetime_ms: u64,
+    ) -> Result<(String, Option<ScoreUci>)> {
         self.envoie(&format!("position fen {fen}"))?;
         self.envoie(&format!("go movetime {movetime_ms}"))?;
         let delai = delai_go(movetime_ms);
-        let mut score: Option<f32> = None;
+        // Deux mémoires : le dernier score EXACT et le dernier score BORNÉ
+        // (lowerbound/upperbound). On rend l'exact dès qu'il en existe un — une
+        // borne n'est pas une évaluation (voir `score_brut_de_ligne_info`) —,
+        // et la borne seulement s'il n'y a jamais eu mieux, plutôt que rien.
+        let mut exact: Option<ScoreUci> = None;
+        let mut borne: Option<ScoreUci> = None;
         loop {
             let ligne = self.ligne_avant(delai)?;
             let mut mots = ligne.split_whitespace();
@@ -318,14 +356,69 @@ impl UciEngine {
                 if !(4..=5).contains(&coup.len()) {
                     return Err(erreur(format!("coup UCI mal formé : {coup:?}")));
                 }
-                return Ok((coup.to_string(), score));
+                return Ok((coup.to_string(), exact.or(borne)));
             }
             // Ligne info/string : on mémorise l'éventuel score et on draine.
-            if let Some(v) = score_de_ligne_info(&ligne) {
-                score = Some(v);
+            match score_brut_de_ligne_info(&ligne) {
+                Some((v, false)) => exact = Some(v),
+                Some((v, true)) => borne = Some(v),
+                None => {}
             }
         }
     }
+}
+
+/// Score UCI BRUT, du point de vue du CAMP AU TRAIT :
+/// - `Cp(x)` : centipions ;
+/// - `Mat(n)` : mat en `n` coups — `n > 0` le trait mate, `n <= 0` le trait se
+///   fait mater (`Mat(0)` = position déjà matée).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScoreUci {
+    Cp(i32),
+    Mat(i32),
+}
+
+/// Écrasement historique d'un score brut dans [-1, 1] (échelle des cibles
+/// d'entraînement) : tanh(cp/300), mat → ±1. Extrait tel quel de l'ancien
+/// `score_de_ligne_info` — aucun changement de comportement pour ses appelants
+/// (selfplay, calibration, match).
+fn valeur_de_score(s: ScoreUci) -> f32 {
+    match s {
+        ScoreUci::Cp(cp) => (cp as f32 / 300.0).tanh(),
+        ScoreUci::Mat(n) => {
+            if n > 0 {
+                1.0
+            } else {
+                -1.0
+            }
+        }
+    }
+}
+
+/// Extrait le score BRUT d'une ligne UCI « ... score cp X | score mate N ... »
+/// et dit s'il est BORNÉ (« lowerbound »/« upperbound », émis après le nombre
+/// quand la fenêtre d'aspiration a échoué). Ligne sans score exploitable → None.
+///
+/// Un score borné n'est PAS une évaluation : « upperbound X » dit seulement
+/// « au plus X », la vraie valeur peut être très en dessous. Tant que le score
+/// servait à étiqueter dans [-1, 1], l'approximation était sans conséquence ;
+/// depuis que l'arbitre en tire des CENTIPIONS et des pertes, une dernière
+/// ligne bornée avant `bestmove` fabriquerait un écart artificiel — donc une
+/// « erreur » ou une « gaffe » imaginaire au tableau de bord. Le drapeau permet
+/// aux appelants de préférer le dernier score EXACT (voir
+/// `meilleur_coup_et_score_brut_fen`).
+fn score_brut_de_ligne_info(ligne: &str) -> Option<(ScoreUci, bool)> {
+    let mots: Vec<&str> = ligne.split_whitespace().collect();
+    let i = mots.iter().position(|m| *m == "score")?;
+    let borne = mots[i..]
+        .iter()
+        .any(|m| *m == "lowerbound" || *m == "upperbound");
+    let score = match (mots.get(i + 1)?, mots.get(i + 2)?) {
+        (&"cp", x) => x.parse::<i32>().ok().map(ScoreUci::Cp),
+        (&"mate", n) => n.parse::<i32>().ok().map(ScoreUci::Mat),
+        _ => None,
+    }?;
+    Some((score, borne))
 }
 
 /// Extrait la valeur d'une ligne UCI contenant « score ... », convertie dans
@@ -336,20 +429,12 @@ impl UciEngine {
 ///
 /// CONVENTION UCI : le score est du point de vue du CAMP AU TRAIT — identique
 /// à notre v_racine interne, donc AUCUN renversement de signe.
-/// « lowerbound »/« upperbound » (émis APRÈS le nombre) sont acceptés tels
-/// quels : la valeur bornée est une approximation suffisante pour étiqueter.
-/// Ligne sans score exploitable → None.
+/// « lowerbound »/« upperbound » sont acceptés tels quels ICI : après
+/// tanh(cp/300), une borne d'aspiration ne déplace l'étiquette que de quelques
+/// millièmes, et ce chemin sert à ÉTIQUETTER (self-play, calibration), pas à
+/// mesurer des centipions. Ligne sans score exploitable → None.
 fn score_de_ligne_info(ligne: &str) -> Option<f32> {
-    let mots: Vec<&str> = ligne.split_whitespace().collect();
-    let i = mots.iter().position(|m| *m == "score")?;
-    match (mots.get(i + 1)?, mots.get(i + 2)?) {
-        (&"cp", x) => x.parse::<f32>().ok().map(|cp| (cp / 300.0).tanh()),
-        (&"mate", n) => n
-            .parse::<i32>()
-            .ok()
-            .map(|n| if n > 0 { 1.0 } else { -1.0 }),
-        _ => None,
-    }
+    score_brut_de_ligne_info(ligne).map(|(s, _borne)| valeur_de_score(s))
 }
 
 impl Drop for UciEngine {
@@ -507,7 +592,8 @@ mod tests {
             Some(1.0)
         );
         assert_eq!(score_de_ligne_info("info depth 0 score mate 0"), Some(-1.0));
-        // lowerbound/upperbound (après le nombre) : valeur bornée telle quelle.
+        // lowerbound/upperbound (après le nombre) : valeur bornée telle quelle
+        // sur ce chemin d'étiquetage dans [-1, 1].
         assert_eq!(
             score_de_ligne_info("info depth 20 score cp 13 lowerbound nodes 99"),
             Some((13.0f32 / 300.0).tanh())
@@ -521,6 +607,37 @@ mod tests {
         assert_eq!(score_de_ligne_info("bestmove e2e4 ponder e7e5"), None);
         assert_eq!(score_de_ligne_info("info depth 1 score cp abc"), None);
         assert_eq!(score_de_ligne_info("info depth 1 score"), None);
+    }
+
+    /// Drapeau « borné » : c'est lui qui empêche une fenêtre d'aspiration
+    /// ratée de se transformer en gaffe imaginaire au tableau de bord de
+    /// l'arbitre (le score en CENTIPIONS, lui, n'a pas le droit d'être « au
+    /// plus X »).
+    #[test]
+    fn parse_score_borne_ou_exact() {
+        assert_eq!(
+            score_brut_de_ligne_info("info depth 20 score cp 13 nodes 99 pv e2e4"),
+            Some((ScoreUci::Cp(13), false))
+        );
+        assert_eq!(
+            score_brut_de_ligne_info("info depth 20 score cp 13 lowerbound nodes 99"),
+            Some((ScoreUci::Cp(13), true))
+        );
+        assert_eq!(
+            score_brut_de_ligne_info("info depth 20 score cp 250 upperbound"),
+            Some((ScoreUci::Cp(250), true))
+        );
+        assert_eq!(
+            score_brut_de_ligne_info("info depth 7 score mate 3 upperbound"),
+            Some((ScoreUci::Mat(3), true))
+        );
+        // « lowerbound » AVANT « score » (aucun moteur ne l'émet ainsi, mais la
+        // recherche part de « score » : rien à confondre avec un coup nommé).
+        assert_eq!(
+            score_brut_de_ligne_info("info lowerbound depth 3 score cp 40"),
+            Some((ScoreUci::Cp(40), false))
+        );
+        assert_eq!(score_brut_de_ligne_info("bestmove e2e4"), None);
     }
 
     /// Oracle pleine force réel : évaluations cohérentes, du point de vue du

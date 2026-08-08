@@ -15,6 +15,11 @@ const GLYPHS = {
 const FEN_INITIALE = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 /* Cadence de polling du direct (ms). */
 const PERIODE_MS = 400;
+/* Cadence de polling de l'arbitre (ms) : cinq fois plus lente que le direct.
+   Une annotation coûte plusieurs secondes de moteur, elle ne peut pas changer
+   plus vite que ça — et l'arbitre est un accessoire, il ne doit pas peser sur
+   la page qui, elle, doit rester au coup près. */
+const PERIODE_ARBITRE_MS = 2000;
 
 let enVol = false; // une requête à la fois, même si le réseau traîne
 
@@ -41,6 +46,17 @@ let baseLocale = null;   // performance.now() à l'apparition de ce pli
    sans rien casser. */
 let indexNav = null;     // null = direct ; sinon index de la FEN affichée
 let partieNav = null;    // n° de partie du dernier état : changement → direct
+
+/* ------------------------------------------------------- arbitre (état) ---
+   Dernier models/match_arbitre.json exploitable (GET /api/arbitre, écrit par
+   arbitre.exe) : {partie, champion_blanc, movetime_ms, plis: [...], resume}.
+   null = arbitre éteint, en retard d'une partie, ou rien encore annoté → la
+   carte se masque entièrement. Le fichier est écrit ATOMIQUEMENT côté Rust :
+   un JSON partiel ne peut pas être lu ici. (Nommé « arbitreEtat » et non
+   « arbitre » : la carte porte id="arbitre", et une variable homonyme ne
+   ferait qu'embrouiller la lecture.) */
+let arbitreEtat = null;
+let enVolArbitre = false;
 
 /* ------------------------------------------------------ FEN → pièces */
 function parseFen(fen) {
@@ -219,6 +235,154 @@ function majPonder(st) {
     `${horloge(p.ms_cumules)} de recherche de fond`);
 }
 
+/* -------------------------------------------------------------- arbitre */
+
+/* Libellés et pastilles du classement (mêmes clés que echec::arbitre). */
+const CLASSEMENTS = {
+  meilleur: "meilleur", excellent: "excellent", bon: "bon",
+  imprecision: "imprécision", erreur: "erreur", gaffe: "gaffe",
+};
+const PHASES = [
+  ["ouverture", "Ouverture"], ["milieu", "Milieu"],
+  ["transition", "Transition"], ["finale", "Finale"],
+];
+/* Seuil au-delà duquel un score en centipions est un MAT annoncé : l'arbitre
+   publie ±(32000 − n) coups (voir echec::arbitre::MAT_CP). */
+const MAT_CP = 32000;
+
+/* Centipions (côté blancs) → texte en pions, ou « +M4 » pour un mat. */
+function texteEvalCp(cp) {
+  if (cp === null || cp === undefined || !isFinite(cp)) return "—";
+  if (Math.abs(cp) >= MAT_CP - 1000) {
+    return (cp > 0 ? "+" : "-") + "M" + (MAT_CP - Math.abs(cp));
+  }
+  return (cp >= 0 ? "+" : "") + (cp / 100).toFixed(2);
+}
+
+/* Perte moyenne (centipions, ou null si rien mesuré). */
+function textePerte(v) {
+  return v === null || v === undefined || !isFinite(v) ? "—" : Math.round(v) + " cp";
+}
+
+function nomCamp(camp) { return camp === "champion" ? "Champion" : "Fantôme"; }
+
+/* Numéro (1-based) du demi-coup AFFICHÉ : le dernier joué en direct, celui
+   qu'on revisite en navigation (history_fen[i] est la position atteinte APRÈS
+   i plis, donc le coup qui y mène porte le numéro i). 0 = position initiale. */
+function pliAffiche(st) {
+  if (!st) return 0;
+  if (indexNav !== null) return indexNav;
+  return Array.isArray(st.history_san) ? st.history_san.length : 0;
+}
+
+/* Annotation d'un pli donné, ou null. */
+function annotationDuPli(pli) {
+  if (!arbitreEtat || !Array.isArray(arbitreEtat.plis)) return null;
+  return arbitreEtat.plis.find((p) => p.ply === pli) || null;
+}
+
+/* Petit nœud texte avec classe (les valeurs viennent du serveur : on passe
+   par textContent, jamais par innerHTML). */
+function bout(classe, texte) {
+  const el = document.createElement("span");
+  el.className = classe;
+  el.textContent = texte;
+  return el;
+}
+
+/* Ligne du coup affiché : éval avant → après (côté blancs), meilleur coup du
+   moteur, coup joué, perte et pastille de classement. */
+function rendreCoupArbitre(pli, a) {
+  const box = $("arb-coup");
+  box.replaceChildren();
+  if (pli === 0) {
+    box.append(bout("arb-attente", "Position initiale — aucun coup à juger."));
+    return;
+  }
+  box.append(bout("arb-pli", "Pli " + pli));
+  if (!a) {
+    // L'arbitre a plusieurs secondes de retard par construction (une analyse
+    // de moteur par position) : on le dit, on ne laisse pas un blanc.
+    box.append(bout("arb-attente", "analyse en cours…"));
+    return;
+  }
+  box.append(bout("arb-pli", nomCamp(a.camp) + " · " + a.phase));
+  box.append(bout("arb-eval", texteEvalCp(a.eval_avant) + " → " + texteEvalCp(a.eval_apres)));
+  const coups = document.createElement("span");
+  coups.className = "arb-move";
+  coups.append("moteur ");
+  const meilleur = document.createElement("b");
+  meilleur.textContent = a.meilleur || "—";
+  coups.append(meilleur, " · joué ");
+  const joue = document.createElement("b");
+  joue.textContent = a.joue;
+  coups.append(joue);
+  box.append(coups);
+  box.append(bout("arb-perte", a.perte_cp + " cp perdus"));
+  box.append(bout(
+    "pastille p-" + a.classement,
+    CLASSEMENTS[a.classement] || a.classement
+  ));
+}
+
+/* Tableau de bord : perte moyenne du CHAMPION par phase, puis une ligne de
+   compteurs par camp. Le Fantôme sert de repère — mais l'arbitre est le MÊME
+   moteur que lui, en pleine force : ses coups sont notés par l'évaluation qui
+   les a produits, donc sa perte moyenne est structurellement flattée (réserve
+   affichée sous les deux lignes, .arb-note). */
+function rendreBilanArbitre(resume) {
+  const corps = $("arb-phases");
+  corps.replaceChildren();
+  const parPhase = (resume && resume.par_phase_champion) || {};
+  const plisPhase = (resume && resume.plis_par_phase_champion) || {};
+  for (const [cle, libelle] of PHASES) {
+    const tr = document.createElement("tr");
+    const nom = document.createElement("td");
+    nom.textContent = libelle;
+    const perte = document.createElement("td");
+    const v = parPhase[cle];
+    perte.className = v === null || v === undefined ? "num vide" : "num";
+    perte.textContent = textePerte(v);
+    const plis = document.createElement("td");
+    plis.className = "num vide";
+    plis.textContent = plisPhase[cle] != null ? plisPhase[cle] : "—";
+    tr.append(nom, perte, plis);
+    corps.append(tr);
+  }
+  const parCamp = (resume && resume.par_camp) || {};
+  for (const camp of ["champion", "fantome"]) {
+    const el = $("arb-" + camp);
+    el.replaceChildren();
+    const s = parCamp[camp];
+    const titre = document.createElement("b");
+    titre.textContent = nomCamp(camp);
+    el.append(titre);
+    if (!s || !s.plis) { el.append(" — rien d'annoté."); continue; }
+    el.append(` · ${textePerte(s.perte_moyenne)} de perte moyenne · ` +
+      `${s.gaffes} gaffe(s), ${s.erreurs} erreur(s), ${s.imprecisions} imprécision(s) · ` +
+      `${s.meilleurs}/${s.plis} coups du moteur`);
+  }
+}
+
+/* Carte « arbitre » entière. Appelée à chaque poll de l'arbitre ET à chaque
+   changement de position affichée (flèches ←/→ : le verdict suit le coup
+   visité sans attendre le poll suivant). */
+function majArbitre() {
+  const box = $("arbitre");
+  const st = dernierEtat;
+  // Rien à montrer si l'arbitre est éteint, ou s'il annote encore une autre
+  // partie que celle diffusée (son verdict ne parlerait pas de ce plateau).
+  const ok = !!arbitreEtat && !!st && arbitreEtat.partie === st.partie;
+  box.hidden = !ok;
+  if (!ok) return;
+  $("arb-moteur").textContent = arbitreEtat.movetime_ms
+    ? `moteur de référence · ${(arbitreEtat.movetime_ms / 1000).toFixed(1)} s par position`
+    : "";
+  const pli = pliAffiche(st);
+  rendreCoupArbitre(pli, annotationDuPli(pli));
+  rendreBilanArbitre(arbitreEtat.resume);
+}
+
 /* --------------------------------------------------- navigation (rendu) */
 
 /* history_fen exploitable, ou null (json d'ancienne génération). */
@@ -244,6 +408,9 @@ function rendrePosition(st) {
     renderHistory(st.history_san);
   }
   majBarreNav(st);
+  // Le verdict de l'arbitre suit la position affichée — c'est tout l'intérêt
+  // de la navigation : revoir une erreur avec son annotation à côté.
+  majArbitre();
 }
 
 function majBarreNav(st) {
@@ -420,6 +587,25 @@ async function tick() {
   }
 }
 
+/* Polling de l'arbitre, à part et plus lent que le direct : /api/arbitre
+   répond TOUJOURS 200 (objet vide si arbitre.exe n'a rien publié — voir
+   src/bin/serve.rs), donc pas d'erreur qui clignoterait dans la console.
+   Sans plis exploitables, arbitreEtat repart à null : la carte se masque. */
+async function tickArbitre() {
+  if (enVolArbitre) return;
+  enVolArbitre = true;
+  try {
+    const res = await fetch("/api/arbitre");
+    const a = res.ok ? await res.json() : null;
+    arbitreEtat = a && Array.isArray(a.plis) && a.plis.length ? a : null;
+  } catch (_) {
+    arbitreEtat = null;                              // serveur injoignable
+  } finally {
+    enVolArbitre = false;
+    majArbitre();
+  }
+}
+
 /* ------------------------------------------------------------------ init */
 
 (function init() {
@@ -436,6 +622,8 @@ async function tick() {
   });
   tick();
   setInterval(tick, PERIODE_MS);
+  tickArbitre();
+  setInterval(tickArbitre, PERIODE_ARBITRE_MS);
   // Animation continue des horloges entre deux polls (~5 Hz : mm:ss affiché,
   // inutile d'aller plus vite ; indépendant du réseau).
   setInterval(majHorloges, 200);

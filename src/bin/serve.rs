@@ -33,6 +33,13 @@
 //!                          par match.exe, jumeau du direct self-play — voir
 //!                          src/bin/match.rs ; page /match) ; 404 propre si
 //!                          aucun match n'a encore publié.
+//!  GET  /api/arbitre     → models/match_arbitre.json tel quel (annotations
+//!                          coup par coup du match, écrites par arbitre.exe —
+//!                          voir src/bin/arbitre.rs ; panneau « arbitre » de
+//!                          la page /match). Fichier ABSENT → 200 avec un
+//!                          objet vide, PAS une erreur : l'arbitre est un
+//!                          accessoire optionnel du match, la page doit
+//!                          simplement masquer son panneau.
 //!
 //! Schéma de l'état ("state") :
 //!  {"fen": "...", "turn": "white"|"black", "your_color": "white"|"black",
@@ -670,6 +677,20 @@ fn api_match() -> Rep {
     }
 }
 
+/// GET /api/arbitre : renvoie models/match_arbitre.json tel quel — écrit
+/// ATOMIQUEMENT par arbitre.exe à chaque pli annoté (src/bin/arbitre.rs).
+/// Contrairement à /api/match, l'absence de fichier n'est PAS une erreur :
+/// l'arbitre est optionnel (le match tourne très bien sans lui), donc réponse
+/// 200 avec un objet vide — le panneau web se masque de lui-même, sans faire
+/// clignoter d'erreur dans la console du navigateur toutes les 2 secondes.
+fn api_arbitre() -> Rep {
+    match std::fs::read(format!("{MODELS_DIR}/match_arbitre.json")) {
+        Ok(donnees) => Response::from_data(donnees)
+            .with_header(entete("Content-Type", "application/json; charset=utf-8")),
+        Err(_) => reponse_json(200, &serde_json::json!({})),
+    }
+}
+
 /// POST /api/new-game
 fn api_new_game(etat: &Etat, corps: &str) -> Rep {
     let v: serde_json::Value = serde_json::from_str(corps).unwrap_or(serde_json::Value::Null);
@@ -776,6 +797,7 @@ fn traiter(mut req: Request, etat: &Etat) {
         "/api/progress" if est_get => reponse_json(200, &progress_json()),
         "/api/live" if est_get => api_live(),
         "/api/match" if est_get => api_match(),
+        "/api/arbitre" if est_get => api_arbitre(),
         "/api/new-game" if est_post => api_new_game(etat, &corps),
         "/api/move" if est_post => api_move(etat, &corps),
         c if c.starts_with("/api/") => erreur_json(404, "route API inconnue"),
