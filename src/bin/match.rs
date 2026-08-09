@@ -101,7 +101,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use shakmaty::fen::Fen;
-use shakmaty::san::SanPlus;
+use shakmaty::san::{San, SanPlus};
 use shakmaty::uci::UciMove;
 use shakmaty::zobrist::{Zobrist64, ZobristHash};
 use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, Move, Position};
@@ -154,6 +154,12 @@ struct Opt {
     parties_total: usize,
     score_depart_champion: f64,
     score_depart_fantome: f64,
+    /// OUVERTURES IMPOSÉES (--livre-plis N) : N premiers demi-coups d'une ligne
+    /// du livre joués d'office par les deux camps. 0 (défaut) = position
+    /// initiale, comportement historique. Les rondes vont par PAIRES : la même
+    /// ouverture est jouée deux fois, une par couleur — l'appariement des
+    /// matchs de moteurs, qui annule le biais d'ouverture.
+    livre_plis: u32,
     pgn: String,
     /// Réservée (reproductibilité d'une future randomisation : livre,
     /// température...) — la recherche à température 0 est déterministe.
@@ -193,6 +199,7 @@ fn parse_args() -> Opt {
         parties_total: 0,
         score_depart_champion: 0.0,
         score_depart_fantome: 0.0,
+        livre_plis: 0,
         pgn: "pgn".to_string(),
         seed: 0xDEE9_B1CE,
     };
@@ -246,6 +253,7 @@ fn parse_args() -> Opt {
                 opt.score_depart_champion = parse_valeur(c.trim(), &nom);
                 opt.score_depart_fantome = parse_valeur(f.trim(), &nom);
             }
+            "--livre-plis" => opt.livre_plis = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--pgn" => opt.pgn = valeur(&args, i, &nom),
             "--seed" => opt.seed = parse_valeur(&valeur(&args, i, &nom), &nom),
             _ => {
@@ -549,6 +557,7 @@ fn partie(
     movetime_fantome: u64,
     ponder: &mut Ponder,
     derniere_pv: &DernierePv,
+    ouverture: &[String],
 ) -> Issue {
     let champion_blanc = direct.champion_blanc;
     let mut pos = Chess::default();
@@ -567,9 +576,32 @@ fn partie(
     // aussi history_fen : la navigation remonte jusqu'à elle).
     let fen0 = Fen::from_position(pos.clone(), EnPassantMode::Legal).to_string();
     history_fen.push(fen0.clone());
+
+    // OUVERTURE IMPOSÉE (livre) : les deux camps la jouent d'office, aucun
+    // moteur n'est consulté. Sans elle, deux moteurs déterministes rejouent la
+    // même partie à chaque fois — seuls les aléas de minutage les font diverger.
+    // Les coups entrent dans l'historique comme les autres : le PGN reste une
+    // partie complète depuis le premier coup, et les répétitions comptent bien
+    // les positions traversées.
+    for san_txt in ouverture {
+        let Ok(san) = San::from_ascii(san_txt.as_bytes()) else {
+            panic!("coup d'ouverture illisible : {san_txt}");
+        };
+        let Ok(coup) = san.to_move(&pos) else {
+            panic!("coup d'ouverture illégal : {san_txt}");
+        };
+        let san_complet = SanPlus::from_move(pos.clone(), &coup).to_string();
+        pos.play_unchecked(&coup);
+        history_san.push(san_complet);
+        plies += 1;
+        *repetitions.entry(zobrist(&pos)).or_insert(0) += 1;
+        history_fen.push(Fen::from_position(pos.clone(), EnPassantMode::Legal).to_string());
+    }
+    let fen0 = history_fen.last().cloned().unwrap_or(fen0);
+
     direct.publie(
         false,
-        0,
+        plies,
         &fen0,
         None,
         &history_san,
@@ -1027,6 +1059,27 @@ fn main() {
             parties_total,
             if direct.champion_blanc { "blancs" } else { "noirs" }
         );
+        // Ouverture de la ronde : une par PAIRE de parties (3 et 4 partagent
+        // la même, 5 et 6 la suivante...), tirée du livre par la graine du
+        // match. Les deux couleurs jouent donc la même position de départ :
+        // tout biais de l'ouverture se compense entre les deux rondes.
+        let ouverture: Vec<String> = if opt.livre_plis == 0 {
+            Vec::new()
+        } else {
+            let lignes = echec::departs::lignes_du_livre();
+            let paire = (numero - 1) / 2;
+            let idx = (opt.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                >> 17)
+                .wrapping_add(paire as u64) as usize
+                % lignes.len();
+            let (etiquette, coups) = lignes[idx];
+            println!("  ouverture imposée : {etiquette}");
+            coups
+                .split_whitespace()
+                .take(opt.livre_plis as usize)
+                .map(|s| s.to_string())
+                .collect()
+        };
         let issue = partie(
             &mut recherche,
             &mut moteur,
@@ -1035,6 +1088,7 @@ fn main() {
             opt.movetime_adversaire,
             &mut ponder,
             &derniere_pv,
+            &ouverture,
         );
         debug_assert!(ponder.au_repos(), "thread de ponder survivant à la partie");
         direct.score_champion += issue.points_champion;

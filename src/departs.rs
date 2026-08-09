@@ -52,6 +52,14 @@ fn zobrist(pos: &Chess) -> u64 {
 // Livre d'ouvertures
 // ---------------------------------------------------------------------------
 
+/// Les lignes du livre telles quelles — (étiquette, coups SAN). Exposées pour
+/// les MATCHS : deux moteurs déterministes rejouent sinon la même partie à
+/// chaque ronde, et l'usage des matchs de moteurs est d'imposer une ouverture
+/// différente par ronde, la même jouée des DEUX couleurs.
+pub fn lignes_du_livre() -> &'static [(&'static str, &'static str)] {
+    LIGNES
+}
+
 /// Le livre : (étiquette, coups SAN séparés par des espaces). Théorie réelle,
 /// 6 à 12 demi-coups par ligne. Toute ligne illégale fait paniquer le premier
 /// accès au livre avec un message qui NOMME la ligne fautive (test dédié).
