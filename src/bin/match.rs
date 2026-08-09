@@ -144,6 +144,16 @@ struct Opt {
     /// SES cœurs et SON cache, pas sur son horloge (voir l'en-tête).
     ponder_threads: u32,
     games: usize,
+    /// REPRISE D'UNE SÉRIE INTERROMPUE (--partie-depart, --parties-total,
+    /// --score-depart) : un match de 6 parties peut être joué en plusieurs
+    /// lancements. Sans ces options, comportement historique (série de 1 à
+    /// `games`, score parti de 0-0). Elles ne changent QUE la comptabilité
+    /// affichée et publiée — numéro de partie, total, score cumulé, numéro de
+    /// ronde du PGN, couleur de départ —, jamais le jeu lui-même.
+    partie_depart: usize,
+    parties_total: usize,
+    score_depart_champion: f64,
+    score_depart_fantome: f64,
     pgn: String,
     /// Réservée (reproductibilité d'une future randomisation : livre,
     /// température...) — la recherche à température 0 est déterministe.
@@ -179,6 +189,10 @@ fn parse_args() -> Opt {
         ponder: false,
         ponder_threads: 0,
         games: 1,
+        partie_depart: 1,
+        parties_total: 0,
+        score_depart_champion: 0.0,
+        score_depart_fantome: 0.0,
         pgn: "pgn".to_string(),
         seed: 0xDEE9_B1CE,
     };
@@ -216,6 +230,22 @@ fn parse_args() -> Opt {
             "--tt-log2" => opt.tt_log2 = parse_valeur(&valeur(&args, i, &nom), &nom),
             "--syzygy" => opt.syzygy = valeur(&args, i, &nom),
             "--games" => opt.games = parse_valeur(&valeur(&args, i, &nom), &nom),
+            "--partie-depart" => {
+                opt.partie_depart = parse_valeur(&valeur(&args, i, &nom), &nom)
+            }
+            "--parties-total" => {
+                opt.parties_total = parse_valeur(&valeur(&args, i, &nom), &nom)
+            }
+            // « c,f » : points DÉJÀ acquis par le champion et par le Fantôme.
+            "--score-depart" => {
+                let v = valeur(&args, i, &nom);
+                let (c, f) = v.split_once(',').unwrap_or_else(|| {
+                    eprintln!("option --score-depart : attendu « champion,fantome » (ex. 1,1)");
+                    std::process::exit(2);
+                });
+                opt.score_depart_champion = parse_valeur(c.trim(), &nom);
+                opt.score_depart_fantome = parse_valeur(f.trim(), &nom);
+            }
             "--pgn" => opt.pgn = valeur(&args, i, &nom),
             "--seed" => opt.seed = parse_valeur(&valeur(&args, i, &nom), &nom),
             _ => {
@@ -892,8 +922,15 @@ fn main() {
         .unwrap_or_else(|e| panic!("impossible de créer le dossier PGN {} : {e}", opt.pgn));
     let date = date_pgn();
 
+    // Comptabilité de la série : `parties_total` par défaut = la longueur de
+    // CE lancement (comportement historique) ; sinon le total du match complet.
+    let parties_total = if opt.parties_total == 0 {
+        opt.partie_depart + opt.games - 1
+    } else {
+        opt.parties_total
+    };
     let mut direct = Direct {
-        games: opt.games,
+        games: parties_total,
         champion_blanc: true,
         partie: 0,
         elo_fantome: elo,
@@ -901,8 +938,8 @@ fn main() {
         movetime_fantome: opt.movetime_adversaire,
         threads: opt.threads_recherche,
         tt_log2: opt.tt_log2,
-        score_champion: 0.0,
-        score_fantome: 0.0,
+        score_champion: opt.score_depart_champion,
+        score_fantome: opt.score_depart_fantome,
         etat: Arc::new(Mutex::new(serde_json::Value::Null)),
     };
 
@@ -964,10 +1001,14 @@ fn main() {
     }));
 
     for i in 0..opt.games {
+        // Numéro de la partie DANS LE MATCH (pas dans ce lancement) : c'est lui
+        // qui gouverne l'affichage, le PGN et la couleur, pour qu'une série
+        // reprise garde l'alternance du match complet.
+        let numero = opt.partie_depart + i;
         // Couleurs alternées : le champion a les blancs aux parties impaires
         // (1re, 3e, ...).
-        direct.partie = i + 1;
-        direct.champion_blanc = i % 2 == 0;
+        direct.partie = numero;
+        direct.champion_blanc = numero % 2 == 1;
         // AVANT le vidage de la table : joint un éventuel fond en vol (partie()
         // le fait déjà — ceinture) ET remet à zéro les killers/historique du
         // chercheur de FOND, que `recherche.nouvelle_partie()` ne touche pas
@@ -977,13 +1018,13 @@ fn main() {
         ponder.nouvelle_partie();
         recherche.nouvelle_partie();
         if let Err(e) = moteur.nouvelle_partie() {
-            panic!("ucinewgame en erreur avant la partie {} : {e}", i + 1);
+            panic!("ucinewgame en erreur avant la partie {numero} : {e}");
         }
 
         println!(
             "— partie {}/{} : champion avec les {}",
-            i + 1,
-            opt.games,
+            numero,
+            parties_total,
             if direct.champion_blanc { "blancs" } else { "noirs" }
         );
         let issue = partie(
@@ -999,8 +1040,8 @@ fn main() {
         direct.score_champion += issue.points_champion;
         direct.score_fantome += 1.0 - issue.points_champion;
 
-        let chemin_pgn = format!("{}/partie_{:03}.pgn", opt.pgn, i + 1);
-        ecrit_pgn(&chemin_pgn, i + 1, direct.champion_blanc, elo, &issue, &opt, &date)
+        let chemin_pgn = format!("{}/partie_{:03}.pgn", opt.pgn, numero);
+        ecrit_pgn(&chemin_pgn, numero, direct.champion_blanc, elo, &issue, &opt, &date)
             .unwrap_or_else(|e| eprintln!("écriture PGN {chemin_pgn} en échec : {e}"));
         println!(
             "  {} ({}) en {} plis — PGN : {chemin_pgn} — score Champion {} · Fantôme {}",
