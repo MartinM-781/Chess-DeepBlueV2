@@ -160,6 +160,10 @@ struct Opt {
     /// ouverture est jouée deux fois, une par couleur — l'appariement des
     /// matchs de moteurs, qui annule le biais d'ouverture.
     livre_plis: u32,
+    /// --livre-gambits : autorise les lignes de gambit dans le tirage des
+    /// ouvertures. Par défaut FAUX — un gambit livre d'office un pion à l'un
+    /// des deux camps, ce qui mesure le répertoire plutôt que les moteurs.
+    livre_gambits: bool,
     pgn: String,
     /// Réservée (reproductibilité d'une future randomisation : livre,
     /// température...) — la recherche à température 0 est déterministe.
@@ -200,6 +204,7 @@ fn parse_args() -> Opt {
         score_depart_champion: 0.0,
         score_depart_fantome: 0.0,
         livre_plis: 0,
+        livre_gambits: false,
         pgn: "pgn".to_string(),
         seed: 0xDEE9_B1CE,
     };
@@ -208,6 +213,11 @@ fn parse_args() -> Opt {
     while i < args.len() {
         let nom = args[i].clone();
         // Drapeaux SANS valeur : n'avancent que d'un cran.
+        if nom == "--livre-gambits" {
+            opt.livre_gambits = true;
+            i += 1;
+            continue;
+        }
         if nom == "--int8" {
             opt.int8 = true;
             i += 1;
@@ -1091,13 +1101,28 @@ fn main() {
         let ouverture: Vec<String> = if opt.livre_plis == 0 {
             Vec::new()
         } else {
-            let lignes = echec::departs::lignes_du_livre();
+            // Les GAMBITS sont écartés par défaut : ils imposent au camp qui
+            // les subit une position objectivement moins bonne (un pion de
+            // moins contre de l'initiative), or un match doit départager deux
+            // moteurs, pas leur répertoire. L'appariement compense le biais
+            // entre les deux rondes d'une paire, mais chaque partie prise
+            // isolément reste faussée — et une ronde peut être décisive.
+            // --livre-gambits rétablit le livre entier.
+            let toutes = echec::departs::lignes_du_livre();
+            let lignes: Vec<&(&str, &str)> = if opt.livre_gambits {
+                toutes.iter().collect()
+            } else {
+                toutes
+                    .iter()
+                    .filter(|(etiq, _)| !etiq.contains("gambit"))
+                    .collect()
+            };
             let paire = (numero - 1) / 2;
             let idx = (opt.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
                 >> 17)
                 .wrapping_add(paire as u64) as usize
                 % lignes.len();
-            let (etiquette, coups) = lignes[idx];
+            let (etiquette, coups) = *lignes[idx];
             println!("  ouverture imposée : {etiquette}");
             coups
                 .split_whitespace()
