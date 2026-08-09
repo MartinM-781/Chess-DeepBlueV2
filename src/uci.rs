@@ -334,7 +334,39 @@ impl UciEngine {
         fen: &str,
         movetime_ms: u64,
     ) -> Result<(String, Option<ScoreUci>)> {
-        self.envoie(&format!("position fen {fen}"))?;
+        self.meilleur_coup_et_score_brut_historique(fen, &[], movetime_ms)
+    }
+
+    /// Comme ci-dessus, mais en DÉCLARANT l'historique de la partie : les coups
+    /// UCI joués depuis la position `fen_initiale`. Sans lui (`position fen`
+    /// nu), le moteur ne voit qu'une position isolée et ne peut PAS détecter
+    /// les répétitions de la partie : un camp gagnant y concède la nulle sans
+    /// s'en apercevoir — trois de nos quatre premières parties de match se sont
+    /// terminées ainsi. `coups` vide → exactement l'ancien comportement.
+    /// Version « valeur dans [-1, 1] » de `..._brut_historique` (même
+    /// conversion que `meilleur_coup_et_score_fen`).
+    pub fn meilleur_coup_et_score_historique(
+        &mut self,
+        fen_initiale: &str,
+        coups: &[String],
+        movetime_ms: u64,
+    ) -> Result<(String, Option<f32>)> {
+        self.meilleur_coup_et_score_brut_historique(fen_initiale, coups, movetime_ms)
+            .map(|(coup, score)| (coup, score.map(valeur_de_score)))
+    }
+
+    pub fn meilleur_coup_et_score_brut_historique(
+        &mut self,
+        fen_initiale: &str,
+        coups: &[String],
+        movetime_ms: u64,
+    ) -> Result<(String, Option<ScoreUci>)> {
+        let fen = if coups.is_empty() {
+            format!("position fen {fen_initiale}")
+        } else {
+            format!("position fen {fen_initiale} moves {}", coups.join(" "))
+        };
+        self.envoie(&fen)?;
         self.envoie(&format!("go movetime {movetime_ms}"))?;
         let delai = delai_go(movetime_ms);
         // Deux mémoires : le dernier score EXACT et le dernier score BORNÉ

@@ -565,6 +565,14 @@ fn partie(
     repetitions.insert(zobrist(&pos), 1);
     let mut history_san: Vec<String> = Vec::new();
     let mut history_fen: Vec<String> = Vec::new();
+    // Mémoire de la PARTIE, indispensable aux deux camps pour voir les
+    // répétitions : les coups UCI depuis la position initiale (envoyés au
+    // Fantôme derrière `position ... moves ...`) et les clés zobrist des
+    // positions déjà traversées (déclarées à notre recherche). Sans elles, le
+    // camp gagnant répète sans le savoir et concède la nulle.
+    let mut history_uci: Vec<String> = Vec::new();
+    let mut cles_partie: Vec<u64> = vec![zobrist(&pos)];
+    let fen_initiale = Fen::from_position(pos.clone(), EnPassantMode::Legal).to_string();
     let mut plies: u32 = 0;
     let mut temps_champion_ms: u64 = 0;
     let mut temps_fantome_ms: u64 = 0;
@@ -591,10 +599,12 @@ fn partie(
             panic!("coup d'ouverture illégal : {san_txt}");
         };
         let san_complet = SanPlus::from_move(pos.clone(), &coup).to_string();
+        history_uci.push(coup.to_uci(CastlingMode::Standard).to_string());
         pos.play_unchecked(&coup);
         history_san.push(san_complet);
         plies += 1;
         *repetitions.entry(zobrist(&pos)).or_insert(0) += 1;
+        cles_partie.push(zobrist(&pos));
         history_fen.push(Fen::from_position(pos.clone(), EnPassantMode::Legal).to_string());
     }
     let fen0 = history_fen.last().cloned().unwrap_or(fen0);
@@ -637,6 +647,9 @@ fn partie(
             // La boîte aux lettres repart vide : jamais de prédiction bâtie
             // sur la variante principale du coup précédent.
             derniere_pv.vide();
+            // Toutes les positions de la partie SAUF celle où l'on joue : la
+            // recherche traitera un retour à l'une d'elles comme une nulle.
+            recherche.declare_historique_partie(&cles_partie[..cles_partie.len() - 1]);
             let res = recherche.cherche(&pos, limites_champion);
             v_champion = Some(vers_blancs(res.score, trait_blanc));
             temps_champion_ms += debut.elapsed().as_millis() as u64;
@@ -644,8 +657,14 @@ fn partie(
             prediction = derniere_pv.reponse_apres(&coup);
             coup
         } else {
-            let fen = Fen::from_position(pos.clone(), EnPassantMode::Legal).to_string();
-            let reponse = moteur.meilleur_coup_et_score_fen(&fen, movetime_fantome);
+            // Le Fantôme reçoit la partie ENTIÈRE (position initiale + coups),
+            // pas la seule position courante : c'est la seule façon pour un
+            // moteur UCI de connaître les répétitions déjà survenues.
+            let reponse = moteur.meilleur_coup_et_score_historique(
+                &fen_initiale,
+                &history_uci,
+                movetime_fantome,
+            );
             let ecoule_fantome = debut.elapsed().as_millis() as u64;
             // Parse UCI + validation de LÉGALITÉ contre la position : un coup
             // illégal du moteur vaut forfait, jamais de corruption
@@ -670,7 +689,11 @@ fn partie(
                         None => {
                             // Le trait est au Fantôme : le forfait donne la
                             // partie au champion, quelle que soit sa couleur.
-                            eprintln!("coup illégal du Fantôme ({texte:?} sur {fen}) : forfait");
+                            let fen_courante =
+                                Fen::from_position(pos.clone(), EnPassantMode::Legal).to_string();
+                            eprintln!(
+                                "coup illégal du Fantôme ({texte:?} sur {fen_courante}) : forfait"
+                            );
                             break if trait_blanc {
                                 ("0-1", "forfait (coup illégal du moteur)")
                             } else {
@@ -693,9 +716,11 @@ fn partie(
         // SAN (suffixes +/# compris) calculé AVANT de jouer.
         let san = SanPlus::from_move(pos.clone(), &coup).to_string();
         let uci = coup.to_uci(CastlingMode::Standard).to_string();
+        history_uci.push(uci.clone());
         pos.play_unchecked(&coup);
         history_san.push(san);
         plies += 1;
+        cles_partie.push(zobrist(&pos));
         let compte = {
             let entree = repetitions.entry(zobrist(&pos)).or_insert(0);
             *entree += 1;

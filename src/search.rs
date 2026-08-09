@@ -561,6 +561,14 @@ pub struct Recherche {
     /// Clés zobrist de la LIGNE en cours d'exploration (racine → nœud) :
     /// détection des répétitions dans l'arbre. Pile poussée/poppée par negamax.
     chemin: Vec<u64>,
+    /// Clés zobrist des positions DÉJÀ TRAVERSÉES DANS LA PARTIE (avant la
+    /// racine). Sans elles, la recherche ne voit que les répétitions internes à
+    /// son arbre : un camp gagnant peut alors répéter une position vue deux
+    /// fois dans la partie sans se douter qu'il concède la nulle. Elles sont
+    /// versées en tête de `chemin` à chaque recherche, ce qui les rend
+    /// indistinguables d'une répétition d'arbre pour `negamax`.
+    /// Vide par défaut : comportement historique strictement inchangé.
+    historique_partie: Vec<u64>,
     // --- État d'un appel de cherche() (réinitialisé à chaque appel) ---
     noeuds: u64,
     stop: bool,
@@ -625,6 +633,7 @@ impl Recherche {
             historique: vec![0; 2 * 64 * 64],
             tampon: vec![0.0; N_FEATURES],
             chemin: Vec::with_capacity(MAX_PLY + 1),
+            historique_partie: Vec::new(),
             noeuds: 0,
             stop: false,
             limites_actives: false,
@@ -927,6 +936,10 @@ impl Recherche {
         // La racine ouvre la ligne courante (les nœuds la prolongent) ; un
         // arrêt en plein arbre peut laisser des résidus → on repart propre.
         self.chemin.clear();
+        // Les positions déjà vues DANS LA PARTIE précèdent la racine : une
+        // ligne qui y retombe est traitée comme une répétition d'arbre, donc
+        // comme une nulle. Sans elles, le camp gagnant répète sans le savoir.
+        self.chemin.extend_from_slice(&self.historique_partie);
         self.chemin.push(cle_racine);
         let coup_tt_racine = self.sonde(cle_racine).map_or(COUP_AUCUN, |e| e.coup);
         let couleur = pos.turn();
@@ -1107,6 +1120,16 @@ impl Recherche {
             case.donnees.store(0, Ordering::Relaxed);
         }
         self.oublie_heuristiques();
+        self.historique_partie.clear();
+    }
+
+    /// Déclare les positions déjà traversées dans la partie (clés zobrist, même
+    /// convention que la recherche) : la recherche les traite alors comme des
+    /// répétitions. À appeler avant chaque coup dans une boucle de match ; sans
+    /// cet appel, le comportement est celui d'avant (aucune mémoire de partie).
+    pub fn declare_historique_partie(&mut self, cles: &[u64]) {
+        self.historique_partie.clear();
+        self.historique_partie.extend_from_slice(cles);
     }
 
     /// Remet à zéro les seules heuristiques de TRI (killers, historique), sans
