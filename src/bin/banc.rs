@@ -35,6 +35,8 @@ use std::sync::Arc;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use shakmaty::fen::Fen;
+use shakmaty::san::SanPlus;
+use shakmaty::uci::UciMove;
 use shakmaty::{Chess, EnPassantMode, Position};
 
 use echec::arbitre::{classement, cp_du_score};
@@ -192,12 +194,19 @@ fn main() {
             let fen_avant = Fen::from_position(pos.clone(), EnPassantMode::Legal).to_string();
             // 1. Évaluation de référence AVANT le coup (point de vue du trait,
             //    c'est-à-dire du champion, qui joue).
-            let Ok((_, Some(s_avant))) =
+            let Ok((meilleur_uci, Some(s_avant))) =
                 moteur.meilleur_coup_et_score_brut_fen(&fen_avant, opt.movetime)
             else {
                 sautees += 1;
                 continue;
             };
+            // Meilleur coup du moteur en SAN : c'est lui qu'on voudra lire en
+            // face du coup du champion quand une position tourne mal.
+            let meilleur_san = UciMove::from_ascii(meilleur_uci.as_bytes())
+                .ok()
+                .and_then(|u| u.to_move(&pos).ok())
+                .map(|m| SanPlus::from_move(pos.clone(), &m).to_string())
+                .unwrap_or_else(|| meilleur_uci.clone());
             let avant = cp_du_score(s_avant);
             // Positions DÉJÀ TRANCHÉES (mat annoncé ou plus de 8 pions
             // d'écart) : la qualité du coup n'y veut plus rien dire — on gagne
@@ -216,6 +225,7 @@ fn main() {
                 sautees += 1;
                 continue;
             };
+            let coup_san = SanPlus::from_move(pos.clone(), &coup).to_string();
             let mut apres_pos = pos.clone();
             apres_pos.play_unchecked(&coup);
 
@@ -245,7 +255,7 @@ fn main() {
             pertes.push(perte);
             if !opt.csv.is_empty() {
                 lignes_csv.push(format!(
-                    "{famille},{k},{avant},{perte},{cl},\"{fen_avant}\""
+                    "{famille},{k},{avant},{perte},{cl},{coup_san},{meilleur_san},\"{fen_avant}\""
                 ));
             }
             if (k + 1) % 10 == 0 {
@@ -280,7 +290,7 @@ fn main() {
         let existe = std::path::Path::new(&opt.csv).exists();
         let mut contenu = String::new();
         if !existe {
-            contenu.push_str("famille,indice,eval_avant_cp,perte_cp,classement,fen\n");
+            contenu.push_str("famille,indice,eval_avant_cp,perte_cp,classement,coup,meilleur,fen\n");
         }
         contenu.push_str(&lignes_csv.join("\n"));
         contenu.push('\n');

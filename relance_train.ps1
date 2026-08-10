@@ -35,6 +35,17 @@
 #   Si le temps de mesure dérape, BAISSER --elo-games — surtout pas rétablir
 #   les ancres saturées, qui ne rapportent aucune information.
 #
+# DÉPARTS — transition 30 % depuis le 09/08 (20 % avant) :
+#   verdict du match contre le Fantôme 2800 (arbitre, 327 plis) : transition
+#   51,9 cp de perte moyenne contre 6,5 à l'adversaire — la seule phase où le
+#   champion décroche. Le banc (src/bin/banc.rs) situe la faute : défense des
+#   pièces échouées au bord (cavalier a2/b2) et passivité dans les positions
+#   générées de milieu tardif. UNE variable changée : ouvertures 0,5 -> 0,4,
+#   transition 0,2 -> 0,3. Référence du banc AVANT (graine 20260809, 200k
+#   nœuds, arbitre 1,5 s) : transition 28,7 cp / 6 fautes distinctes.
+#   Juge : re-banc même graine après ~24-48 h + pente SF1700 sur >= 30 h
+#   (jamais moins — leçon du faux plateau). Retour à 0,5/0,2 si dégradation.
+#
 # DRAPEAU D'ARRÊT — C:\dev\Echec\PAUSE_COUPERETS :
 #   tant que ce fichier existe, l'ENTRAÎNEMENT n'est pas relancé. C'est le
 #   seul mécanisme qui lit ce drapeau : il n'avait jusqu'ici aucun effet, et
@@ -87,8 +98,8 @@ if ((-not $pause) -and (-not $trainPerime) -and (-not (Get-Process train -ErrorA
         "--oracle-movetime","40","--mentor-poids","1.0",`
         "--replay","2400000","--games-per-cycle","60","--eval-games","64",`
         "--gate-every","40","--gate-games","512","--elo-every","8","--elo-games","168",`
-        "--departs-ouvertures","0.5","--departs-finales","0.2",`
-        "--departs-transition","0.2","--syzygy","engines/syzygy","--int8" `
+        "--departs-ouvertures","0.4","--departs-finales","0.2",`
+        "--departs-transition","0.3","--syzygy","engines/syzygy","--int8" `
         -WorkingDirectory "C:\dev\Echec" `
         -RedirectStandardOutput "C:\dev\Echec\train.log" `
         -RedirectStandardError "C:\dev\Echec\train.err.log"
