@@ -35,14 +35,15 @@
 #   Si le temps de mesure dérape, BAISSER --elo-games — surtout pas rétablir
 #   les ancres saturées, qui ne rapportent aucune information.
 #
-# THREADS — 26 depuis le 09/08 (18 avant) : SUR-SOUSCRIPTION voulue.
-#   Mesuré : à 18 threads, train.exe ne consomme que 10,5 cœurs — chaque
-#   thread de self-play DORT pendant les 40 ms de son oracle Stockfish.
-#   L'excès de threads recouvre ces attentes (l'OS fait le recouvrement).
-#   Référence avant : cycle médian 36,0 s, 5 654 parties/h, 10,5 cœurs.
-#   Juge : parties/h et cœurs consommés après ~1 h, pente SF1700 sur >= 30 h.
-#   Rollback : ce seul nombre. Le signal d'entraînement est INCHANGÉ (mêmes
-#   labels, même movetime d'oracle, mêmes nœuds de recherche).
+# THREADS — 18 (l'essai 26 du 09/08 a été REFUTÉ et annulé en 1 h) :
+#   hypothèse : à 18 threads, train.exe ne consomme que 10,5 cœurs, la
+#   sur-souscription devait recouvrir les attentes d'oracle. Mesure : cycle
+#   médian 39,6 s à 26 threads contre 36,0 à 18 (-9 %) — la contention (26
+#   moteurs oracle + 26 chercheurs sur 20 cœurs logiques) coûte plus que le
+#   recouvrement ne rapporte. CONCLUSION DURABLE : les cœurs creux viennent de
+#   la PHASE D'APPRENTISSAGE SÉRIALISÉE (1 thread pendant que 17 dorment),
+#   pas des attentes d'oracle. Le vrai levier est un pipeline apprentissage /
+#   self-play (refonte de train.rs) — chantier d'ingénierie, pas un réglage.
 #
 # DÉPARTS — transition 30 % depuis le 09/08 (20 % avant) :
 #   verdict du match contre le Fantôme 2800 (arbitre, 327 plis) : transition
@@ -101,7 +102,7 @@ if ($trainPerime -or $servePerime) {
 
 if ((-not $pause) -and (-not $trainPerime) -and (-not (Get-Process train -ErrorAction SilentlyContinue))) {
     Start-Process -WindowStyle Hidden -FilePath "C:\dev\Echec\target\release\train.exe" `
-        -ArgumentList "--out","models","--threads","26","--search-nodes","8000",`
+        -ArgumentList "--out","models","--threads","18","--search-nodes","8000",`
         "--lr","0.0001","--td-lambda","0.2",`
         "--oracle","engines/stockfish/stockfish-windows-x86-64-avx2.exe",`
         "--oracle-movetime","40","--mentor-poids","1.0",`
