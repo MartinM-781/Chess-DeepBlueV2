@@ -35,6 +35,15 @@
 #   Si le temps de mesure dérape, BAISSER --elo-games — surtout pas rétablir
 #   les ancres saturées, qui ne rapportent aucune information.
 #
+# THREADS — 26 depuis le 09/08 (18 avant) : SUR-SOUSCRIPTION voulue.
+#   Mesuré : à 18 threads, train.exe ne consomme que 10,5 cœurs — chaque
+#   thread de self-play DORT pendant les 40 ms de son oracle Stockfish.
+#   L'excès de threads recouvre ces attentes (l'OS fait le recouvrement).
+#   Référence avant : cycle médian 36,0 s, 5 654 parties/h, 10,5 cœurs.
+#   Juge : parties/h et cœurs consommés après ~1 h, pente SF1700 sur >= 30 h.
+#   Rollback : ce seul nombre. Le signal d'entraînement est INCHANGÉ (mêmes
+#   labels, même movetime d'oracle, mêmes nœuds de recherche).
+#
 # DÉPARTS — transition 30 % depuis le 09/08 (20 % avant) :
 #   verdict du match contre le Fantôme 2800 (arbitre, 327 plis) : transition
 #   51,9 cp de perte moyenne contre 6,5 à l'adversaire — la seule phase où le
@@ -92,7 +101,7 @@ if ($trainPerime -or $servePerime) {
 
 if ((-not $pause) -and (-not $trainPerime) -and (-not (Get-Process train -ErrorAction SilentlyContinue))) {
     Start-Process -WindowStyle Hidden -FilePath "C:\dev\Echec\target\release\train.exe" `
-        -ArgumentList "--out","models","--threads","18","--search-nodes","8000",`
+        -ArgumentList "--out","models","--threads","26","--search-nodes","8000",`
         "--lr","0.0001","--td-lambda","0.2",`
         "--oracle","engines/stockfish/stockfish-windows-x86-64-avx2.exe",`
         "--oracle-movetime","40","--mentor-poids","1.0",`
