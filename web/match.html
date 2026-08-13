@@ -149,6 +149,12 @@
               font-variant-numeric: tabular-nums; }
   .arb-camp b { color: var(--ink); }
   .arb-moteur { color: var(--muted); font-size: 10px; }
+  .arb-direct { display: flex; flex-wrap: wrap; align-items: center; gap: 5px 10px;
+    padding: 7px 9px; border-radius: 7px; background: var(--surface);
+    border: 1px solid var(--border); font-size: 12px; }
+  .arb-direct .direct-eval { font-weight: 700; font-variant-numeric: tabular-nums; }
+  .arb-direct .direct-pulse { width: 7px; height: 7px; border-radius: 50%;
+    background: currentColor; animation: pense-pulse 1.6s ease-in-out infinite; }
   /* Réserve sur le mètre-étalon : discrète, mais toujours sous les yeux. */
   .arb-note { margin-top: 8px; font-size: 10.5px; line-height: 1.35;
               color: var(--muted); font-style: italic; }
@@ -233,6 +239,11 @@
       <div class="card-box-head">
         <h2>Arbitre</h2><span class="arb-moteur" id="arb-moteur"></span>
       </div>
+      <!-- L'œil en direct : verdict de l'arbitre sur la position AU TRAIT,
+           rafraîchi à chaque sonde (la table du moteur persiste, l'éval se
+           raffine pendant la réflexion). Masqué en navigation historique :
+           il ne parle que du présent. -->
+      <div class="arb-direct" id="arb-direct" hidden></div>
       <div class="arb-coup" id="arb-coup"></div>
       <table class="arb-phases">
         <thead><tr>

@@ -458,16 +458,40 @@ fn ecrit_atomique(chemin: &str, contenu: &str) {
 }
 
 /// Publie l'état d'arbitrage de la partie en cours.
-fn publie(opt: &Opt, live: &Live, annotations: &[Annotation]) {
+fn publie(opt: &Opt, live: &Live, annotations: &[Annotation], direct: Option<&Direct>) {
     let plis: Vec<serde_json::Value> = annotations.iter().map(|a| a.json()).collect();
-    let v = serde_json::json!({
+    let mut v = serde_json::json!({
         "partie": live.partie,
         "champion_blanc": live.champion_blanc,
         "movetime_ms": opt.movetime,
         "plis": plis,
         "resume": resume(annotations),
     });
+    // L'ŒIL EN DIRECT : verdict de l'arbitre sur la position ACTUELLEMENT au
+    // trait (pendant que les moteurs réfléchissent), rafraîchi à chaque sonde.
+    if let Some(d) = direct {
+        v["direct"] = serde_json::json!({
+            "partie": d.partie,
+            "ply": d.ply,
+            "eval_cp": d.eval_blancs,
+            "meilleur": d.meilleur,
+            "sondes": d.sondes,
+        });
+    }
     ecrit_atomique(&opt.out, &v.to_string());
+}
+
+/// Verdict en direct de l'arbitre sur la position au trait — publié dans le
+/// JSON sous "direct". `sondes` compte les analyses successives de la MÊME
+/// position : la table du moteur persistant d'une sonde à l'autre, chaque
+/// passage approfondit le verdict (l'éval affichée se raffine pendant les
+/// 3 minutes de réflexion des joueurs).
+struct Direct {
+    partie: u32,
+    ply: u32,
+    eval_blancs: i32,
+    meilleur: String,
+    sondes: u32,
 }
 
 /// Ajoute une ligne au CSV (créé avec son entête au besoin) et VIDE le tampon :
@@ -788,6 +812,9 @@ fn boucle(opt: &Opt) -> i32 {
     // Dernière publication : (partie, nombre de plis publiés) — évite de
     // réécrire le JSON à chaque tour de sondage quand rien n'a changé.
     let mut publie_pour: Option<(u32, usize)> = None;
+    // Verdict en direct de la position au trait (None tant que l'arbitre
+    // rattrape son retard d'annotations).
+    let mut direct: Option<Direct> = None;
     let mut partie_courante: u32 = 0;
     // Dernier état vu de la partie en cours : c'est la source de rattrapage
     // quand match.exe passe à la partie suivante.
@@ -829,9 +856,13 @@ fn boucle(opt: &Opt) -> i32 {
 
         let pli = prochain_pli_hors(&annotations, live.partie, &etat.ignores(live.partie));
         if pli as usize <= live.plis() {
+            // Un coup vient de tomber : le verdict direct de l'ancienne
+            // position est périmé — on le retire plutôt que d'afficher une
+            // éval d'hier sur le plateau d'aujourd'hui.
+            direct = None;
             if traite_pli(opt, &live, pli, &mut etat) {
                 let annotations = etat.annotations(live.partie);
-                publie(opt, &live, &annotations);
+                publie(opt, &live, &annotations, direct.as_ref());
                 publie_pour = Some((live.partie, annotations.len()));
                 dors(opt.pause);
             } else {
@@ -842,16 +873,48 @@ fn boucle(opt: &Opt) -> i32 {
             continue;
         }
 
-        // À jour : on publie si quelque chose a changé, puis on sonde.
-        if publie_pour != Some((live.partie, annotations.len())) {
-            publie(opt, &live, &annotations);
-            publie_pour = Some((live.partie, annotations.len()));
-        }
         if live.termine {
+            if publie_pour != Some((live.partie, annotations.len())) {
+                publie(opt, &live, &annotations, None);
+            }
             println!("arbitre : match terminé et intégralement annoté — sortie.");
             break;
         }
-        dors(ATTENTE_MS);
+
+        // À jour : l'ŒIL EN DIRECT. Toutes les annotations sont faites, les
+        // joueurs réfléchissent — l'arbitre sonde la position AU TRAIT.
+        // Bonus de conception : la sonde passe par le même cache que les
+        // annotations, donc quand le coup tombera, l'annotation de cette
+        // position sera déjà payée (rattrapage instantané) ; et la table du
+        // moteur persistant entre les sondes, chaque passage approfondit.
+        let pli_courant = live.plis() as u32;
+        let meme_position = matches!(&direct, Some(d) if d.partie == live.partie && d.ply == pli_courant);
+        let Some(fen_courante) = live.fen.last().cloned() else {
+            dors(ATTENTE_MS);
+            continue;
+        };
+        // La sonde re-analyse la position même si le cache la connaît déjà
+        // (c'est le re-passage qui approfondit) : on retire l'entrée avant.
+        etat.cache.remove(&fen_courante);
+        let sondes_prec = if meme_position {
+            direct.as_ref().map_or(0, |d| d.sondes)
+        } else {
+            0
+        };
+        if let Some(a) = analyse(&mut etat.moteur, opt, &mut etat.cache, &fen_courante) {
+            direct = Some(Direct {
+                partie: live.partie,
+                ply: pli_courant,
+                eval_blancs: a.eval_blancs,
+                meilleur: a.meilleur,
+                sondes: sondes_prec + 1,
+            });
+            publie(opt, &live, &annotations, direct.as_ref());
+            publie_pour = Some((live.partie, annotations.len()));
+            dors(opt.pause);
+        } else {
+            dors(ATTENTE_MS);
+        }
     }
 
     if arret_demande() {

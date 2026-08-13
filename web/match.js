@@ -381,6 +381,36 @@ function majArbitre() {
   const pli = pliAffiche(st);
   rendreCoupArbitre(pli, annotationDuPli(pli));
   rendreBilanArbitre(arbitreEtat.resume);
+  rendreDirectArbitre(st);
+}
+
+/* L'oeil en direct : verdict de l'arbitre sur la position AU TRAIT, rafraichi
+   a chaque sonde. Visible uniquement quand la page suit le direct (en
+   navigation historique il parlerait d'une autre position que celle affichee)
+   et quand le verdict porte bien sur le pli courant de la partie courante. */
+function rendreDirectArbitre(st) {
+  const box = $("arb-direct");
+  const d = arbitreEtat && arbitreEtat.direct;
+  const enDirect = indexNav === null;
+  const ok = !!d && enDirect && d.partie === st.partie && d.ply === st.ply;
+  box.hidden = !ok;
+  if (!ok) return;
+  box.replaceChildren();
+  const pulse = document.createElement("span");
+  pulse.className = "direct-pulse";
+  const titre = document.createElement("span");
+  titre.textContent = "arbitre en direct :";
+  const evalEl = document.createElement("span");
+  evalEl.className = "direct-eval";
+  evalEl.textContent = texteEvalCp(d.eval_cp);
+  const conseil = document.createElement("span");
+  const meilleur = document.createElement("b");
+  meilleur.textContent = d.meilleur || "—";
+  conseil.append("conseille ", meilleur);
+  const sondes = document.createElement("span");
+  sondes.className = "arb-moteur";
+  sondes.textContent = `sonde ${d.sondes}`;
+  box.append(pulse, titre, evalEl, conseil, sondes);
 }
 
 /* --------------------------------------------------- navigation (rendu) */
